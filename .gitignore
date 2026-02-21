@@ -9,3 +9,6 @@ wheels/
 # Virtual environments
 .venv
 db.sqlite3
+
+# Environment
+.env

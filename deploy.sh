@@ -9,7 +9,7 @@ set -e
 SERVER_USER="leadrisks.com_487i3cldg3e"
 SERVER_HOST="161.97.101.121"
 SERVER_PATH="\$HOME/auditsence/iams-backend"
-CONTAINER="iams-backend_backend_1"
+CONTAINER="iams-backend-backend-1"
 
 echo "==> Copying .env to server..."
 scp .env "$SERVER_USER@$SERVER_HOST:~/auditsence/iams-backend/.env"

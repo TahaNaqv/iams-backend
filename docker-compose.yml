@@ -17,15 +17,8 @@ services:
     build: .
     ports:
       - "8001:8000"
-    environment:
-      SECRET_KEY: ${SECRET_KEY:-django-insecure-change-me-in-production}
-      DEBUG: ${DEBUG:-0}
-      DB_HOST: db
-      DB_PORT: 5432
-      DB_NAME: ${POSTGRES_DB:-iams_db}
-      DB_USER: ${POSTGRES_USER:-iams_user}
-      DB_PASSWORD: ${POSTGRES_PASSWORD:-iams_secret}
-      ALLOWED_HOSTS: ${ALLOWED_HOSTS:-localhost,127.0.0.1,backend,0.0.0.0,api.auditsence.leadrisks.com,161.97.101.121}
+    env_file:
+      - .env
     depends_on:
       db:
         condition: service_healthy

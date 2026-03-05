@@ -10,10 +10,12 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/6.0/ref/settings/
 """
 
-import os
 from pathlib import Path
-
 from decouple import config
+
+
+def _split(val: str) -> list[str]:
+    return [v.strip() for v in val.split(',') if v.strip()]
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -28,7 +30,7 @@ SECRET_KEY = config('SECRET_KEY', default='django-insecure-bxsuh%8wxq80g_^a28)rx
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = config('DEBUG', default=True, cast=bool)
 
-ALLOWED_HOSTS = config('ALLOWED_HOSTS', default='localhost,127.0.0.1').split(',')
+ALLOWED_HOSTS = _split(config('ALLOWED_HOSTS', default='localhost,127.0.0.1'))
 
 
 # Application definition
@@ -139,12 +141,12 @@ USE_TZ = True
 # https://docs.djangoproject.com/en/6.0/howto/static-files/
 
 STATIC_URL = 'static/'
+STATIC_ROOT = BASE_DIR / 'staticfiles'
 
 # CORS
-CORS_ALLOWED_ORIGINS = config(
-    'CORS_ALLOWED_ORIGINS',
-    default='http://localhost:5173,http://127.0.0.1:5173'
-).split(',')
+CORS_ALLOWED_ORIGINS = _split(config('CORS_ALLOWED_ORIGINS', default='http://localhost:5173,http://127.0.0.1:5173'))
+
+CSRF_TRUSTED_ORIGINS = _split(config('CSRF_TRUSTED_ORIGINS', default=''))
 
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': (
@@ -154,3 +156,5 @@ REST_FRAMEWORK = {
         'rest_framework.permissions.IsAuthenticated',
     ),
 }
+
+DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'

@@ -20,7 +20,7 @@ ssh "$SERVER_USER@$SERVER_HOST" bash << ENDSSH
   cd ~/auditsence/iams-backend
 
   echo "  -> Pulling latest code..."
-  git pull origin main
+  git pull origin master
 
   echo "  -> Rebuilding and restarting containers..."
   docker-compose up -d --build

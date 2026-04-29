@@ -1,6 +1,8 @@
 services:
   db:
     image: postgres:16-alpine
+    ports:
+      - "5433:5432"
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-iams_db}
       POSTGRES_USER: ${POSTGRES_USER:-iams_user}

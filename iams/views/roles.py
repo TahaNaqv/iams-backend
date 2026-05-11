@@ -2,6 +2,7 @@ from rest_framework import viewsets, status
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
+from django.shortcuts import get_object_or_404
 
 from iams.models import Role
 from iams.serializers import RoleSerializer, RoleWriteSerializer, RolePermissionsUpdateSerializer
@@ -37,7 +38,7 @@ class RolePermissionsView(APIView):
     permission_classes = [IsAuthenticated, HasPermission("manage_permissions")]
 
     def patch(self, request, pk):
-        role = Role.objects.get(pk=pk)
+        role = get_object_or_404(Role, pk=pk)
         serializer = RolePermissionsUpdateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         permission_ids = serializer.validated_data["permission_ids"]

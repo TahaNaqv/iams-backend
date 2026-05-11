@@ -106,6 +106,11 @@ class UserCreateSerializer(serializers.ModelSerializer):
             "status",
         ]
 
+    def validate_role_id(self, value):
+        if not Role.objects.filter(id=value).exists():
+            raise serializers.ValidationError("Invalid role_id.")
+        return value
+
     def create(self, validated_data):
         role_id = validated_data.pop("role_id")
         department = validated_data.pop("department", "")
@@ -119,7 +124,7 @@ class UserCreateSerializer(serializers.ModelSerializer):
             first_name=validated_data.get("first_name", ""),
             last_name=validated_data.get("last_name", ""),
         )
-        role = Role.objects.get(id=role_id)
+        role = Role.objects.filter(id=role_id).first()
         UserProfile.objects.create(
             user=user,
             role=role,
@@ -141,6 +146,11 @@ class UserUpdateSerializer(serializers.ModelSerializer):
         model = User
         fields = ["first_name", "last_name", "role_id", "department", "status"]
 
+    def validate_role_id(self, value):
+        if value and not Role.objects.filter(id=value).exists():
+            raise serializers.ValidationError("Invalid role_id.")
+        return value
+
     def update(self, instance, validated_data):
         role_id = validated_data.pop("role_id", None)
         department = validated_data.pop("department", None)
@@ -154,7 +164,7 @@ class UserUpdateSerializer(serializers.ModelSerializer):
         if profile is None:
             profile = UserProfile(user=instance)
         if role_id is not None:
-            profile.role = Role.objects.get(id=role_id)
+            profile.role = Role.objects.filter(id=role_id).first()
         if department is not None:
             profile.department = department
         if status is not None:

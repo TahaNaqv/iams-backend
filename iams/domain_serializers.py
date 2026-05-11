@@ -24,6 +24,14 @@ from iams.models import (
     RiskHistoryEntry,
     TimeEntry,
     TimelineEvent,
+    ApprovalRequest,
+    ApprovalStep,
+    WorkProgram,
+    WorkProcedure,
+    WorkProcedureStep,
+    AuditReport,
+    AuditReportSection,
+    ManagedDocument,
 )
 
 
@@ -121,6 +129,14 @@ class ChecklistItemSerializer(serializers.ModelSerializer):
         fields = ["id", "auditId", "title", "assignee", "status", "notes"]
 
 
+class ChecklistItemWriteSerializer(serializers.ModelSerializer):
+    auditId = serializers.PrimaryKeyRelatedField(source="audit", queryset=Audit.objects.all())
+
+    class Meta:
+        model = ChecklistItem
+        fields = ["id", "auditId", "title", "assignee", "status", "notes"]
+
+
 class EvidenceFileSerializer(serializers.ModelSerializer):
     auditId = serializers.UUIDField(source="audit_id", read_only=True)
     sizeKb = serializers.IntegerField(source="size_kb")
@@ -134,6 +150,14 @@ class EvidenceFileSerializer(serializers.ModelSerializer):
 
 class TimelineEventSerializer(serializers.ModelSerializer):
     auditId = serializers.UUIDField(source="audit_id", read_only=True)
+
+    class Meta:
+        model = TimelineEvent
+        fields = ["id", "auditId", "title", "description", "timestamp"]
+
+
+class TimelineEventWriteSerializer(serializers.ModelSerializer):
+    auditId = serializers.PrimaryKeyRelatedField(source="audit", queryset=Audit.objects.all())
 
     class Meta:
         model = TimelineEvent
@@ -314,3 +338,245 @@ class RiskAssessmentImportIssueSerializer(serializers.ModelSerializer):
     class Meta:
         model = RiskAssessmentImportIssue
         fields = ["id", "severity", "sheetName", "rowNumber", "message"]
+
+
+class ApprovalStepSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ApprovalStep
+        fields = ["id", "role", "approver", "status", "date", "comments", "order"]
+
+
+class ApprovalRequestSerializer(serializers.ModelSerializer):
+    steps = ApprovalStepSerializer(many=True)
+
+    class Meta:
+        model = ApprovalRequest
+        fields = [
+            "id",
+            "title",
+            "type",
+            "reference_id",
+            "department",
+            "submitted_by",
+            "submitted_date",
+            "current_step",
+            "priority",
+            "description",
+            "status",
+            "steps",
+        ]
+
+    def create(self, validated_data):
+        steps_data = validated_data.pop("steps", [])
+        req = ApprovalRequest.objects.create(**validated_data)
+        for i, s in enumerate(steps_data):
+            step_order = s.pop("order", i)
+            ApprovalStep.objects.create(request=req, order=step_order, **s)
+        return req
+
+    def update(self, instance, validated_data):
+        # Basic update; steps are managed via workflow actions.
+        for k, v in validated_data.items():
+            if k != "steps":
+                setattr(instance, k, v)
+        instance.save()
+        return instance
+
+
+class WorkProcedureStepSerializer(serializers.ModelSerializer):
+    procedureId = serializers.UUIDField(source="procedure_id", read_only=True)
+    sampleSize = serializers.CharField(source="sample_size")
+    completedBy = serializers.CharField(source="completed_by")
+    completedDate = serializers.DateField(source="completed_date", allow_null=True)
+
+    class Meta:
+        model = WorkProcedureStep
+        fields = ["id", "procedureId", "description", "method", "sampleSize", "result", "notes", "completedBy", "completedDate"]
+
+
+class WorkProcedureStepWriteSerializer(serializers.ModelSerializer):
+    procedureId = serializers.PrimaryKeyRelatedField(source="procedure", queryset=WorkProcedure.objects.all())
+    sampleSize = serializers.CharField(source="sample_size", required=False, allow_blank=True)
+    completedBy = serializers.CharField(source="completed_by", required=False, allow_blank=True)
+    completedDate = serializers.DateField(source="completed_date", required=False, allow_null=True)
+
+    class Meta:
+        model = WorkProcedureStep
+        fields = ["id", "procedureId", "description", "method", "sampleSize", "result", "notes", "completedBy", "completedDate"]
+
+
+class WorkProcedureSerializer(serializers.ModelSerializer):
+    workProgramId = serializers.UUIDField(source="work_program_id", read_only=True)
+    riskArea = serializers.CharField(source="risk_area")
+    controlRef = serializers.CharField(source="control_ref")
+    assignedTo = serializers.CharField(source="assigned_to")
+    signedOffBy = serializers.CharField(source="signed_off_by")
+    signedOffDate = serializers.DateField(source="signed_off_date", allow_null=True)
+    steps = WorkProcedureStepSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = WorkProcedure
+        fields = [
+            "id",
+            "workProgramId",
+            "title",
+            "objective",
+            "riskArea",
+            "controlRef",
+            "assignedTo",
+            "status",
+            "conclusion",
+            "signedOffBy",
+            "signedOffDate",
+            "steps",
+        ]
+
+
+class WorkProcedureWriteSerializer(serializers.ModelSerializer):
+    workProgramId = serializers.PrimaryKeyRelatedField(source="work_program", queryset=WorkProgram.objects.all())
+    riskArea = serializers.CharField(source="risk_area", required=False, allow_blank=True)
+    controlRef = serializers.CharField(source="control_ref", required=False, allow_blank=True)
+    assignedTo = serializers.CharField(source="assigned_to", required=False, allow_blank=True)
+    signedOffBy = serializers.CharField(source="signed_off_by", required=False, allow_blank=True)
+    signedOffDate = serializers.DateField(source="signed_off_date", required=False, allow_null=True)
+
+    class Meta:
+        model = WorkProcedure
+        fields = [
+            "id",
+            "workProgramId",
+            "title",
+            "objective",
+            "riskArea",
+            "controlRef",
+            "assignedTo",
+            "status",
+            "conclusion",
+            "signedOffBy",
+            "signedOffDate",
+        ]
+
+
+class WorkProgramSerializer(serializers.ModelSerializer):
+    auditId = serializers.UUIDField(source="audit_id", read_only=True)
+    auditTitle = serializers.CharField(source="audit.title", read_only=True)
+    procedures = WorkProcedureSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = WorkProgram
+        fields = ["id", "auditId", "auditTitle", "title", "procedures"]
+
+
+class WorkProgramWriteSerializer(serializers.ModelSerializer):
+    auditId = serializers.PrimaryKeyRelatedField(source="audit", queryset=Audit.objects.all())
+
+    class Meta:
+        model = WorkProgram
+        fields = ["id", "auditId", "title"]
+
+
+class AuditReportSectionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = AuditReportSection
+        fields = ["id", "order", "title", "type", "content"]
+
+
+class AuditReportSerializer(serializers.ModelSerializer):
+    auditId = serializers.UUIDField(source="audit_id", read_only=True)
+    auditTitle = serializers.CharField(source="audit.title", read_only=True)
+    createdDate = serializers.DateField(source="created_date", allow_null=True)
+    lastModified = serializers.DateField(source="last_modified", allow_null=True)
+    sections = AuditReportSectionSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = AuditReport
+        fields = [
+            "id",
+            "title",
+            "auditId",
+            "auditTitle",
+            "status",
+            "author",
+            "reviewer",
+            "createdDate",
+            "lastModified",
+            "department",
+            "sections",
+        ]
+
+
+class AuditReportWriteSerializer(serializers.ModelSerializer):
+    auditId = serializers.PrimaryKeyRelatedField(source="audit", queryset=Audit.objects.all())
+    createdDate = serializers.DateField(source="created_date", required=False, allow_null=True)
+    lastModified = serializers.DateField(source="last_modified", required=False, allow_null=True)
+
+    class Meta:
+        model = AuditReport
+        fields = ["id", "title", "auditId", "status", "author", "reviewer", "createdDate", "lastModified", "department"]
+
+
+class AuditReportSectionWriteSerializer(serializers.ModelSerializer):
+    reportId = serializers.PrimaryKeyRelatedField(source="report", queryset=AuditReport.objects.all())
+
+    class Meta:
+        model = AuditReportSection
+        fields = ["id", "reportId", "order", "title", "type", "content"]
+
+
+class ManagedDocumentSerializer(serializers.ModelSerializer):
+    fileType = serializers.CharField(source="file_type")
+    fileSize = serializers.CharField(source="file_size")
+    createdDate = serializers.DateField(source="created_date", allow_null=True)
+    modifiedDate = serializers.DateField(source="modified_date", allow_null=True)
+    downloadUrl = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ManagedDocument
+        fields = [
+            "id",
+            "title",
+            "category",
+            "status",
+            "owner",
+            "department",
+            "fileType",
+            "fileSize",
+            "createdDate",
+            "modifiedDate",
+            "description",
+            "tags",
+            "versions",
+            "downloadUrl",
+        ]
+
+    def get_downloadUrl(self, obj):
+        request = self.context.get("request")
+        if obj.file and request:
+            return request.build_absolute_uri(obj.file.url)
+        return None
+
+
+class ManagedDocumentWriteSerializer(serializers.ModelSerializer):
+    fileType = serializers.CharField(source="file_type", required=False, allow_blank=True)
+    fileSize = serializers.CharField(source="file_size", required=False, allow_blank=True)
+    createdDate = serializers.DateField(source="created_date", required=False, allow_null=True)
+    modifiedDate = serializers.DateField(source="modified_date", required=False, allow_null=True)
+
+    class Meta:
+        model = ManagedDocument
+        fields = [
+            "id",
+            "title",
+            "category",
+            "status",
+            "owner",
+            "department",
+            "file",
+            "fileType",
+            "fileSize",
+            "createdDate",
+            "modifiedDate",
+            "description",
+            "tags",
+            "versions",
+        ]

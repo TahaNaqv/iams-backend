@@ -1,4 +1,5 @@
 from django.contrib.auth import get_user_model
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.urls import reverse
 from rest_framework import status
 from rest_framework.test import APITestCase
@@ -98,3 +99,77 @@ class DomainApiTests(APITestCase):
         self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {token_res.data['access']}")
         res = self.client.get("/api/audits/")
         self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_checklist_evidence_timeline_and_approvals_flow(self):
+        audit_res = self.client.post(
+            "/api/audits/",
+            {
+                "title": "Execution Audit",
+                "department": "IT",
+                "leadAuditor": "Tester",
+                "status": "In Progress",
+                "startDate": "2026-05-01",
+                "endDate": "2026-05-31",
+                "priority": "Medium",
+                "riskRating": "Medium",
+                "scope": "Execution",
+                "objectives": "Validate workflows",
+                "completionPercent": 10,
+                "findingsCount": 0,
+            },
+            format="json",
+        )
+        self.assertEqual(audit_res.status_code, status.HTTP_201_CREATED)
+        audit_id = audit_res.data["id"]
+
+        checklist_res = self.client.post(
+            f"/api/audits/{audit_id}/checklist/",
+            {"title": "Collect evidence", "assignee": "Tester", "status": "Pending", "notes": ""},
+            format="json",
+        )
+        self.assertEqual(checklist_res.status_code, status.HTTP_201_CREATED)
+
+        file = SimpleUploadedFile("evidence.txt", b"sample evidence", content_type="text/plain")
+        evidence_res = self.client.post(
+            f"/api/audits/{audit_id}/evidence/",
+            {"file": file, "name": "Evidence A", "type": "txt"},
+            format="multipart",
+        )
+        self.assertEqual(evidence_res.status_code, status.HTTP_201_CREATED)
+
+        timeline_res = self.client.post(
+            f"/api/audits/{audit_id}/timeline/",
+            {"title": "Evidence uploaded", "description": "Initial upload", "timestamp": "2026-05-10T10:00:00Z"},
+            format="json",
+        )
+        self.assertEqual(timeline_res.status_code, status.HTTP_201_CREATED)
+
+        approval_res = self.client.post(
+            "/api/approval-requests/",
+            {
+                "title": "Approve audit report",
+                "type": "Report",
+                "reference_id": "RPT-100",
+                "department": "IT",
+                "submitted_by": "Tester",
+                "submitted_date": "2026-05-10",
+                "current_step": 0,
+                "priority": "High",
+                "description": "Needs approval",
+                "status": "Pending",
+                "steps": [
+                    {"role": "Manager", "approver": "Jane", "status": "Pending", "date": None, "comments": "", "order": 0}
+                ],
+            },
+            format="json",
+        )
+        self.assertEqual(approval_res.status_code, status.HTTP_201_CREATED)
+        approval_id = approval_res.data["id"]
+
+        approve_step_res = self.client.post(
+            f"/api/approval-requests/{approval_id}/approve/",
+            {"comments": "Looks good"},
+            format="json",
+        )
+        self.assertEqual(approve_step_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(approve_step_res.data["status"], "Approved")

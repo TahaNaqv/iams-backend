@@ -1,4 +1,5 @@
-from .auth import MeView
+from .auth import MeView, ThrottledTokenObtainPairView
+from .health import HealthView, ReadinessView
 from .users import UserViewSet
 from .roles import RoleViewSet, RolePermissionsView
 from .permissions import PermissionViewSet
@@ -16,6 +17,7 @@ from .domain import (
     DashboardKPIView,
     DepartmentViewSet,
     EvidenceByAuditView,
+    EvidenceFileViewSet,
     FindingViewSet,
     FollowUpViewSet,
     HoursBudgetViewSet,
@@ -26,12 +28,22 @@ from .domain import (
     RiskAssessmentSummaryViewSet,
     RiskAssessmentViewSet,
     RiskHistoryViewSet,
+    ApprovalRequestViewSet,
+    WorkProgramViewSet,
+    WorkProcedureViewSet,
+    WorkProcedureStepViewSet,
+    AuditReportViewSet,
+    AuditReportSectionViewSet,
+    ManagedDocumentViewSet,
     TimeEntryViewSet,
     TimelineByAuditView,
 )
 
 __all__ = [
     "MeView",
+    "ThrottledTokenObtainPairView",
+    "HealthView",
+    "ReadinessView",
     "UserViewSet",
     "RoleViewSet",
     "RolePermissionsView",
@@ -44,9 +56,17 @@ __all__ = [
     "ChecklistByAuditView",
     "ChecklistItemViewSet",
     "EvidenceByAuditView",
+    "EvidenceFileViewSet",
     "TimelineByAuditView",
     "AuditableEntityViewSet",
     "RiskHistoryViewSet",
+    "ApprovalRequestViewSet",
+    "WorkProgramViewSet",
+    "WorkProcedureViewSet",
+    "WorkProcedureStepViewSet",
+    "AuditReportViewSet",
+    "AuditReportSectionViewSet",
+    "ManagedDocumentViewSet",
     "NotificationViewSet",
     "AuditLogViewSet",
     "FollowUpViewSet",

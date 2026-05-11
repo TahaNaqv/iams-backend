@@ -15,6 +15,7 @@ from iams.views import (
     DashboardKPIView,
     DepartmentViewSet,
     EvidenceByAuditView,
+    EvidenceFileViewSet,
     FindingViewSet,
     FollowUpViewSet,
     HoursBudgetViewSet,
@@ -28,6 +29,13 @@ from iams.views import (
     RiskHistoryViewSet,
     RolePermissionsView,
     RoleViewSet,
+    ApprovalRequestViewSet,
+    WorkProgramViewSet,
+    WorkProcedureViewSet,
+    WorkProcedureStepViewSet,
+    AuditReportViewSet,
+    AuditReportSectionViewSet,
+    ManagedDocumentViewSet,
     TimeEntryViewSet,
     TimelineByAuditView,
     UserViewSet,
@@ -43,6 +51,7 @@ router.register("corrective-actions", CorrectiveActionViewSet, basename="correct
 router.register("departments", DepartmentViewSet, basename="department")
 router.register("activities", ActivityViewSet, basename="activity")
 router.register("checklist-items", ChecklistItemViewSet, basename="checklist-item")
+router.register("evidence-files", EvidenceFileViewSet, basename="evidence-file")
 router.register("auditable-entities", AuditableEntityViewSet, basename="auditable-entity")
 router.register("risk-history", RiskHistoryViewSet, basename="risk-history")
 router.register("notifications", NotificationViewSet, basename="notification")
@@ -57,6 +66,13 @@ router.register("risk-assessments", RiskAssessmentViewSet, basename="risk-assess
 router.register("risk-assessment-sheets", RiskAssessmentSheetsViewSet, basename="risk-assessment-sheet")
 router.register("risk-assessment-matrix", RiskAssessmentMatrixViewSet, basename="risk-assessment-matrix")
 router.register("risk-assessment-summary", RiskAssessmentSummaryViewSet, basename="risk-assessment-summary")
+router.register("approval-requests", ApprovalRequestViewSet, basename="approval-request")
+router.register("work-programs", WorkProgramViewSet, basename="work-program")
+router.register("work-procedures", WorkProcedureViewSet, basename="work-procedure")
+router.register("work-procedure-steps", WorkProcedureStepViewSet, basename="work-procedure-step")
+router.register("audit-reports", AuditReportViewSet, basename="audit-report")
+router.register("audit-report-sections", AuditReportSectionViewSet, basename="audit-report-section")
+router.register("managed-documents", ManagedDocumentViewSet, basename="managed-document")
 
 urlpatterns = [
     path("", include(router.urls)),

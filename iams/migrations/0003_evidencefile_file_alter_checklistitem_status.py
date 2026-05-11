@@ -54,9 +54,20 @@ class Migration(migrations.Migration):
     ]
 
     operations = [
-        migrations.RunPython(
-            add_evidence_file_field_if_missing,
-            reverse_code=remove_evidence_file_field_if_exists,
+        migrations.SeparateDatabaseAndState(
+            database_operations=[
+                migrations.RunPython(
+                    add_evidence_file_field_if_missing,
+                    reverse_code=remove_evidence_file_field_if_exists,
+                ),
+            ],
+            state_operations=[
+                migrations.AddField(
+                    model_name="evidencefile",
+                    name="file",
+                    field=models.FileField(blank=True, null=True, upload_to="evidence/%Y/%m/%d/"),
+                ),
+            ],
         ),
         migrations.AlterField(
             model_name='checklistitem',

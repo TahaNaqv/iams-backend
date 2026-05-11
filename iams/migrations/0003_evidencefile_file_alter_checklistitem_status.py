@@ -3,6 +3,50 @@
 from django.db import migrations, models
 
 
+def add_evidence_file_field_if_missing(apps, schema_editor):
+    """
+    Make this migration idempotent for environments where the `file` column
+    was added manually or by a partial prior rollout.
+    """
+    EvidenceFile = apps.get_model("iams", "EvidenceFile")
+    table_name = EvidenceFile._meta.db_table
+
+    with schema_editor.connection.cursor() as cursor:
+        columns = {
+            column.name
+            for column in schema_editor.connection.introspection.get_table_description(
+                cursor, table_name
+            )
+        }
+
+    if "file" in columns:
+        return
+
+    field = models.FileField(blank=True, null=True, upload_to="evidence/%Y/%m/%d/")
+    field.set_attributes_from_name("file")
+    schema_editor.add_field(EvidenceFile, field)
+
+
+def remove_evidence_file_field_if_exists(apps, schema_editor):
+    EvidenceFile = apps.get_model("iams", "EvidenceFile")
+    table_name = EvidenceFile._meta.db_table
+
+    with schema_editor.connection.cursor() as cursor:
+        columns = {
+            column.name
+            for column in schema_editor.connection.introspection.get_table_description(
+                cursor, table_name
+            )
+        }
+
+    if "file" not in columns:
+        return
+
+    field = models.FileField(blank=True, null=True, upload_to="evidence/%Y/%m/%d/")
+    field.set_attributes_from_name("file")
+    schema_editor.remove_field(EvidenceFile, field)
+
+
 class Migration(migrations.Migration):
 
     dependencies = [
@@ -10,10 +54,9 @@ class Migration(migrations.Migration):
     ]
 
     operations = [
-        migrations.AddField(
-            model_name='evidencefile',
-            name='file',
-            field=models.FileField(blank=True, null=True, upload_to='evidence/%Y/%m/%d/'),
+        migrations.RunPython(
+            add_evidence_file_field_if_missing,
+            reverse_code=remove_evidence_file_field_if_exists,
         ),
         migrations.AlterField(
             model_name='checklistitem',

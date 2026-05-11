@@ -5,6 +5,60 @@ import uuid
 from django.db import migrations, models
 
 
+def cleanup_partial_postgres_migration(apps, schema_editor):
+    """
+    If a prior deploy crashed mid-migration on Postgres, table-backed composite
+    types (named like the table) can remain and cause duplicate pg_type errors
+    on retry. This cleanup makes the migration idempotent for first-time create.
+    """
+    if schema_editor.connection.vendor != "postgresql":
+        return
+
+    # Only objects created in this migration.
+    tables = [
+        "iams_activityitem",
+        "iams_audit",
+        "iams_auditableentity",
+        "iams_auditlogentry",
+        "iams_auditor",
+        "iams_comment",
+        "iams_department",
+        "iams_notification",
+        "iams_riskassessmentimportissue",
+        "iams_riskassessmentsheet",
+        "iams_riskhistoryentry",
+        "iams_auditassignment",
+        "iams_checklistitem",
+        "iams_evidencefile",
+        "iams_finding",
+        "iams_correctiveaction",
+        "iams_followupitem",
+        "iams_hoursbudget",
+        "iams_riskassessmentmatrixcell",
+        "iams_riskassessmentrecord",
+        "iams_riskassessmentsummaryitem",
+        "iams_timeentry",
+        "iams_timelineevent",
+    ]
+
+    # Drop tables first (they own the composite types), then drop any remaining
+    # composite types defensively.
+    for table in tables:
+        schema_editor.execute(f'DROP TABLE IF EXISTS "{table}" CASCADE;')
+
+    for table in tables:
+        schema_editor.execute(
+            f"""
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_type WHERE typname = '{table}') THEN
+    EXECUTE 'DROP TYPE IF EXISTS \"{table}\" CASCADE';
+  END IF;
+END $$;
+"""
+        )
+
+
 class Migration(migrations.Migration):
 
     dependencies = [
@@ -12,6 +66,7 @@ class Migration(migrations.Migration):
     ]
 
     operations = [
+        migrations.RunPython(cleanup_partial_postgres_migration, reverse_code=migrations.RunPython.noop),
         migrations.CreateModel(
             name='ActivityItem',
             fields=[

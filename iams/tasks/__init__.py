@@ -10,5 +10,6 @@ Tasks are auto-discovered by Celery via ``app.autodiscover_tasks()`` in
     iams.tasks.cleanup     — scheduled retention/archival jobs (Phase 2/5)
 """
 from .auth import send_password_reset_email
+from .scans import scan_uploaded_file
 
-__all__ = ["send_password_reset_email"]
+__all__ = ["send_password_reset_email", "scan_uploaded_file"]

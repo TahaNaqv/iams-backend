@@ -142,10 +142,17 @@ class EvidenceFileSerializer(serializers.ModelSerializer):
     sizeKb = serializers.IntegerField(source="size_kb")
     uploadedBy = serializers.CharField(source="uploaded_by")
     uploadedAt = serializers.DateTimeField(source="uploaded_at")
+    scanStatus = serializers.CharField(source="scan_status", read_only=True)
+    scanSignature = serializers.CharField(source="scan_signature", read_only=True)
+    scannedAt = serializers.DateTimeField(source="scanned_at", read_only=True, allow_null=True)
+    quarantined = serializers.BooleanField(read_only=True)
 
     class Meta:
         model = EvidenceFile
-        fields = ["id", "auditId", "name", "type", "sizeKb", "uploadedBy", "uploadedAt"]
+        fields = [
+            "id", "auditId", "name", "type", "sizeKb", "uploadedBy", "uploadedAt",
+            "scanStatus", "scanSignature", "scannedAt", "quarantined",
+        ]
 
 
 class TimelineEventSerializer(serializers.ModelSerializer):
@@ -332,12 +339,9 @@ class RiskAssessmentSummaryItemSerializer(serializers.ModelSerializer):
 
 
 class RiskAssessmentImportIssueSerializer(serializers.ModelSerializer):
-    sheetName = serializers.CharField(source="sheet_name")
-    rowNumber = serializers.IntegerField(source="row_number")
-
     class Meta:
         model = RiskAssessmentImportIssue
-        fields = ["id", "severity", "sheetName", "rowNumber", "message"]
+        fields = ["id", "severity", "sheet", "cell", "message"]
 
 
 class ApprovalStepSerializer(serializers.ModelSerializer):
@@ -529,6 +533,10 @@ class ManagedDocumentSerializer(serializers.ModelSerializer):
     createdDate = serializers.DateField(source="created_date", allow_null=True)
     modifiedDate = serializers.DateField(source="modified_date", allow_null=True)
     downloadUrl = serializers.SerializerMethodField()
+    scanStatus = serializers.CharField(source="scan_status", read_only=True)
+    scanSignature = serializers.CharField(source="scan_signature", read_only=True)
+    scannedAt = serializers.DateTimeField(source="scanned_at", read_only=True, allow_null=True)
+    quarantined = serializers.BooleanField(read_only=True)
 
     class Meta:
         model = ManagedDocument
@@ -547,13 +555,21 @@ class ManagedDocumentSerializer(serializers.ModelSerializer):
             "tags",
             "versions",
             "downloadUrl",
+            "scanStatus",
+            "scanSignature",
+            "scannedAt",
+            "quarantined",
         ]
 
     def get_downloadUrl(self, obj):
+        # Quarantined documents must not expose a download URL.
+        if obj.quarantined or not obj.file:
+            return None
         request = self.context.get("request")
-        if obj.file and request:
-            return request.build_absolute_uri(obj.file.url)
-        return None
+        url = obj.file.url
+        if request and not url.startswith(("http://", "https://")):
+            url = request.build_absolute_uri(url)
+        return url
 
 
 class ManagedDocumentWriteSerializer(serializers.ModelSerializer):

@@ -214,6 +214,34 @@ class ChecklistItem(TimeStampedModel):
 
 
 class EvidenceFile(TimeStampedModel):
+    """An audit working-paper attachment.
+
+    Files are stored on local disk (dev) or MinIO/S3 (prod) — selected via
+    the ``USE_S3_STORAGE`` / ``STORAGES`` settings, not anything model-level.
+
+    Every upload is virus-scanned asynchronously by
+    ``iams.tasks.scans.scan_evidence_file`` (Celery + clamd). The scan
+    result lives on the row itself:
+
+      - ``SCAN_PENDING``  — task not yet completed
+      - ``SCAN_CLEAN``    — clamd returned OK
+      - ``SCAN_INFECTED`` — clamd flagged the file; ``quarantined=True`` and
+                            downloads are blocked
+      - ``SCAN_ERROR``    — clamd unreachable / non-fatal scan failure;
+                            human review required
+    """
+
+    SCAN_PENDING = "pending"
+    SCAN_CLEAN = "clean"
+    SCAN_INFECTED = "infected"
+    SCAN_ERROR = "error"
+    SCAN_STATUS_CHOICES = [
+        (SCAN_PENDING, "Pending"),
+        (SCAN_CLEAN, "Clean"),
+        (SCAN_INFECTED, "Infected"),
+        (SCAN_ERROR, "Scan error"),
+    ]
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     audit = models.ForeignKey(Audit, on_delete=models.CASCADE, related_name="evidence_files")
     file = models.FileField(upload_to="evidence/%Y/%m/%d/", blank=True, null=True)
@@ -225,6 +253,14 @@ class EvidenceFile(TimeStampedModel):
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="uploaded_evidence_files"
     )
     uploaded_at = models.DateTimeField()
+
+    # AV scan state — set asynchronously by iams.tasks.scans
+    scan_status = models.CharField(
+        max_length=20, choices=SCAN_STATUS_CHOICES, default=SCAN_PENDING, db_index=True
+    )
+    scan_signature = models.CharField(max_length=255, blank=True)  # virus name from clamd
+    scanned_at = models.DateTimeField(null=True, blank=True)
+    quarantined = models.BooleanField(default=False, db_index=True)
 
     class Meta:
         indexes = [models.Index(fields=["audit", "uploaded_at"])]
@@ -441,7 +477,12 @@ class RiskAssessmentImportIssue(TimeStampedModel):
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     severity = models.CharField(max_length=20, choices=SEVERITY_CHOICES, default="warning")
-    sheet_name = models.CharField(max_length=255, blank=True)
+    # Matches the FE contract `{ sheet, cell }`. ``cell`` is a free-form
+    # Excel-style reference (e.g. "B14") so renderers can deep-link straight to
+    # the offending workbook cell. ``row_number`` is kept for backwards
+    # compatibility and ordering.
+    sheet = models.CharField(max_length=255, blank=True)
+    cell = models.CharField(max_length=20, blank=True)
     row_number = models.PositiveIntegerField(default=0)
     message = models.TextField()
 
@@ -600,6 +641,17 @@ class ManagedDocument(TimeStampedModel):
     description = models.TextField(blank=True)
     tags = models.JSONField(default=list, blank=True)
     versions = models.JSONField(default=list, blank=True)
+
+    # Mirrors EvidenceFile scan state — same task scans both.
+    scan_status = models.CharField(
+        max_length=20,
+        choices=EvidenceFile.SCAN_STATUS_CHOICES,
+        default=EvidenceFile.SCAN_PENDING,
+        db_index=True,
+    )
+    scan_signature = models.CharField(max_length=255, blank=True)
+    scanned_at = models.DateTimeField(null=True, blank=True)
+    quarantined = models.BooleanField(default=False, db_index=True)
 
     class Meta:
         ordering = ["-modified_date", "-created_at"]

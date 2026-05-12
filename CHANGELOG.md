@@ -2,6 +2,45 @@
 
 All notable changes to the IAMS Django REST API backend.
 
+## [0.5.0] — Phase 1 Track 3: MinIO storage + ClamAV virus scanning (2026-05-12)
+
+### Added
+- **Antivirus scanning of uploads** — every `EvidenceFile` and `ManagedDocument` upload is scanned asynchronously by `iams.tasks.scans.scan_uploaded_file` (Celery + `clamd` over TCP INSTREAM).
+- **`clamd>=1.0.2`** dependency in `pyproject.toml`.
+- New model fields on both `EvidenceFile` and `ManagedDocument` (migration 0007): `scan_status` (`pending`/`clean`/`infected`/`error`), `scan_signature`, `scanned_at`, `quarantined`. Exposed in serializers as `scanStatus`/`scanSignature`/`scannedAt`/`quarantined`.
+- **`clamav` service** in `docker-compose.yml` — runs `clamav/clamav:stable` with healthcheck (note: first boot downloads ~250MB of virus definitions; `start_period: 600s`).
+- **CLAMD configuration** in `config/settings/base.py`: `CLAMD_HOST` / `CLAMD_PORT` / `CLAMD_SCAN_TIMEOUT` / `CLAMD_MAX_FILE_MB` / `CLAMD_SKIP` (escape hatch for dev/CI without clamd).
+- **13 scan-flow tests** in `iams/tests/test_scans.py` — clean / infected / scan error / `CLAMD_SKIP` / oversize / missing row / unknown model_label / upload-dispatches / 403-quarantined-download / 409-pending-download / clean-download / managed-document upload / managed-document-quarantined-hides-downloadUrl.
+
+### Behavior
+- **Fail-closed** — any clamd error or oversize file is marked `quarantined=True`; humans must clear it.
+- **Download endpoint** (`GET /api/evidence-files/<id>/download/`) now:
+  - 403 if quarantined (with `scanStatus` + `scanSignature` in body)
+  - 409 if scan still pending
+  - 200 with signed URL otherwise (MinIO returns presigned URL via `django-storages` when `USE_S3_STORAGE=1`; FileSystemStorage returns the absolute media URL in dev)
+- **ManagedDocument `downloadUrl`** is `null` when quarantined — the FE cannot accidentally link to a virus-flagged file.
+- **Rescan on file replace** — `ManagedDocumentViewSet.perform_update` resets scan state and dispatches a new scan if the `file` field changes.
+
+### Test totals
+- **Backend: 304 tests passing** (was 291; added 13 scan tests). Coverage stable.
+
+## [0.4.0] — Phase 1 Track 2: Contract Conformance (2026-05-12)
+
+### Added
+- **`iams/tests/test_contract.py`** — **32 contract conformance tests**, one per major endpoint, asserting the JSON response shape matches the frontend's TypeScript model exactly (every camelCase field present, no snake_case leaks, list/dict types correct). This file is the **executable version** of `iams-frontend/docs/api-contract.md`.
+- `cell` field on `RiskAssessmentImportIssue` model — added via [migration 0006](iams/migrations/0006_rename_sheet_name_riskassessmentimportissue_sheet_and_more.py) to match the FE contract `{sheet, cell}`.
+
+### Fixed (drift caught by the new contract suite)
+- `RiskAssessmentImportIssue` had `sheet_name` / `row_number` model fields with `sheetName` / `rowNumber` serializer keys. The FE contract expects `sheet` / `cell`. Renamed the field, added the new one, simplified the serializer.
+
+### Changed
+- `DefaultPagination.page_size` bumped 25→100 (max stays 200) so the existing FE list pages (which do not yet render pagination controls) don't silently truncate. Phase 4 dashboard work will reintroduce 25-per-page once the UI catches up.
+- `order_by()` added to: `UserViewSet`, `ChecklistItemViewSet`, `EvidenceFileViewSet`, `AuditableEntityViewSet`, `FollowUpViewSet`, `AssignmentViewSet`, `HoursBudgetViewSet`, `RiskAssessmentViewSet`. Silences DRF's `UnorderedObjectListWarning` and gives paginated lists deterministic ordering.
+
+### Notes
+- All 291 backend tests passing. Coverage stable.
+- Per the plan, the FE convention `pendingCAPs` (acronym preserved) was kept rather than normalized to `pendingCaps` — the FE i18n keys, mock data, and components all use the acronym form.
+
 ## [0.3.0] — Phase 1 Milestone: Auth Hardening + RBAC Matrix (2026-05-12)
 
 ### Added — Auth endpoints

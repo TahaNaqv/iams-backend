@@ -11,7 +11,12 @@ User = get_user_model()
 
 
 class UserViewSet(viewsets.ModelViewSet):
-    queryset = User.objects.select_related("profile__role").prefetch_related("profile__role__permissions").all()
+    queryset = (
+        User.objects.select_related("profile__role")
+        .prefetch_related("profile__role__permissions")
+        .all()
+        .order_by("id")
+    )
     permission_classes = [HasPermission("manage_users")]
 
     def get_serializer_class(self):

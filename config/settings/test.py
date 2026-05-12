@@ -56,3 +56,9 @@ REST_FRAMEWORK["DEFAULT_THROTTLE_RATES"] = {
 import logging  # noqa: E402
 
 logging.disable(logging.CRITICAL)
+
+# Antivirus — never reach a real clamd in tests. Individual tests patch
+# the client directly when they need to exercise scan behavior.
+CLAMD_SKIP = True
+CLAMD_HOST = "clamav-not-used-in-tests"
+CLAMD_PORT = 3310

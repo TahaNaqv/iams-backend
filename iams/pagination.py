@@ -16,9 +16,15 @@ class DefaultPagination(PageNumberPagination):
     Query params:
         - ?page=N
         - ?page_size=N (capped at max_page_size)
+
+    The default page size is intentionally generous (100) because the current
+    UI does not yet expose pagination controls on most list views. Phase 4's
+    dashboard work will introduce proper paginated tables; at that point this
+    default can be tightened to 25. The hard ceiling (``max_page_size``) is
+    what determines the worst case, not this default.
     """
 
-    page_size = 25
+    page_size = 100
     page_size_query_param = "page_size"
     max_page_size = 200
 

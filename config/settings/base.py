@@ -219,7 +219,7 @@ REST_FRAMEWORK = {
         "auth_burst": "10/minute",
     },
     "DEFAULT_PAGINATION_CLASS": "iams.pagination.DefaultPagination",
-    "PAGE_SIZE": 25,
+    "PAGE_SIZE": 100,
     "DEFAULT_FILTER_BACKENDS": [
         "django_filters.rest_framework.DjangoFilterBackend",
         "rest_framework.filters.SearchFilter",
@@ -372,6 +372,15 @@ LOGGING = {
         },
     },
 }
+
+# ──────────────────────────────────────────────────────────────────────
+# Antivirus scanning (ClamAV daemon, see iams.tasks.scans)
+# ──────────────────────────────────────────────────────────────────────
+CLAMD_HOST = env("CLAMD_HOST", default="clamav")
+CLAMD_PORT = env.int("CLAMD_PORT", default=3310)
+CLAMD_SCAN_TIMEOUT = env.int("CLAMD_SCAN_TIMEOUT", default=60)
+CLAMD_MAX_FILE_MB = env.int("CLAMD_MAX_FILE_MB", default=100)
+CLAMD_SKIP = env.bool("CLAMD_SKIP", default=False)
 
 # ──────────────────────────────────────────────────────────────────────
 # Super admin seeding (used by manage.py seed_rbac)

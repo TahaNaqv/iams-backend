@@ -174,7 +174,7 @@ class ChecklistByAuditView(APIView):
 
 
 class ChecklistItemViewSet(viewsets.ModelViewSet):
-    queryset = ChecklistItem.objects.all()
+    queryset = ChecklistItem.objects.all().order_by("created_at", "id")
     serializer_class = ChecklistItemSerializer
 
     def get_permissions(self):
@@ -221,20 +221,55 @@ class EvidenceByAuditView(APIView):
             uploaded_by=request.data.get("uploadedBy") or (getattr(request.user, "email", "") or ""),
             uploaded_at=now,
         )
+        # Dispatch AV scan asynchronously — the upload returns immediately
+        # with scan_status='pending'; the FE polls the row to see when the
+        # scan finishes (or relies on the WebSocket push planned for Phase 5).
+        from iams.tasks import scan_uploaded_file
+        scan_uploaded_file.delay(model_label="EvidenceFile", object_id=str(item.id))
         return Response(EvidenceFileSerializer(item).data, status=status.HTTP_201_CREATED)
 
 
 class EvidenceFileViewSet(viewsets.ReadOnlyModelViewSet):
-    queryset = EvidenceFile.objects.all()
+    queryset = EvidenceFile.objects.all().order_by("-uploaded_at", "id")
     serializer_class = EvidenceFileSerializer
     permission_classes = [HasPermission("view_audits")]
 
     @action(detail=True, methods=["get"], url_path="download")
     def download(self, request, pk=None):
+        """Return a download URL.
+
+        Quarantined files (failed AV scan, scan error, or oversized) refuse
+        the download with 403 — the row remains visible (so reviewers know
+        something was uploaded) but the bytes are unreachable.
+
+        When the storage backend supports it (MinIO/S3), this returns a
+        signed URL with a short expiry; for local FileSystemStorage in dev
+        it falls back to an absolute media URL.
+        """
         obj = self.get_object()
+        if obj.quarantined:
+            return Response(
+                {
+                    "detail": "File is quarantined.",
+                    "scanStatus": obj.scan_status,
+                    "scanSignature": obj.scan_signature,
+                },
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        if obj.scan_status == EvidenceFile.SCAN_PENDING:
+            return Response(
+                {"detail": "File is still being scanned.", "scanStatus": obj.scan_status},
+                status=status.HTTP_409_CONFLICT,
+            )
         if not obj.file:
             return Response({"detail": "No file available."}, status=status.HTTP_404_NOT_FOUND)
-        return Response({"url": request.build_absolute_uri(obj.file.url)})
+        # ``file.url`` already produces a signed URL when django-storages is
+        # configured with ``querystring_auth=True`` (see settings.prod). For
+        # local FileSystemStorage we wrap it in the request host.
+        url = obj.file.url
+        if not url.startswith(("http://", "https://")):
+            url = request.build_absolute_uri(url)
+        return Response({"url": url})
 
 
 class TimelineByAuditView(APIView):
@@ -255,7 +290,7 @@ class TimelineByAuditView(APIView):
 
 
 class AuditableEntityViewSet(viewsets.ReadOnlyModelViewSet):
-    queryset = AuditableEntity.objects.all()
+    queryset = AuditableEntity.objects.all().order_by("name", "id")
     serializer_class = AuditableEntitySerializer
     permission_classes = [HasPermission("view_audits")]
 
@@ -291,7 +326,7 @@ class AuditLogViewSet(viewsets.ReadOnlyModelViewSet):
 
 
 class FollowUpViewSet(viewsets.GenericViewSet, mixins.ListModelMixin, mixins.RetrieveModelMixin, mixins.UpdateModelMixin):
-    queryset = FollowUpItem.objects.select_related("finding").all()
+    queryset = FollowUpItem.objects.select_related("finding").all().order_by("due_date", "id")
     serializer_class = FollowUpItemSerializer
     permission_classes = [HasPermission("manage_findings")]
 
@@ -337,7 +372,11 @@ class AuditorViewSet(viewsets.ModelViewSet):
 
 
 class AssignmentViewSet(viewsets.ModelViewSet):
-    queryset = AuditAssignment.objects.select_related("auditor", "audit").all()
+    queryset = (
+        AuditAssignment.objects.select_related("auditor", "audit")
+        .all()
+        .order_by("start_date", "id")
+    )
     permission_classes = [HasPermission("view_audits")]
 
     def get_serializer_class(self):
@@ -371,7 +410,7 @@ class TimeEntryViewSet(viewsets.ModelViewSet):
 
 
 class HoursBudgetViewSet(viewsets.ModelViewSet):
-    queryset = HoursBudget.objects.select_related("audit").all()
+    queryset = HoursBudget.objects.select_related("audit").all().order_by("id")
     permission_classes = [HasPermission("view_audits")]
 
     def get_serializer_class(self):
@@ -388,7 +427,7 @@ class HoursBudgetViewSet(viewsets.ModelViewSet):
 
 
 class RiskAssessmentViewSet(viewsets.ModelViewSet):
-    queryset = RiskAssessmentRecord.objects.all()
+    queryset = RiskAssessmentRecord.objects.all().order_by("department", "source_row", "id")
     serializer_class = RiskAssessmentRecordSerializer
     permission_classes = [HasPermission("view_audits")]
 
@@ -526,3 +565,26 @@ class ManagedDocumentViewSet(viewsets.ModelViewSet):
         if self.action in ("create", "update", "partial_update"):
             return ManagedDocumentWriteSerializer
         return ManagedDocumentSerializer
+
+    def perform_create(self, serializer):
+        # Save first so the row exists, then dispatch the AV scan.
+        instance = serializer.save()
+        if instance.file:
+            from iams.tasks import scan_uploaded_file
+            scan_uploaded_file.delay(model_label="ManagedDocument", object_id=str(instance.id))
+
+    def perform_update(self, serializer):
+        # If the file was replaced, reset scan state and rescan.
+        old_file_name = serializer.instance.file.name if serializer.instance.file else None
+        instance = serializer.save()
+        new_file_name = instance.file.name if instance.file else None
+        if new_file_name and new_file_name != old_file_name:
+            instance.scan_status = EvidenceFile.SCAN_PENDING
+            instance.scan_signature = ""
+            instance.quarantined = False
+            instance.scanned_at = None
+            instance.save(
+                update_fields=["scan_status", "scan_signature", "quarantined", "scanned_at"]
+            )
+            from iams.tasks import scan_uploaded_file
+            scan_uploaded_file.delay(model_label="ManagedDocument", object_id=str(instance.id))

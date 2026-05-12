@@ -35,7 +35,7 @@ dependencies = [
     "flower>=2.0.1",
 
     # Email
-    "django-anymail[sendgrid,smtp]>=12.0",
+    "django-anymail[sendgrid]>=12.0",
 
     # WSGI/ASGI server
     "gunicorn>=23.0.0",
@@ -71,6 +71,11 @@ dependencies = [
     "opentelemetry-instrumentation-psycopg2>=0.50b0",
     "opentelemetry-instrumentation-celery>=0.50b0",
     "opentelemetry-exporter-otlp>=1.29.0",
+
+    # Antivirus on uploads via ClamAV daemon (see docker-compose clamav service).
+    # ``clamd`` is the pure-Python protocol client; the daemon itself runs as a
+    # separate container in production.
+    "clamd>=1.0.2",
 
     # Utilities
     "python-dateutil>=2.9.0",

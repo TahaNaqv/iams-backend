@@ -25,6 +25,11 @@ from iams.models import (
 )
 from iams.notifications import dispatch
 from iams.tasks.notify import _resolve_user_from_owner_label
+from iams.workflows import (
+    apply_chain_template,
+    approval_request_approved,
+    approval_request_rejected,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -207,3 +212,65 @@ def approval_step_assigned_notify(sender, instance: ApprovalStep, created: bool,
         )
     except Exception:  # noqa: BLE001
         logger.exception("notify: ApprovalStep handler failed")
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Auto-apply chain template on ApprovalRequest creation
+# ──────────────────────────────────────────────────────────────────────
+@receiver(post_save, sender=ApprovalRequest, dispatch_uid="iams_approval_apply_chain")
+def approval_request_apply_chain(sender, instance: ApprovalRequest, created: bool, **kwargs):
+    """When an ApprovalRequest is created and the caller didn't attach
+    any steps, expand the active ApprovalChainTemplate for that type.
+
+    Runs after the row exists so the inline-steps API path (which writes
+    its own ApprovalStep rows in the serializer create()) wins by default.
+    """
+    if not created:
+        return
+    try:
+        apply_chain_template(instance)
+    except Exception:  # noqa: BLE001
+        logger.exception("workflow: chain template apply failed")
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Domain-specific side effects on approval completion
+# ──────────────────────────────────────────────────────────────────────
+@receiver(approval_request_approved, dispatch_uid="iams_approval_approved_side_effects")
+def approval_request_approved_side_effects(sender, instance: ApprovalRequest, **kwargs):
+    """React to the fully-approved request.
+
+    Each request type can have follow-on actions: an approved CAP
+    Closure marks the CAP closed, an approved Report marks it Final,
+    an approved Audit Plan unlocks audits for that period. The actions
+    are best-effort — failures are logged but don't roll back the
+    approval itself.
+    """
+    try:
+        ref = instance.reference_id
+        if not ref:
+            return
+        if instance.type == "CAP Closure":
+            CorrectiveAction.objects.filter(pk=ref).update(status="Closed", progress=100)
+            logger.info("workflow: CAP %s closed via approved request %s", ref, instance.pk)
+        elif instance.type == "Report":
+            from iams.models import AuditReport
+            AuditReport.objects.filter(pk=ref).update(status="Final")
+            logger.info("workflow: report %s finalized via approved request %s", ref, instance.pk)
+        elif instance.type == "Audit Plan":
+            # Audit plan approval doesn't mutate a specific row in the
+            # current schema — it just gates downstream operations. We
+            # log it so the audit trail captures the transition.
+            logger.info("workflow: audit plan %s approved", ref)
+    except Exception:  # noqa: BLE001
+        logger.exception("workflow: post-approval side effect failed")
+
+
+@receiver(approval_request_rejected, dispatch_uid="iams_approval_rejected_side_effects")
+def approval_request_rejected_side_effects(sender, instance: ApprovalRequest, **kwargs):
+    """Currently a hook for future use (e.g., revert CAP to In Progress).
+    Logs for audit-trail completeness."""
+    logger.info(
+        "workflow: request %s of type %s rejected",
+        instance.pk, instance.type,
+    )

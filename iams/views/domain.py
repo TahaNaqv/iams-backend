@@ -28,6 +28,7 @@ from iams.domain_serializers import (
     FollowUpItemSerializer,
     HoursBudgetSerializer,
     HoursBudgetWriteSerializer,
+    ApprovalChainTemplateSerializer,
     NotificationPreferenceSerializer,
     NotificationSerializer,
     RiskAssessmentImportIssueSerializer,
@@ -69,6 +70,7 @@ from iams.models import (
     Finding,
     FollowUpItem,
     HoursBudget,
+    ApprovalChainTemplate,
     Notification,
     NotificationPreference,
     RiskAssessmentImportIssue,
@@ -561,57 +563,85 @@ class RiskAssessmentImportIssuesViewSet(viewsets.ReadOnlyModelViewSet):
 
 
 class ApprovalRequestViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
-    queryset = ApprovalRequest.objects.prefetch_related("steps").all()
+    queryset = ApprovalRequest.objects.prefetch_related("steps").all().order_by("-created_at")
     serializer_class = ApprovalRequestSerializer
     permission_classes = [IsAuthenticated]
 
+    def get_queryset(self):
+        qs = super().get_queryset()
+        # ``?mine=pending`` — requests where the *current* pending step
+        # names the calling user (by email or by role). Used by the
+        # dashboard "My pending approvals" widget.
+        if self.request.query_params.get("mine") == "pending":
+            user = self.request.user
+            if not (user and user.is_authenticated):
+                return qs.none()
+            role_name = ""
+            profile = getattr(user, "profile", None)
+            if profile and profile.role:
+                role_name = profile.role.name
+            # Subquery: requests whose lowest-order pending step matches user
+            qs = qs.filter(
+                status="Pending",
+                steps__status="Pending",
+            ).filter(
+                Q(steps__approver__iexact=user.email)
+                | Q(steps__role__iexact=role_name)
+            ).distinct()
+        return qs
+
     @action(detail=True, methods=["post"], url_path="approve")
     def approve(self, request, pk=None):
+        from iams.workflows import ApprovalError, advance_on_approve, current_step
         obj = self.get_object()
         comment = request.data.get("comments", "")
-        step = obj.steps.filter(status="Pending").order_by("order").first()
-        if not step:
-            return Response({"detail": "No pending step."}, status=status.HTTP_400_BAD_REQUEST)
-        step.status = "Approved"
-        step.date = timezone.now().date()
-        step.comments = comment or "Approved."
-        step.save(update_fields=["status", "date", "comments"])
-        obj.current_step = min(obj.current_step + 1, obj.steps.count())
-        if not obj.steps.filter(status="Pending").exists() and not obj.steps.filter(status="Rejected").exists():
-            obj.status = "Approved"
-        obj.save(update_fields=["current_step", "status"])
-        # Explicit audit event — approve is a domain action, not a CRUD verb
+        # Capture the step before the call (advance_on_approve consumes it)
+        step_snapshot = current_step(obj)
+        try:
+            advance_on_approve(obj, by_user=request.user, comment=comment)
+        except ApprovalError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
         from iams.audit import record_audit_event
         record_audit_event(
             action=AuditLogEntry.ACTION_APPROVE,
             actor=request.user,
             target=obj,
-            details={"step_order": step.order, "step_role": step.role, "comments": comment},
+            details={
+                "step_order": step_snapshot.order if step_snapshot else None,
+                "step_role": step_snapshot.role if step_snapshot else "",
+                "comments": comment,
+                "final_status": obj.status,
+            },
             request=request,
         )
+        obj.refresh_from_db()
         return Response(ApprovalRequestSerializer(obj).data)
 
     @action(detail=True, methods=["post"], url_path="reject")
     def reject(self, request, pk=None):
+        from iams.workflows import ApprovalError, current_step, reject_request
         obj = self.get_object()
         comment = request.data.get("comments", "")
-        step = obj.steps.filter(status="Pending").order_by("order").first()
-        if not step:
-            return Response({"detail": "No pending step."}, status=status.HTTP_400_BAD_REQUEST)
-        step.status = "Rejected"
-        step.date = timezone.now().date()
-        step.comments = comment or "Rejected."
-        step.save(update_fields=["status", "date", "comments"])
-        obj.status = "Rejected"
-        obj.save(update_fields=["status"])
+        step_snapshot = current_step(obj)
+        try:
+            reject_request(obj, by_user=request.user, comment=comment)
+        except ApprovalError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
         from iams.audit import record_audit_event
         record_audit_event(
             action=AuditLogEntry.ACTION_REJECT,
             actor=request.user,
             target=obj,
-            details={"step_order": step.order, "step_role": step.role, "comments": comment},
+            details={
+                "step_order": step_snapshot.order if step_snapshot else None,
+                "step_role": step_snapshot.role if step_snapshot else "",
+                "comments": comment,
+            },
             request=request,
         )
+        obj.refresh_from_db()
         return Response(ApprovalRequestSerializer(obj).data)
 
 
@@ -698,3 +728,20 @@ class ManagedDocumentViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
             )
             from iams.tasks import scan_uploaded_file
             scan_uploaded_file.delay(model_label="ManagedDocument", object_id=str(instance.id))
+
+
+class ApprovalChainTemplateViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
+    """Admin-managed approval chain templates.
+
+    Read access requires ``view_audits`` (so the WorkflowApprovals page
+    can show "this is the chain that will apply"). Write access requires
+    ``manage_settings`` since editing a template changes how every
+    future approval is routed.
+    """
+    queryset = ApprovalChainTemplate.objects.all().order_by("request_type", "name")
+    serializer_class = ApprovalChainTemplateSerializer
+
+    def get_permissions(self):
+        if self.action in ("list", "retrieve"):
+            return [HasPermission("view_audits")]
+        return [HasPermission("manage_settings")]

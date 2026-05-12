@@ -16,6 +16,7 @@ from .notify import (
     dispatch_weekly_digest,
 )
 from .scans import scan_uploaded_file
+from .workflows import escalate_overdue_steps
 
 __all__ = [
     "send_password_reset_email",
@@ -23,4 +24,5 @@ __all__ = [
     "deliver_email",
     "dispatch_cap_overdue_reminders",
     "dispatch_weekly_digest",
+    "escalate_overdue_steps",
 ]

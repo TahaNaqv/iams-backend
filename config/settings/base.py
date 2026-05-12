@@ -328,6 +328,12 @@ CELERY_BEAT_SCHEDULE = {
         "task": "iams.notify.weekly_digest",
         "schedule": crontab(day_of_week="monday", hour=8, minute=0),
     },
+    # Nightly at 03:00 local — escalate any pending approval steps past
+    # their SLA (deduped to once per 24h via ApprovalStep.escalated_at).
+    "approval-escalation-nightly": {
+        "task": "iams.workflows.escalate_overdue_steps",
+        "schedule": crontab(hour=3, minute=0),
+    },
 }
 
 # ──────────────────────────────────────────────────────────────────────

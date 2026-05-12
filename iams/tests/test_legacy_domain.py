@@ -156,8 +156,11 @@ class DomainApiTests(APITestCase):
                 "priority": "High",
                 "description": "Needs approval",
                 "status": "Pending",
+                # Phase 2 lock-down: approve/reject now require the caller
+                # to either match approver.email or hold the step's role.
+                # The test user has role "Audit Manager".
                 "steps": [
-                    {"role": "Manager", "approver": "Jane", "status": "Pending", "date": None, "comments": "", "order": 0}
+                    {"role": "Audit Manager", "approver": "tester@example.com", "status": "Pending", "date": None, "comments": "", "order": 0}
                 ],
             },
             format="json",

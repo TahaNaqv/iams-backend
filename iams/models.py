@@ -679,15 +679,19 @@ class ApprovalRequest(TimeStampedModel):
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     title = models.CharField(max_length=255)
-    type = models.CharField(max_length=50, choices=TYPE_CHOICES)
-    reference_id = models.CharField(max_length=100, blank=True)
+    type = models.CharField(max_length=50, choices=TYPE_CHOICES, db_index=True)
+    reference_id = models.CharField(max_length=100, blank=True, db_index=True)
     department = models.CharField(max_length=200, blank=True)
     submitted_by = models.CharField(max_length=200, blank=True)
     submitted_date = models.DateField(null=True, blank=True)
     current_step = models.PositiveIntegerField(default=0)
     priority = models.CharField(max_length=10, choices=PRIORITY_CHOICES, default="Medium")
     description = models.TextField(blank=True)
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="Pending")
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="Pending", db_index=True)
+
+    # When the request was last actioned (used by escalation telemetry +
+    # FE staleness badges). Set automatically by approve/reject.
+    last_action_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         ordering = ["-created_at"]
@@ -699,14 +703,79 @@ class ApprovalStep(TimeStampedModel):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     request = models.ForeignKey(ApprovalRequest, on_delete=models.CASCADE, related_name="steps")
     order = models.PositiveIntegerField(default=0)
-    role = models.CharField(max_length=100, blank=True)
-    approver = models.CharField(max_length=200, blank=True)
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="Pending")
+    role = models.CharField(max_length=100, blank=True, db_index=True)
+    approver = models.CharField(max_length=200, blank=True, db_index=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="Pending", db_index=True)
     date = models.DateField(null=True, blank=True)
     comments = models.TextField(blank=True)
 
+    # SLA fields driven by the chain template that applied this step.
+    sla_days = models.PositiveIntegerField(
+        default=7,
+        help_text="How long this step has before it's eligible for escalation.",
+    )
+    due_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    escalated_at = models.DateTimeField(null=True, blank=True)
+
     class Meta:
         ordering = ["order", "created_at"]
+
+
+class ApprovalChainTemplate(TimeStampedModel):
+    """Configurable approval chain for a given request type.
+
+    Tooling rule: when an ``ApprovalRequest`` is created with no
+    explicit ``steps``, the matching active template's ``chain`` is
+    expanded into ``ApprovalStep`` rows automatically.
+
+    ``chain`` is a JSON array of step descriptors::
+
+        [
+          {"role": "Audit Manager",  "sla_days": 3},
+          {"role": "CAE",            "sla_days": 5},
+          {"role": "Board",          "sla_days": 14}
+        ]
+
+    The optional ``approver_role_attr`` (default ``role``) lets a template
+    target a Permission key or other role attribute when the chain needs
+    to dispatch to a specific user rather than fan-out by role name.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    name = models.CharField(max_length=200, unique=True)
+    request_type = models.CharField(max_length=50, choices=ApprovalRequest.TYPE_CHOICES)
+    chain = models.JSONField(
+        default=list,
+        help_text="Ordered list of {role, sla_days} step descriptors.",
+    )
+    description = models.TextField(blank=True)
+    is_active = models.BooleanField(default=True, db_index=True)
+
+    class Meta:
+        ordering = ["request_type", "name"]
+        constraints = [
+            # At most one active template per request type — keeps auto-apply
+            # deterministic. Admin must deactivate the old one before
+            # activating a replacement.
+            models.UniqueConstraint(
+                fields=["request_type"],
+                condition=models.Q(is_active=True),
+                name="iams_one_active_chain_per_type",
+            ),
+        ]
+
+    def step_descriptors(self) -> list[dict]:
+        """Return the chain as a list of dicts; tolerant of legacy shapes."""
+        out: list[dict] = []
+        for entry in self.chain or []:
+            if isinstance(entry, str):
+                out.append({"role": entry, "sla_days": 7})
+            elif isinstance(entry, dict):
+                out.append({
+                    "role": entry.get("role", ""),
+                    "sla_days": int(entry.get("sla_days", 7) or 7),
+                })
+        return out
 
 
 class WorkProgram(TimeStampedModel):

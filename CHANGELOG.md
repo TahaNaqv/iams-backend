@@ -2,6 +2,46 @@
 
 All notable changes to the IAMS Django REST API backend.
 
+## [0.8.0] — Phase 2 Track 3: Approval workflow engine + escalation (2026-05-12)
+
+### Added
+- **`ApprovalChainTemplate` model** — configurable, per-`request_type` approval chain. JSON `chain` field of `{role, sla_days}` step descriptors. DB-level unique-active constraint per request type (`iams_one_active_chain_per_type`).
+- **`ApprovalStep` SLA fields** (migration 0011): `sla_days`, `due_at` (db_index), `escalated_at`.
+- **`ApprovalRequest.last_action_at`** for telemetry and FE staleness badges.
+- **Workflow service module** `iams/workflows.py`:
+  - `apply_chain_template(request)` — expands the active template into `ApprovalStep` rows; idempotent.
+  - `can_user_action(request, user)` — authorisation: approver email match, OR role match, OR super-admin bypass.
+  - `advance_on_approve(request, by_user, comment)` — locked to designated approver. Advances `current_step`, promotes the next step's `due_at`, and fires the `approval_request_approved` signal when the chain completes.
+  - `reject_request(request, by_user, comment)` — short-circuits + fires `approval_request_rejected`.
+  - `overdue_pending_steps()` — read-only generator for the escalation task.
+- **Domain signals** `approval_request_approved`, `approval_request_rejected`, `approval_step_escalated` — emitted by the workflow engine for downstream consumers.
+- **Auto-apply chain on creation** — `post_save` signal expands the active `ApprovalChainTemplate` into steps whenever an `ApprovalRequest` is created without inline steps.
+- **Domain-specific side-effect handlers** (in `iams/signals.py`):
+  - `CAP Closure` approved → marks the CAP `Closed` + `progress=100`.
+  - `Report` approved → marks the `AuditReport` `Final`.
+  - `Audit Plan` approved → logs the gating transition (downstream behavior in Phase 4).
+- **Escalation Celery task** `iams.workflows.escalate_overdue_steps`:
+  - Stamps `escalated_at` on overdue pending steps (24h dedupe).
+  - Re-pings the original approver with escalated wording.
+  - Broadcasts a heads-up to every active Audit Manager via `dispatch_to_role`.
+  - Records `approval_step_escalated` audit-log event (actor `system:escalation`).
+  - Sends the `approval_step_escalated` signal for future consumers.
+- **Beat schedule** — nightly at 03:00 local.
+- **`ApprovalChainTemplateViewSet`** at `/api/approval-chain-templates/`. Reads gated by `view_audits`; writes by `manage_settings`.
+- **`?mine=pending`** filter on `/api/approval-requests/` — returns requests whose current pending step matches the caller's email OR role.
+- **`seed_approval_chains` management command** — seeds 5 default templates (Audit Plan, CAP Closure, Finding, Report, Risk Assessment). Idempotent; `--activate` to force-activate after seed.
+
+### Changed
+- `ApprovalRequestViewSet.approve` / `.reject` now route through the workflow service. **Unauthorised approvers get 400 with a clear "not the designated approver" message.** Audit-log events now capture the step role + final request status.
+- `ApprovalStepSerializer` exposes `slaDays`, `dueAt`, `escalatedAt`, `overdue` (computed: pending AND past due_at). `ApprovalRequestSerializer` exposes `lastActionAt`.
+
+### Test totals
+- **Backend: 358 passing** (was 339; added 19 workflow tests). Coverage stable.
+- Updated legacy test to satisfy the new approver-lockdown rule.
+
+### Notes
+- The Postgres `Q(escalated_at__isnull=True) | Q(escalated_at__lt=cutoff)` dedupe is checked **before** `escalated_at` is stamped in the task, so re-running mid-window is a true no-op (verified by `test_escalation_is_deduped_per_24h`).
+
 ## [0.7.0] — Phase 2 Track 2: Notifications + email pipeline (2026-05-12)
 
 ### Added

@@ -2,6 +2,7 @@ from rest_framework import serializers
 
 from iams.models import (
     ActivityItem,
+    ApprovalChainTemplate,
     Audit,
     AuditAssignment,
     AuditableEntity,
@@ -389,13 +390,28 @@ class RiskAssessmentImportIssueSerializer(serializers.ModelSerializer):
 
 
 class ApprovalStepSerializer(serializers.ModelSerializer):
+    slaDays = serializers.IntegerField(source="sla_days", read_only=True)
+    dueAt = serializers.DateTimeField(source="due_at", read_only=True, allow_null=True)
+    escalatedAt = serializers.DateTimeField(source="escalated_at", read_only=True, allow_null=True)
+    overdue = serializers.SerializerMethodField()
+
     class Meta:
         model = ApprovalStep
-        fields = ["id", "role", "approver", "status", "date", "comments", "order"]
+        fields = [
+            "id", "role", "approver", "status", "date", "comments", "order",
+            "slaDays", "dueAt", "escalatedAt", "overdue",
+        ]
+
+    def get_overdue(self, obj) -> bool:
+        from django.utils import timezone
+        return bool(
+            obj.status == "Pending" and obj.due_at is not None and obj.due_at < timezone.now()
+        )
 
 
 class ApprovalRequestSerializer(serializers.ModelSerializer):
     steps = ApprovalStepSerializer(many=True)
+    lastActionAt = serializers.DateTimeField(source="last_action_at", read_only=True, allow_null=True)
 
     class Meta:
         model = ApprovalRequest
@@ -412,6 +428,7 @@ class ApprovalRequestSerializer(serializers.ModelSerializer):
             "description",
             "status",
             "steps",
+            "lastActionAt",
         ]
 
     def create(self, validated_data):
@@ -429,6 +446,15 @@ class ApprovalRequestSerializer(serializers.ModelSerializer):
                 setattr(instance, k, v)
         instance.save()
         return instance
+
+
+class ApprovalChainTemplateSerializer(serializers.ModelSerializer):
+    requestType = serializers.CharField(source="request_type")
+    isActive = serializers.BooleanField(source="is_active")
+
+    class Meta:
+        model = ApprovalChainTemplate
+        fields = ["id", "name", "requestType", "chain", "description", "isActive"]
 
 
 class WorkProcedureStepSerializer(serializers.ModelSerializer):

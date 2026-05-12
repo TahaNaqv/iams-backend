@@ -1,15 +1,49 @@
-.venv
-__pycache__
-*.pyc
-*.pyo
+# IAMS backend Docker build context — exclude noise + secrets.
+
+# Version control
 .git
 .gitignore
+.gitattributes
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv
+venv/
+env/
+
+# Local dev artifacts
+db.sqlite3
+db.sqlite3-journal
+media/
+staticfiles/
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editor / OS
+.vscode
+.idea
+.DS_Store
+*.swp
+
+# Secrets — must never be baked into images
 .env
 .env.*
 !.env.example
-*.sqlite3
-.pytest_cache
-.idea
-.vscode
+
+# Docs / CI not needed at runtime
+docs/
 *.md
 !README.md
+deploy.sh
+
+# Pre-commit
+.pre-commit-config.yaml

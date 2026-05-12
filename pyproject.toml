@@ -1,15 +1,237 @@
 [project]
 name = "iams-backend"
-version = "0.1.0"
-description = "Add your description here"
+version = "0.2.0"
+description = "Internal Audit Management System — Django REST API backend"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    # Core framework
     "django>=6.0.2",
-    "django-cors-headers>=4.9.0",
-    "django-filter>=25.2",
     "djangorestframework>=3.16.1",
     "djangorestframework-simplejwt>=5.5.1",
+    "djangorestframework-camel-case>=1.4.2",
+    "django-filter>=25.2",
+    "django-cors-headers>=4.9.0",
+
+    # Configuration
+    "django-environ>=0.12.0",
+
+    # API documentation
+    "drf-spectacular>=0.28.0",
+    "drf-spectacular-sidecar>=2025.10.1",
+
+    # Database & caching
     "psycopg2-binary>=2.9.11",
-    "python-decouple>=3.8",
+    "redis>=5.2.1",
+    "django-redis>=5.4.0",
+
+    # Object storage (MinIO via S3 protocol)
+    "django-storages[boto3]>=1.14.6",
+
+    # Async task queue
+    "celery[redis]>=5.4.0",
+    "django-celery-beat>=2.7.0",
+    "django-celery-results>=2.5.1",
+    "flower>=2.0.1",
+
+    # Email
+    "django-anymail[sendgrid,smtp]>=12.0",
+
+    # WSGI/ASGI server
+    "gunicorn>=23.0.0",
+    "uvicorn[standard]>=0.32.1",
+    "whitenoise>=6.8.2",
+
+    # Security & MFA (used in Phase 5; declared now to lock versions)
+    "django-otp>=1.5.4",
+    "django-two-factor-auth>=1.17.0",
+    "django-csp>=3.8",
+    "django-axes>=7.0.2",
+
+    # SSO (OIDC — used in Phase 6)
+    "mozilla-django-oidc>=4.0.1",
+
+    # Secrets management
+    "hvac>=2.3.0",
+
+    # PDF / report generation
+    "weasyprint>=63.1",
+    "openpyxl>=3.1.5",
+    "jinja2>=3.1.4",
+
+    # Document text extraction (used in Phase 3 working papers)
+    "python-magic>=0.4.27",
+
+    # Observability
+    "sentry-sdk[django]>=2.19.2",
+    "django-prometheus>=2.3.1",
+    "opentelemetry-api>=1.29.0",
+    "opentelemetry-sdk>=1.29.0",
+    "opentelemetry-instrumentation-django>=0.50b0",
+    "opentelemetry-instrumentation-psycopg2>=0.50b0",
+    "opentelemetry-instrumentation-celery>=0.50b0",
+    "opentelemetry-exporter-otlp>=1.29.0",
+
+    # Utilities
+    "python-dateutil>=2.9.0",
+]
+
+[dependency-groups]
+dev = [
+    # Testing
+    "pytest>=8.3.4",
+    "pytest-django>=4.9.0",
+    "pytest-cov>=6.0.0",
+    "pytest-xdist>=3.6.1",
+    "factory-boy>=3.3.1",
+    "freezegun>=1.5.1",
+    "responses>=0.25.5",
+    "model-bakery>=1.20.0",
+
+    # Linting & formatting
+    "ruff>=0.8.4",
+    "black>=24.10.0",
+    "mypy>=1.13.0",
+    "django-stubs[compatible-mypy]>=5.1.1",
+    "djangorestframework-stubs[compatible-mypy]>=3.15.2",
+
+    # Code quality
+    "pre-commit>=4.0.1",
+    "pip-audit>=2.7.3",
+    "nplusone>=1.0.0",
+    "django-debug-toolbar>=4.4.6",
+
+    # Load testing
+    "locust>=2.32.5",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["iams", "config"]
+
+# ───────────────────────────────────────────────────────────────────────
+# Ruff (lint + import sort)
+# ───────────────────────────────────────────────────────────────────────
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = [
+    "migrations",
+    ".venv",
+    "media",
+    "staticfiles",
+]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "B",    # flake8-bugbear
+    "C4",   # flake8-comprehensions
+    "DJ",   # flake8-django
+    "UP",   # pyupgrade
+    "S",    # flake8-bandit (security)
+    "SIM",  # flake8-simplify
+    "RUF",  # ruff-specific
+]
+ignore = [
+    "E501",   # line too long (black handles)
+    "S101",   # assert (allowed in tests)
+    "DJ001",  # null=True on string fields (legacy compatibility)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"**/tests/**" = ["S", "DJ"]
+"**/migrations/**" = ["E", "F", "I", "UP"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["iams", "config"]
+
+# ───────────────────────────────────────────────────────────────────────
+# Black
+# ───────────────────────────────────────────────────────────────────────
+[tool.black]
+line-length = 100
+target-version = ["py312"]
+extend-exclude = """
+(
+  /migrations/
+  | /\\.venv/
+)
+"""
+
+# ───────────────────────────────────────────────────────────────────────
+# mypy
+# ───────────────────────────────────────────────────────────────────────
+[tool.mypy]
+python_version = "3.12"
+strict = false
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_unused_configs = true
+ignore_missing_imports = true
+plugins = ["mypy_django_plugin.main", "mypy_drf_plugin.main"]
+exclude = ["migrations/", "\\.venv/"]
+
+[[tool.mypy.overrides]]
+module = "iams.views.*"
+strict = true
+
+[[tool.mypy.overrides]]
+module = "iams.serializers"
+strict = true
+
+[tool.django-stubs]
+django_settings_module = "config.settings.dev"
+
+# ───────────────────────────────────────────────────────────────────────
+# pytest
+# ───────────────────────────────────────────────────────────────────────
+[tool.pytest.ini_options]
+DJANGO_SETTINGS_MODULE = "config.settings.test"
+python_files = ["test_*.py", "tests.py"]
+addopts = [
+    "--strict-markers",
+    "--strict-config",
+    "--reuse-db",
+    "--no-migrations",
+    "-ra",
+    "--cov=iams",
+    "--cov=config",
+    "--cov-report=term-missing",
+    "--cov-report=html:htmlcov",
+    "--cov-fail-under=70",
+]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: integration tests requiring external services",
+    "rbac: RBAC matrix tests",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::PendingDeprecationWarning",
+]
+
+[tool.coverage.run]
+source = ["iams", "config"]
+omit = [
+    "*/migrations/*",
+    "*/tests/*",
+    "*/management/commands/seed_*.py",
+    "config/wsgi.py",
+    "config/asgi.py",
+    "manage.py",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
 ]

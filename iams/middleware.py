@@ -4,6 +4,11 @@ import uuid
 request_id_ctx = contextvars.ContextVar("request_id", default="-")
 
 
+def get_current_request_id() -> str:
+    """Return the request_id for the current async/thread context, or '-' outside requests."""
+    return request_id_ctx.get()
+
+
 class RequestIdMiddleware:
     def __init__(self, get_response):
         self.get_response = get_response

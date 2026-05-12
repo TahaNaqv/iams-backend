@@ -1,6 +1,23 @@
+# Local development stack for IAMS.
+#
+# Brings up the full on-prem topology in miniature:
+#   - postgres (primary)
+#   - redis (cache + Celery broker)
+#   - backend (Django via gunicorn)
+#   - worker (Celery)
+#   - beat (Celery scheduler)
+#   - flower (Celery UI on :5555)
+#   - minio (S3-compatible object storage on :9000, console on :9001)
+#   - mailhog (SMTP sink on :1025, UI on :8025)
+#
+# Bring up with: docker compose up --build
+# Tail one service: docker compose logs -f backend
+# Run a command:   docker compose run --rm backend manage createsuperuser
+
 services:
   db:
     image: postgres:16-alpine
+    restart: unless-stopped
     ports:
       - "5433:5432"
     environment:
@@ -13,18 +30,146 @@ services:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-iams_user} -d ${POSTGRES_DB:-iams_db}"]
       interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--appendonly", "yes", "--save", "60", "1"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # console
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    command: ["server", "/data", "--console-address", ":9001"]
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  minio-bootstrap:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    entrypoint: >
+      sh -c "
+        mc alias set local http://minio:9000 $${MINIO_ROOT_USER} $${MINIO_ROOT_PASSWORD} &&
+        mc mb --ignore-existing local/iams-evidence &&
+        mc mb --ignore-existing local/iams-documents &&
+        mc mb --ignore-existing local/iams-reports &&
+        mc anonymous set download local/iams-reports &&
+        echo 'MinIO buckets ready.'
+      "
+    restart: "no"
+
+  mailhog:
+    image: mailhog/mailhog:latest
+    restart: unless-stopped
+    ports:
+      - "1025:1025"   # SMTP
+      - "8025:8025"   # web UI
 
   backend:
     build: .
+    image: iams-backend:dev
+    restart: unless-stopped
     ports:
       - "8001:8000"
     env_file:
       - .env
+    environment:
+      DJANGO_SETTINGS_MODULE: ${DJANGO_SETTINGS_MODULE:-config.settings.dev}
+      DJANGO_AUTO_MIGRATE: "1"
+      DJANGO_COLLECTSTATIC: "0"  # served by Django in dev
+    volumes:
+      - .:/app
+      - backend_static:/app/staticfiles
+      - backend_media:/app/media
     depends_on:
       db:
         condition: service_healthy
-    command: sh -c "uv run python manage.py migrate && uv run python manage.py runserver 0.0.0.0:8000"
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    command: ["web"]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  worker:
+    image: iams-backend:dev
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DJANGO_SETTINGS_MODULE: ${DJANGO_SETTINGS_MODULE:-config.settings.dev}
+    volumes:
+      - .:/app
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: ["worker"]
+
+  beat:
+    image: iams-backend:dev
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DJANGO_SETTINGS_MODULE: ${DJANGO_SETTINGS_MODULE:-config.settings.dev}
+    volumes:
+      - .:/app
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: ["beat"]
+
+  flower:
+    image: iams-backend:dev
+    restart: unless-stopped
+    ports:
+      - "5555:5555"
+    env_file:
+      - .env
+    environment:
+      DJANGO_SETTINGS_MODULE: ${DJANGO_SETTINGS_MODULE:-config.settings.dev}
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: ["flower"]
 
 volumes:
   postgres_data:
+  redis_data:
+  minio_data:
+  backend_static:
+  backend_media:

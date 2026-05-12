@@ -6,7 +6,7 @@ from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
-from rest_framework.parsers import MultiPartParser, FormParser
+from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 
 from iams.domain_serializers import (
     ActivityItemSerializer,
@@ -86,6 +86,7 @@ from iams.models import (
     AuditReport,
     AuditReportSection,
     ManagedDocument,
+    WorkingPaper,
     TimeEntry,
     TimelineEvent,
 )
@@ -745,3 +746,190 @@ class ApprovalChainTemplateViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
         if self.action in ("list", "retrieve"):
             return [HasPermission("view_audits")]
         return [HasPermission("manage_settings")]
+
+
+class WorkingPaperViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
+    """Engagement-scoped working papers with versioning + sign-off.
+
+    Endpoints:
+      GET    /api/working-papers/                       list (filterable by ?audit_id=, ?search=, ?status=)
+      GET    /api/working-papers/?currentOnly=true      only the latest version per (audit, reference)
+      POST   /api/working-papers/                       create v1 (multipart for file upload)
+      PATCH  /api/working-papers/{id}/                  edit draft fields (rejected once signed)
+      DELETE /api/working-papers/{id}/                  delete (rejected once signed)
+      POST   /api/working-papers/{id}/sign/auditor/     auditor signature
+      POST   /api/working-papers/{id}/sign/reviewer/    reviewer signature + lock
+      POST   /api/working-papers/{id}/new-version/      create successor (multipart)
+      GET    /api/working-papers/{id}/versions/         full chain (oldest → newest)
+      GET    /api/working-papers/{id}/download/         signed URL (403 if quarantined, 409 if pending scan)
+    """
+
+    queryset = WorkingPaper.objects.select_related("audit", "auditor_signed_by", "reviewer_signed_by").prefetch_related("findings")
+    # JSONParser for PATCH-as-JSON edits; Multipart/Form for uploads.
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
+
+    def get_permissions(self):
+        if self.action in ("list", "retrieve", "versions", "download"):
+            return [HasPermission("view_audits")]
+        return [HasPermission("edit_audits")]
+
+    def get_serializer_class(self):
+        if self.action in ("create", "update", "partial_update"):
+            from iams.domain_serializers import WorkingPaperWriteSerializer
+            return WorkingPaperWriteSerializer
+        from iams.domain_serializers import WorkingPaperSerializer
+        return WorkingPaperSerializer
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        audit_id = self.request.query_params.get("audit_id")
+        if audit_id:
+            qs = qs.filter(audit_id=audit_id)
+        if self.request.query_params.get("currentOnly") == "true":
+            qs = qs.filter(is_current_version=True)
+        status_filter = self.request.query_params.get("status")
+        if status_filter:
+            qs = qs.filter(status=status_filter)
+        search = self.request.query_params.get("search")
+        if search:
+            qs = qs.filter(
+                Q(title__icontains=search)
+                | Q(description__icontains=search)
+                | Q(reference__icontains=search)
+                | Q(searchable_text__icontains=search)
+            )
+        return qs.order_by("audit_id", "reference", "-version")
+
+    def perform_create(self, serializer):
+        # Compute file_size_kb from the uploaded file when present so callers
+        # don't have to send it explicitly.
+        validated = serializer.validated_data
+        file_obj = validated.get("file")
+        if file_obj is not None and not validated.get("file_size_kb"):
+            validated["file_size_kb"] = max(1, file_obj.size // 1024)
+        instance = serializer.save()
+        from iams.working_papers import populate_searchable_text
+        # Populate searchable_text inline (synchronous stub).
+        text = populate_searchable_text(instance)
+        if text:
+            instance.searchable_text = text
+            instance.save(update_fields=["searchable_text", "updated_at"])
+        if instance.file:
+            from iams.tasks import scan_uploaded_file
+            scan_uploaded_file.delay(model_label="WorkingPaper", object_id=str(instance.id))
+
+    def perform_update(self, serializer):
+        # The model's save() guard handles the actually-signed case;
+        # this layer also blocks Under-Review edits to keep the FE crisp.
+        if serializer.instance.signed_off_at is not None:
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied("Working paper is signed off; create a new version instead.")
+        instance = serializer.save()
+        from iams.working_papers import populate_searchable_text
+        text = populate_searchable_text(instance)
+        if text:
+            instance.searchable_text = text
+            instance.save(update_fields=["searchable_text", "updated_at"])
+
+    # ── Sign-off actions ─────────────────────────────────────────────
+    @action(detail=True, methods=["post"], url_path="sign/auditor")
+    def sign_auditor(self, request, pk=None):
+        from iams.audit import record_audit_event
+        from iams.working_papers import SignOffError, sign_as_auditor
+        wp = self.get_object()
+        try:
+            sign_as_auditor(wp, by_user=request.user)
+        except SignOffError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        record_audit_event(
+            action=AuditLogEntry.ACTION_OTHER,
+            actor=request.user,
+            target=wp,
+            details={"event": "working_paper_auditor_signed"},
+            request=request,
+        )
+        from iams.domain_serializers import WorkingPaperSerializer
+        return Response(WorkingPaperSerializer(wp).data)
+
+    @action(detail=True, methods=["post"], url_path="sign/reviewer")
+    def sign_reviewer(self, request, pk=None):
+        from iams.audit import record_audit_event
+        from iams.working_papers import SignOffError, sign_as_reviewer
+        wp = self.get_object()
+        try:
+            sign_as_reviewer(wp, by_user=request.user)
+        except SignOffError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        record_audit_event(
+            action=AuditLogEntry.ACTION_OTHER,
+            actor=request.user,
+            target=wp,
+            details={"event": "working_paper_reviewer_signed", "finalized": True},
+            request=request,
+        )
+        from iams.domain_serializers import WorkingPaperSerializer
+        return Response(WorkingPaperSerializer(wp).data)
+
+    # ── Versioning ──────────────────────────────────────────────────
+    @action(detail=True, methods=["post"], url_path="new-version")
+    def new_version(self, request, pk=None):
+        from iams.audit import record_audit_event
+        from iams.working_papers import create_new_version
+        parent = self.get_object()
+        file_obj = request.FILES.get("file")
+        new_wp = create_new_version(
+            parent,
+            file=file_obj,
+            title=request.data.get("title"),
+            description=request.data.get("description"),
+        )
+        if file_obj is not None:
+            new_wp.file_size_kb = max(1, file_obj.size // 1024)
+            new_wp.save(update_fields=["file_size_kb", "updated_at"])
+            from iams.tasks import scan_uploaded_file
+            scan_uploaded_file.delay(model_label="WorkingPaper", object_id=str(new_wp.id))
+        record_audit_event(
+            action=AuditLogEntry.ACTION_OTHER,
+            actor=request.user,
+            target=new_wp,
+            details={"event": "working_paper_new_version", "parent_id": str(parent.id), "version": new_wp.version},
+            request=request,
+        )
+        from iams.domain_serializers import WorkingPaperSerializer
+        return Response(WorkingPaperSerializer(new_wp).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["get"], url_path="versions")
+    def versions(self, request, pk=None):
+        """Full version chain (oldest → newest) for the same (audit, reference)."""
+        wp = self.get_object()
+        chain = WorkingPaper.objects.filter(
+            audit_id=wp.audit_id, reference=wp.reference,
+        ).order_by("version")
+        from iams.domain_serializers import WorkingPaperSerializer
+        serializer = WorkingPaperSerializer(chain, many=True)
+        return Response(serializer.data)
+
+    # ── Download (mirrors EvidenceFileViewSet.download) ─────────────
+    @action(detail=True, methods=["get"], url_path="download")
+    def download(self, request, pk=None):
+        wp = self.get_object()
+        if wp.quarantined:
+            return Response(
+                {
+                    "detail": "File is quarantined.",
+                    "scanStatus": wp.scan_status,
+                    "scanSignature": wp.scan_signature,
+                },
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        if wp.scan_status == EvidenceFile.SCAN_PENDING:
+            return Response(
+                {"detail": "File is still being scanned.", "scanStatus": wp.scan_status},
+                status=status.HTTP_409_CONFLICT,
+            )
+        if not wp.file:
+            return Response({"detail": "No file available."}, status=status.HTTP_404_NOT_FOUND)
+        url = wp.file.url
+        if not url.startswith(("http://", "https://")):
+            url = request.build_absolute_uri(url)
+        return Response({"url": url})

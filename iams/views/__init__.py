@@ -43,6 +43,7 @@ from .domain import (
     AuditReportViewSet,
     AuditReportSectionViewSet,
     ManagedDocumentViewSet,
+    WorkingPaperViewSet,
     TimeEntryViewSet,
     TimelineByAuditView,
 )
@@ -79,6 +80,7 @@ __all__ = [
     "AuditReportViewSet",
     "AuditReportSectionViewSet",
     "ManagedDocumentViewSet",
+    "WorkingPaperViewSet",
     "NotificationViewSet",
     "NotificationPreferenceViewSet",
     "AuditLogViewSet",

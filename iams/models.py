@@ -871,6 +871,158 @@ class AuditReportSection(TimeStampedModel):
         ordering = ["order", "created_at"]
 
 
+class WorkingPaper(TimeStampedModel):
+    """An audit working paper — engagement-scoped evidence with formal sign-off.
+
+    Distinct from ``ManagedDocument`` (which models org-wide policies /
+    procedures / templates) because IIA 2330 imposes stricter rules on
+    engagement working papers:
+
+      - Each row is bound to a specific ``Audit``.
+      - Multi-step sign-off (Auditor → Reviewer). Both timestamps are
+        captured separately; ``signed_off_at`` is derived from the
+        reviewer step.
+      - Once fully signed, the row is **lock-on-finalize**: Python-level
+        ``save()`` and ``delete()`` reject modification. FR-WP-06.
+      - Versions form a chain via the ``parent`` self-FK. Creating a new
+        version flips ``is_current_version`` on the prior row.
+      - Cross-references to ``Finding`` via M2M for IIA 2330 traceability.
+      - Inherits the scan/quarantine workflow from ``EvidenceFile``.
+    """
+
+    STATUS_DRAFT = "Draft"
+    STATUS_UNDER_REVIEW = "Under Review"
+    STATUS_SIGNED = "Signed"
+    STATUS_ARCHIVED = "Archived"
+    STATUS_CHOICES = [
+        (STATUS_DRAFT, "Draft"),
+        (STATUS_UNDER_REVIEW, "Under Review"),
+        (STATUS_SIGNED, "Signed"),
+        (STATUS_ARCHIVED, "Archived"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    audit = models.ForeignKey(Audit, on_delete=models.CASCADE, related_name="working_papers")
+    reference = models.CharField(
+        max_length=50, blank=True, db_index=True,
+        help_text="Human reference, e.g. 'WP-001'. Optional; system-generated if blank.",
+    )
+    title = models.CharField(max_length=255)
+    description = models.TextField(blank=True)
+
+    file = models.FileField(upload_to="working-papers/%Y/%m/%d/", blank=True, null=True)
+    file_type = models.CharField(max_length=20, blank=True)
+    file_size_kb = models.PositiveIntegerField(default=0)
+
+    status = models.CharField(
+        max_length=20, choices=STATUS_CHOICES, default=STATUS_DRAFT, db_index=True
+    )
+
+    # Version chain. ``parent`` points at the predecessor row (NULL for v1).
+    # ``version`` auto-assigns starting at 1. ``is_current_version`` is True
+    # for exactly one row in the chain at any time.
+    parent = models.ForeignKey(
+        "self", on_delete=models.SET_NULL, null=True, blank=True, related_name="successors"
+    )
+    version = models.PositiveIntegerField(default=1)
+    is_current_version = models.BooleanField(default=True, db_index=True)
+
+    # Sign-off (FR-WP-03). Both signatures must be present for the row to
+    # be considered "finalized".
+    auditor_signed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name="auditor_signed_working_papers",
+    )
+    auditor_signed_at = models.DateTimeField(null=True, blank=True)
+    reviewer_signed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name="reviewer_signed_working_papers",
+    )
+    reviewer_signed_at = models.DateTimeField(null=True, blank=True)
+    signed_off_at = models.DateTimeField(null=True, blank=True, db_index=True)
+
+    # Cross-references to findings (FR-WP-04). Reverse accessor on
+    # Finding is ``working_papers``.
+    findings = models.ManyToManyField(
+        "Finding", blank=True, related_name="working_papers",
+    )
+
+    # AV scan state — mirrors EvidenceFile.
+    scan_status = models.CharField(
+        max_length=20,
+        choices=EvidenceFile.SCAN_STATUS_CHOICES,
+        default=EvidenceFile.SCAN_PENDING,
+        db_index=True,
+    )
+    scan_signature = models.CharField(max_length=255, blank=True)
+    scanned_at = models.DateTimeField(null=True, blank=True)
+    quarantined = models.BooleanField(default=False, db_index=True)
+
+    # Full-text search content. Plain TextField (rather than Postgres
+    # tsvector) so the same code path works on SQLite (tests) and on
+    # Postgres (prod). The ``extract_text`` Celery task populates this
+    # from the file content post-upload.
+    searchable_text = models.TextField(blank=True)
+
+    class Meta:
+        ordering = ["audit_id", "reference", "-version"]
+        indexes = [
+            models.Index(fields=["audit", "is_current_version"]),
+            models.Index(fields=["audit", "status"]),
+            models.Index(fields=["reference"]),
+        ]
+        constraints = [
+            # Enforce a single "current" row per (audit, reference) chain.
+            models.UniqueConstraint(
+                fields=["audit", "reference"],
+                condition=models.Q(is_current_version=True),
+                name="iams_wp_one_current_per_audit_ref",
+            ),
+        ]
+
+    # ── Helpers ─────────────────────────────────────────────────────
+    def is_finalized(self) -> bool:
+        return bool(self.auditor_signed_at and self.reviewer_signed_at)
+
+    def __str__(self) -> str:
+        ref = self.reference or str(self.pk)[:8]
+        return f"{ref} v{self.version} — {self.title}"
+
+    # ── Lock-on-finalize (Python-level) ────────────────────────────
+    def save(self, *args, **kwargs):
+        """Reject updates to a row that's already signed off (FR-WP-06).
+
+        Two carve-outs:
+          - The post-upload AV scan worker updates ``scan_*`` fields,
+            which may happen after sign-off finishes; allow it.
+          - Tests / admin tools that legitimately need to mutate a
+            signed row may set ``instance._force_save_signed = True``.
+        """
+        if (
+            not self._state.adding
+            and self.signed_off_at is not None
+            and not getattr(self, "_force_save_signed", False)
+        ):
+            allowed_fields = {"scan_status", "scan_signature", "scanned_at", "quarantined"}
+            update_fields = kwargs.get("update_fields") or set()
+            if update_fields and set(update_fields).issubset(allowed_fields):
+                return super().save(*args, **kwargs)
+            raise PermissionError(
+                "WorkingPaper is locked: signed off on "
+                f"{self.signed_off_at.isoformat() if self.signed_off_at else 'unknown'}. "
+                "Create a new version instead."
+            )
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        if self.signed_off_at is not None:
+            raise PermissionError(
+                "WorkingPaper is locked after sign-off; cannot delete. "
+                "Archive instead."
+            )
+        return super().delete(*args, **kwargs)
+
+
 class ManagedDocument(TimeStampedModel):
     STATUS_CHOICES = [("Published", "Published"), ("Draft", "Draft"), ("Under Review", "Under Review"), ("Archived", "Archived")]
     CATEGORY_CHOICES = [("Policies", "Policies"), ("Procedures", "Procedures"), ("Standards", "Standards"), ("Templates", "Templates"), ("Evidence", "Evidence"), ("Reports", "Reports")]

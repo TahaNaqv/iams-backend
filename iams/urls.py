@@ -38,6 +38,7 @@ from iams.views import (
     AuditReportViewSet,
     AuditReportSectionViewSet,
     ManagedDocumentViewSet,
+    WorkingPaperViewSet,
     TimeEntryViewSet,
     TimelineByAuditView,
     UserViewSet,
@@ -77,6 +78,7 @@ router.register("work-procedure-steps", WorkProcedureStepViewSet, basename="work
 router.register("audit-reports", AuditReportViewSet, basename="audit-report")
 router.register("audit-report-sections", AuditReportSectionViewSet, basename="audit-report-section")
 router.register("managed-documents", ManagedDocumentViewSet, basename="managed-document")
+router.register("working-papers", WorkingPaperViewSet, basename="working-paper")
 
 urlpatterns = [
     path("", include(router.urls)),

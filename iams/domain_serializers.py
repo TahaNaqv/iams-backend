@@ -19,6 +19,7 @@ from iams.models import (
     Notification,
     NotificationPreference,
     RiskAssessmentImportIssue,
+    WorkingPaper,
     RiskAssessmentMatrixCell,
     RiskAssessmentRecord,
     RiskAssessmentSheet,
@@ -666,3 +667,99 @@ class ManagedDocumentWriteSerializer(serializers.ModelSerializer):
             "tags",
             "versions",
         ]
+
+
+class WorkingPaperSerializer(serializers.ModelSerializer):
+    """Read serializer for working papers.
+
+    Exposes engagement context (auditId/auditTitle), version chain
+    metadata (parentId/isCurrentVersion), the sign-off pair (auditor +
+    reviewer with timestamps and display names), AV scan state, and
+    the cross-referenced finding IDs.
+    """
+
+    auditId = serializers.UUIDField(source="audit_id", read_only=True)
+    auditTitle = serializers.CharField(source="audit.title", read_only=True)
+    fileType = serializers.CharField(source="file_type")
+    fileSizeKb = serializers.IntegerField(source="file_size_kb")
+
+    parentId = serializers.UUIDField(source="parent_id", read_only=True, allow_null=True)
+    isCurrentVersion = serializers.BooleanField(source="is_current_version", read_only=True)
+
+    auditorSignedAt = serializers.DateTimeField(source="auditor_signed_at", read_only=True, allow_null=True)
+    auditorSignedBy = serializers.SerializerMethodField()
+    reviewerSignedAt = serializers.DateTimeField(source="reviewer_signed_at", read_only=True, allow_null=True)
+    reviewerSignedBy = serializers.SerializerMethodField()
+    signedOffAt = serializers.DateTimeField(source="signed_off_at", read_only=True, allow_null=True)
+    isFinalized = serializers.SerializerMethodField()
+
+    findingIds = serializers.PrimaryKeyRelatedField(
+        source="findings", many=True,
+        queryset=Finding.objects.all(),
+        required=False,
+    )
+
+    scanStatus = serializers.CharField(source="scan_status", read_only=True)
+    scanSignature = serializers.CharField(source="scan_signature", read_only=True)
+    scannedAt = serializers.DateTimeField(source="scanned_at", read_only=True, allow_null=True)
+    quarantined = serializers.BooleanField(read_only=True)
+
+    class Meta:
+        model = WorkingPaper
+        fields = [
+            "id", "auditId", "auditTitle", "reference", "title", "description",
+            "file", "fileType", "fileSizeKb", "status",
+            "parentId", "version", "isCurrentVersion",
+            "auditorSignedAt", "auditorSignedBy",
+            "reviewerSignedAt", "reviewerSignedBy",
+            "signedOffAt", "isFinalized",
+            "findingIds",
+            "scanStatus", "scanSignature", "scannedAt", "quarantined",
+        ]
+        read_only_fields = [
+            "auditId", "auditTitle",
+            "version", "parentId", "isCurrentVersion",
+            "auditorSignedAt", "reviewerSignedAt", "signedOffAt", "isFinalized",
+            "scanStatus", "scanSignature", "scannedAt", "quarantined",
+        ]
+
+    def get_isFinalized(self, obj) -> bool:
+        return obj.is_finalized()
+
+    def _user_label(self, user) -> dict | None:
+        if user is None:
+            return None
+        return {
+            "id": str(user.pk),
+            "email": user.email,
+            "name": (user.get_full_name() or user.email).strip(),
+        }
+
+    def get_auditorSignedBy(self, obj):
+        return self._user_label(obj.auditor_signed_by)
+
+    def get_reviewerSignedBy(self, obj):
+        return self._user_label(obj.reviewer_signed_by)
+
+
+class WorkingPaperWriteSerializer(serializers.ModelSerializer):
+    """Write serializer — POST creates new v1, PATCH updates draft state."""
+
+    auditId = serializers.PrimaryKeyRelatedField(
+        source="audit", queryset=Audit.objects.all(),
+    )
+    fileType = serializers.CharField(source="file_type", required=False, allow_blank=True)
+    fileSizeKb = serializers.IntegerField(source="file_size_kb", required=False)
+    findingIds = serializers.PrimaryKeyRelatedField(
+        source="findings", many=True,
+        queryset=Finding.objects.all(),
+        required=False,
+    )
+
+    class Meta:
+        model = WorkingPaper
+        fields = [
+            "id", "auditId", "reference", "title", "description",
+            "file", "fileType", "fileSizeKb", "status", "findingIds",
+        ]
+        read_only_fields = ["id"]

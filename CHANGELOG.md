@@ -2,6 +2,40 @@
 
 All notable changes to the IAMS Django REST API backend.
 
+## [0.9.0] — Phase 3 Track 1: Working Papers + sign-off + versioning (2026-05-12)
+
+### Added
+- **`WorkingPaper` model** ([migration 0012](iams/migrations/0012_workingpaper.py)) — engagement-scoped audit working papers. Includes:
+  - Reference + title + description + file + file_type + file_size_kb
+  - Status (Draft / Under Review / Signed / Archived)
+  - Version chain: `parent` self-FK, `version` integer, `is_current_version` boolean (partial unique constraint enforces one current row per (audit, reference))
+  - Multi-step sign-off: `auditor_signed_by/at`, `reviewer_signed_by/at`, derived `signed_off_at`
+  - Cross-references to `Finding` via M2M (FR-WP-04)
+  - AV scan state mirroring `EvidenceFile` (`scan_status`, `scan_signature`, `scanned_at`, `quarantined`)
+  - `searchable_text` for case-insensitive contains queries (works on Postgres + SQLite)
+- **Python-level lock-on-finalize** (FR-WP-06) — `WorkingPaper.save()` rejects updates to a row with `signed_off_at` set; `delete()` raises `PermissionError`. AV scan-only updates (`scan_status`/`scan_signature`/`scanned_at`/`quarantined`) are explicitly allowed so the worker can still write its verdict after sign-off.
+- **`iams/working_papers.py` service module**:
+  - `sign_as_auditor(wp, by_user)` — records auditor signature; rejects double-sign.
+  - `sign_as_reviewer(wp, by_user)` — records reviewer signature, sets `signed_off_at`, locks. Enforces **IIA 2330 separation of duties** (reviewer ≠ auditor).
+  - `create_new_version(parent, file=, title=, description=)` — atomic: flips parent's `is_current_version` to False, inserts new row with cleared signatures + reset scan state, copies cross-references forward.
+  - `populate_searchable_text(wp)` — stub extractor (real `unstructured`/`pdfplumber` integration is a follow-up).
+- **`WorkingPaperViewSet`** at `/api/working-papers/`:
+  - List filterable by `?audit_id=` / `?currentOnly=true` / `?status=` / `?search=`
+  - `POST /` — multipart create (computes `file_size_kb`, populates `searchable_text`, dispatches AV scan)
+  - `PATCH /{id}/` — rejected with **403** once signed off
+  - `POST /{id}/sign/auditor/` + `/sign/reviewer/` — atomic sign-off + audit-log event
+  - `POST /{id}/new-version/` — multipart; auto-flips parent's `is_current_version`
+  - `GET /{id}/versions/` — full chain in order 1→N
+  - `GET /{id}/download/` — signed URL; 403 on quarantine, 409 while scan pending
+- **AV scan task** now recognises `model_label="WorkingPaper"` (added to `_SCANNABLE_MODELS`).
+- **Audit-log events** — sign-off and new-version actions both record `AuditLogEntry` rows with the event payload (auditor_signed / reviewer_signed / new_version with parent_id + version).
+- **22 working-paper tests** in `iams/tests/test_working_papers.py`.
+
+### Notes
+- Real document text extraction (PDF/Word) is deferred — the stub indexes title + description + reference + plain-text content for now. Phase 3 Track 1.1 will integrate `unstructured` (already on the dependency wishlist) + a Celery task.
+- The `(audit, reference, is_current_version=True)` partial unique constraint runs on Postgres; SQLite test runs validate the Python-level guard.
+- **Backend tests: 380 passing** (was 358; added 22).
+
 ## [0.8.0] — Phase 2 Track 3: Approval workflow engine + escalation (2026-05-12)
 
 ### Added

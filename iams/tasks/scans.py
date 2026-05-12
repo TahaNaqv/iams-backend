@@ -37,7 +37,7 @@ from celery import shared_task
 from django.conf import settings
 from django.utils import timezone
 
-from iams.models import EvidenceFile, ManagedDocument
+from iams.models import EvidenceFile, ManagedDocument, WorkingPaper
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +48,7 @@ logger = logging.getLogger(__name__)
 _SCANNABLE_MODELS = {
     "EvidenceFile": EvidenceFile,
     "ManagedDocument": ManagedDocument,
+    "WorkingPaper": WorkingPaper,
 }
 
 

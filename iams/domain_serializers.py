@@ -16,6 +16,7 @@ from iams.models import (
     FollowUpItem,
     HoursBudget,
     Notification,
+    NotificationPreference,
     RiskAssessmentImportIssue,
     RiskAssessmentMatrixCell,
     RiskAssessmentRecord,
@@ -191,15 +192,58 @@ class RiskHistoryEntrySerializer(serializers.ModelSerializer):
 
 
 class NotificationSerializer(serializers.ModelSerializer):
+    # ``description`` is the FE-conventional alias for the backend's
+    # ``message`` field. Both names are emitted for compatibility while a
+    # focused FE cleanup collapses the duplication.
+    description = serializers.CharField(source="message", read_only=True)
+    targetType = serializers.SerializerMethodField()
+    targetId = serializers.UUIDField(source="target_object_id", read_only=True, allow_null=True)
+    emailSentAt = serializers.DateTimeField(source="email_sent_at", read_only=True, allow_null=True)
+
     class Meta:
         model = Notification
-        fields = ["id", "title", "message", "type", "read", "timestamp"]
+        fields = [
+            "id", "kind", "title", "message", "description",
+            "type", "read", "timestamp", "link", "module",
+            "targetType", "targetId", "emailSentAt",
+        ]
+        read_only_fields = fields
+
+    def get_targetType(self, obj):
+        ct = obj.target_content_type
+        return ct.model if ct else None
+
+
+class NotificationPreferenceSerializer(serializers.ModelSerializer):
+    inAppEnabled = serializers.BooleanField(source="in_app_enabled")
+    emailEnabled = serializers.BooleanField(source="email_enabled")
+
+    class Meta:
+        model = NotificationPreference
+        fields = ["id", "kind", "inAppEnabled", "emailEnabled"]
+        read_only_fields = ["id"]
 
 
 class AuditLogEntrySerializer(serializers.ModelSerializer):
+    requestId = serializers.CharField(source="request_id", read_only=True)
+    ipAddress = serializers.IPAddressField(source="ip_address", read_only=True, allow_null=True)
+    userAgent = serializers.CharField(source="user_agent", read_only=True)
+    targetType = serializers.SerializerMethodField()
+    targetId = serializers.UUIDField(source="target_object_id", read_only=True, allow_null=True)
+
     class Meta:
         model = AuditLogEntry
-        fields = ["id", "actor", "action", "target", "timestamp", "details"]
+        fields = [
+            "id", "actor", "action", "target",
+            "targetType", "targetId",
+            "timestamp", "requestId", "ipAddress", "userAgent",
+            "changes", "details",
+        ]
+        read_only_fields = fields
+
+    def get_targetType(self, obj):
+        ct = obj.target_content_type
+        return ct.model if ct else None
 
 
 class FollowUpItemSerializer(serializers.ModelSerializer):

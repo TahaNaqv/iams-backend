@@ -307,33 +307,218 @@ class RiskHistoryEntry(TimeStampedModel):
 
 
 class Notification(TimeStampedModel):
+    """A delivered notification.
+
+    Notifications are produced by ``iams.notifications.dispatch(...)``, which
+    fans out a single event into an in-app row here (if the recipient's
+    preferences allow) and an email (likewise).
+
+    A ``recipient`` of ``None`` indicates a **system-wide broadcast** —
+    shown to every authenticated user. Backwards-compatible with the
+    pre-Phase-2 schema where every notification was implicitly global.
+    """
+
+    # Notification taxonomy — keep stable; the FE filters and the
+    # NotificationPreference matrix join on these values.
+    KIND_AUDIT_ASSIGNED = "audit_assigned"
+    KIND_AUDIT_STATUS_CHANGE = "audit_status_change"
+    KIND_FINDING_RAISED = "finding_raised"
+    KIND_CAP_ASSIGNED = "cap_assigned"
+    KIND_CAP_DUE_SOON = "cap_due_soon"
+    KIND_CAP_OVERDUE = "cap_overdue"
+    KIND_APPROVAL_REQUESTED = "approval_requested"
+    KIND_APPROVAL_APPROVED = "approval_approved"
+    KIND_APPROVAL_REJECTED = "approval_rejected"
+    KIND_PASSWORD_RESET = "password_reset"
+    KIND_FILE_QUARANTINE = "file_quarantine"
+    KIND_WEEKLY_DIGEST = "weekly_digest"
+    KIND_MFA_REMINDER = "mfa_reminder"
+    KIND_GENERIC = "generic"
+
+    KIND_CHOICES = [
+        (KIND_AUDIT_ASSIGNED, "Audit assigned"),
+        (KIND_AUDIT_STATUS_CHANGE, "Audit status changed"),
+        (KIND_FINDING_RAISED, "Finding raised"),
+        (KIND_CAP_ASSIGNED, "CAP assigned"),
+        (KIND_CAP_DUE_SOON, "CAP due in 3 days"),
+        (KIND_CAP_OVERDUE, "CAP overdue"),
+        (KIND_APPROVAL_REQUESTED, "Approval requested"),
+        (KIND_APPROVAL_APPROVED, "Approval approved"),
+        (KIND_APPROVAL_REJECTED, "Approval rejected"),
+        (KIND_PASSWORD_RESET, "Password reset"),
+        (KIND_FILE_QUARANTINE, "File quarantined"),
+        (KIND_WEEKLY_DIGEST, "Weekly digest"),
+        (KIND_MFA_REMINDER, "MFA setup reminder"),
+        (KIND_GENERIC, "Generic"),
+    ]
+
+    # Cosmetic urgency: drives the FE icon/colour.
+    LEVEL_INFO = "info"
+    LEVEL_WARNING = "warning"
+    LEVEL_ACTION = "action"
+    LEVEL_CHOICES = [
+        (LEVEL_INFO, "Info"),
+        (LEVEL_WARNING, "Warning"),
+        (LEVEL_ACTION, "Action required"),
+    ]
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    recipient = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="notifications",
+        null=True, blank=True,
+        help_text="Specific recipient. NULL = system-wide broadcast.",
+    )
+    kind = models.CharField(
+        max_length=40, choices=KIND_CHOICES, default=KIND_GENERIC, db_index=True
+    )
     title = models.CharField(max_length=255)
     message = models.TextField()
-    type = models.CharField(max_length=50, default="info")
-    read = models.BooleanField(default=False)
-    timestamp = models.DateTimeField()
+    type = models.CharField(max_length=20, choices=LEVEL_CHOICES, default=LEVEL_INFO)
+
+    # Optional pointer back at the affected object.
+    target_content_type = models.ForeignKey(
+        ContentType, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="+",
+    )
+    target_object_id = models.UUIDField(null=True, blank=True)
+    target_object = GenericForeignKey("target_content_type", "target_object_id")
+
+    # FE deep-link (e.g. "/findings/F-001"). Lets the topbar bell jump
+    # straight to the object without consulting a routing table.
+    link = models.CharField(max_length=512, blank=True)
+
+    # Free-form module label (e.g. "CAPs", "Audits"). Used by the FE for
+    # filtering + grouping.
+    module = models.CharField(max_length=64, blank=True)
+
+    read = models.BooleanField(default=False, db_index=True)
+    timestamp = models.DateTimeField(db_index=True)
+
+    # Email delivery state, written by the notify task.
+    email_sent_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         ordering = ["-timestamp"]
+        indexes = [
+            models.Index(fields=["recipient", "read", "-timestamp"]),
+            models.Index(fields=["kind", "-timestamp"]),
+        ]
+
+
+class NotificationPreference(TimeStampedModel):
+    """Per-user, per-kind delivery preferences.
+
+    A user with no row for a given ``kind`` falls back to ``DEFAULT_PREFS``
+    (defined in ``iams.notifications``). New kinds are therefore opt-out by
+    default for all existing users without requiring a data backfill.
+
+    The matrix is intentionally simple: in_app + email. SMS and push are
+    on the Phase 6 roadmap.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="notification_preferences",
+    )
+    kind = models.CharField(max_length=40, choices=Notification.KIND_CHOICES)
+    in_app_enabled = models.BooleanField(default=True)
+    email_enabled = models.BooleanField(default=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["user", "kind"],
+                name="iams_notif_pref_user_kind_unique",
+            ),
+        ]
+        ordering = ["user_id", "kind"]
 
 
 class AuditLogEntry(TimeStampedModel):
+    """Append-only audit trail.
+
+    Every meaningful state change in the system writes a row here via
+    ``iams.audit.AuditedViewSetMixin`` (auto-capture on every DRF ViewSet)
+    or explicit ``record_audit_event(...)`` calls from signal handlers /
+    Celery tasks. Once written, rows are **never updated or deleted** —
+    ``save()`` rejects updates and ``delete()`` raises. The DB-level
+    enforcement (Postgres REVOKE UPDATE/DELETE) is added in Phase 5 hardening.
+
+    Required for IIA 2330 documentation traceability and the 7-year
+    retention policy (FR-LOG-05).
+    """
+
+    # Action verbs. The FE filters on these so keep the set small/stable.
+    ACTION_CREATE = "create"
+    ACTION_UPDATE = "update"
+    ACTION_DELETE = "delete"
+    ACTION_APPROVE = "approve"
+    ACTION_REJECT = "reject"
+    ACTION_LOGIN = "login"
+    ACTION_LOGOUT = "logout"
+    ACTION_PASSWORD_RESET = "password_reset"
+    ACTION_PASSWORD_CHANGE = "password_change"
+    ACTION_FILE_UPLOAD = "file_upload"
+    ACTION_FILE_QUARANTINE = "file_quarantine"
+    ACTION_EXPORT = "export"
+    ACTION_OTHER = "other"
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    actor = models.CharField(max_length=200)
+    actor = models.CharField(max_length=200, help_text="Email or display name at the time of the action.")
     actor_ref = models.ForeignKey(
-        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="audit_log_entries"
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name="audit_log_entries",
     )
-    action = models.CharField(max_length=255)
-    target = models.CharField(max_length=255)
+    action = models.CharField(max_length=64, db_index=True)
+    target = models.CharField(max_length=255, help_text="Human label of the affected object.")
     target_content_type = models.ForeignKey(ContentType, on_delete=models.SET_NULL, null=True, blank=True)
     target_object_id = models.UUIDField(null=True, blank=True)
     target_object = GenericForeignKey("target_content_type", "target_object_id")
-    timestamp = models.DateTimeField()
+    timestamp = models.DateTimeField(db_index=True)
+
+    # Auto-capture metadata
+    request_id = models.CharField(max_length=64, blank=True, db_index=True)
+    ip_address = models.GenericIPAddressField(null=True, blank=True)
+    user_agent = models.CharField(max_length=400, blank=True)
+
+    # Diff payload: ``{field: {"old": ..., "new": ...}}`` on update;
+    # full snapshot on create/delete (under the "snapshot" key).
+    changes = models.JSONField(default=dict, blank=True)
+
+    # Free-form context (CAP closure reason, approval comments, etc.).
     details = models.JSONField(default=dict, blank=True)
 
     class Meta:
         ordering = ["-timestamp"]
+        indexes = [
+            models.Index(fields=["-timestamp"]),
+            models.Index(fields=["actor_ref", "-timestamp"]),
+            models.Index(fields=["target_content_type", "target_object_id"]),
+            models.Index(fields=["action", "-timestamp"]),
+        ]
+
+    def save(self, *args, **kwargs):
+        # Append-only enforcement: ``_state.adding`` is True only when
+        # Django is about to INSERT. Instances loaded from the DB (or
+        # re-saved after their first save) flip it to False, and we reject.
+        if not self._state.adding:
+            raise PermissionError(
+                "AuditLogEntry is append-only; updates are forbidden. "
+                "Create a new row instead.",
+            )
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):  # noqa: D401 — enforces immutability
+        raise PermissionError(
+            "AuditLogEntry is append-only; deletes are forbidden. Run the "
+            "scheduled retention task as a privileged admin to expire rows.",
+        )
 
 
 class FollowUpItem(TimeStampedModel):

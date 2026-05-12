@@ -28,6 +28,7 @@ from iams.domain_serializers import (
     FollowUpItemSerializer,
     HoursBudgetSerializer,
     HoursBudgetWriteSerializer,
+    NotificationPreferenceSerializer,
     NotificationSerializer,
     RiskAssessmentImportIssueSerializer,
     RiskAssessmentMatrixCellSerializer,
@@ -69,6 +70,7 @@ from iams.models import (
     FollowUpItem,
     HoursBudget,
     Notification,
+    NotificationPreference,
     RiskAssessmentImportIssue,
     RiskAssessmentMatrixCell,
     RiskAssessmentRecord,
@@ -85,10 +87,11 @@ from iams.models import (
     TimeEntry,
     TimelineEvent,
 )
+from iams.audit import AuditedViewSetMixin
 from iams.permissions import HasPermission
 
 
-class AuditViewSet(viewsets.ModelViewSet):
+class AuditViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
     queryset = Audit.objects.all()
     serializer_class = AuditSerializer
 
@@ -117,7 +120,7 @@ class AuditViewSet(viewsets.ModelViewSet):
         return qs
 
 
-class FindingViewSet(viewsets.ModelViewSet):
+class FindingViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
     queryset = Finding.objects.select_related("audit").all()
     permission_classes = [HasPermission("manage_findings")]
 
@@ -134,7 +137,7 @@ class FindingViewSet(viewsets.ModelViewSet):
         return qs
 
 
-class CorrectiveActionViewSet(viewsets.ModelViewSet):
+class CorrectiveActionViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
     queryset = CorrectiveAction.objects.select_related("finding", "finding__audit").all()
     permission_classes = [HasPermission("manage_caps")]
 
@@ -173,7 +176,7 @@ class ChecklistByAuditView(APIView):
         return Response(ChecklistItemSerializer(item).data, status=status.HTTP_201_CREATED)
 
 
-class ChecklistItemViewSet(viewsets.ModelViewSet):
+class ChecklistItemViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
     queryset = ChecklistItem.objects.all().order_by("created_at", "id")
     serializer_class = ChecklistItemSerializer
 
@@ -302,12 +305,33 @@ class RiskHistoryViewSet(viewsets.ReadOnlyModelViewSet):
 
 
 class NotificationViewSet(viewsets.ReadOnlyModelViewSet):
-    queryset = Notification.objects.all()
+    """Per-user inbox.
+
+    The list / retrieve / mark-read endpoints are **scoped to the current
+    user**. System-wide broadcasts (``recipient=NULL``) are included so
+    "from the IAMS team" announcements reach everyone.
+    """
+
     serializer_class = NotificationSerializer
     permission_classes = [IsAuthenticated]
 
+    def get_queryset(self):
+        qs = Notification.objects.all()
+        user = self.request.user
+        if user and user.is_authenticated:
+            qs = qs.filter(Q(recipient=user) | Q(recipient__isnull=True))
+        # Additional filters (kind, read) — handy for the FE bell badge.
+        kind = self.request.query_params.get("kind")
+        if kind:
+            qs = qs.filter(kind=kind)
+        read = self.request.query_params.get("read")
+        if read in ("true", "false"):
+            qs = qs.filter(read=(read == "true"))
+        return qs.order_by("-timestamp")
+
     @action(detail=True, methods=["post"], url_path="read")
     def mark_read(self, request, pk=None):
+        # Honor scoping — users can't mark someone else's row as read.
         item = self.get_object()
         item.read = True
         item.save(update_fields=["read"])
@@ -318,6 +342,64 @@ class NotificationViewSet(viewsets.ReadOnlyModelViewSet):
         self.get_queryset().filter(read=False).update(read=True)
         return Response(status=status.HTTP_204_NO_CONTENT)
 
+    @action(detail=False, methods=["get"], url_path="unread-count")
+    def unread_count(self, request):
+        """Tiny endpoint the FE topbar bell polls every 60 seconds."""
+        count = self.get_queryset().filter(read=False).count()
+        return Response({"count": count})
+
+
+class NotificationPreferenceViewSet(viewsets.ModelViewSet):
+    """Per-user notification delivery preferences.
+
+    ``list`` returns one row per ``kind`` the user has explicitly set
+    plus an in-memory record for every kind they haven't (using the
+    defaults from ``iams.notifications.DEFAULT_PREFS``) so the FE can
+    render a complete matrix without further lookups.
+
+    ``patch`` upserts a row for a given ``kind``.
+    """
+
+    serializer_class = NotificationPreferenceSerializer
+    permission_classes = [IsAuthenticated]
+    pagination_class = None  # tiny set; no need to paginate
+
+    def get_queryset(self):
+        return NotificationPreference.objects.filter(user=self.request.user)
+
+    def list(self, request, *args, **kwargs):
+        # Merge stored rows with defaults so the FE matrix is always complete.
+        from iams.notifications import DEFAULT_PREFS
+        stored = {p.kind: p for p in self.get_queryset()}
+        merged = []
+        for kind, _label in Notification.KIND_CHOICES:
+            if kind in stored:
+                merged.append(stored[kind])
+            else:
+                d = DEFAULT_PREFS.get(kind, {"in_app": True, "email": False})
+                merged.append(
+                    NotificationPreference(
+                        user=request.user,
+                        kind=kind,
+                        in_app_enabled=d["in_app"],
+                        email_enabled=d["email"],
+                    )
+                )
+        serializer = self.get_serializer(merged, many=True)
+        return Response(serializer.data)
+
+    def create(self, request, *args, **kwargs):
+        # Upsert semantics: POST to /preferences/ {kind, ...} replaces
+        # the row for that kind if it already exists.
+        kind = request.data.get("kind")
+        if not kind:
+            return Response({"detail": "kind is required"}, status=status.HTTP_400_BAD_REQUEST)
+        instance = NotificationPreference.objects.filter(user=request.user, kind=kind).first()
+        serializer = self.get_serializer(instance, data=request.data, partial=instance is not None)
+        serializer.is_valid(raise_exception=True)
+        serializer.save(user=request.user)
+        return Response(serializer.data, status=status.HTTP_201_CREATED if instance is None else status.HTTP_200_OK)
+
 
 class AuditLogViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = AuditLogEntry.objects.all()
@@ -325,13 +407,24 @@ class AuditLogViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = [HasPermission("view_reports")]
 
 
-class FollowUpViewSet(viewsets.GenericViewSet, mixins.ListModelMixin, mixins.RetrieveModelMixin, mixins.UpdateModelMixin):
+class FollowUpViewSet(
+    AuditedViewSetMixin,
+    viewsets.GenericViewSet,
+    mixins.ListModelMixin,
+    mixins.RetrieveModelMixin,
+    mixins.UpdateModelMixin,
+):
     queryset = FollowUpItem.objects.select_related("finding").all().order_by("due_date", "id")
     serializer_class = FollowUpItemSerializer
     permission_classes = [HasPermission("manage_findings")]
 
 
-class CommentViewSet(viewsets.GenericViewSet, mixins.ListModelMixin, mixins.CreateModelMixin):
+class CommentViewSet(
+    AuditedViewSetMixin,
+    viewsets.GenericViewSet,
+    mixins.ListModelMixin,
+    mixins.CreateModelMixin,
+):
     queryset = Comment.objects.all()
     serializer_class = CommentSerializer
     permission_classes = [IsAuthenticated]
@@ -365,13 +458,13 @@ class DashboardKPIView(APIView):
         )
 
 
-class AuditorViewSet(viewsets.ModelViewSet):
+class AuditorViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
     queryset = Auditor.objects.all()
     serializer_class = AuditorSerializer
     permission_classes = [HasPermission("view_audits")]
 
 
-class AssignmentViewSet(viewsets.ModelViewSet):
+class AssignmentViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
     queryset = (
         AuditAssignment.objects.select_related("auditor", "audit")
         .all()
@@ -392,7 +485,7 @@ class AssignmentViewSet(viewsets.ModelViewSet):
         return qs
 
 
-class TimeEntryViewSet(viewsets.ModelViewSet):
+class TimeEntryViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
     queryset = TimeEntry.objects.select_related("auditor", "audit").all()
     permission_classes = [HasPermission("view_audits")]
 
@@ -409,7 +502,7 @@ class TimeEntryViewSet(viewsets.ModelViewSet):
         return qs
 
 
-class HoursBudgetViewSet(viewsets.ModelViewSet):
+class HoursBudgetViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
     queryset = HoursBudget.objects.select_related("audit").all().order_by("id")
     permission_classes = [HasPermission("view_audits")]
 
@@ -426,7 +519,7 @@ class HoursBudgetViewSet(viewsets.ModelViewSet):
         return qs
 
 
-class RiskAssessmentViewSet(viewsets.ModelViewSet):
+class RiskAssessmentViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
     queryset = RiskAssessmentRecord.objects.all().order_by("department", "source_row", "id")
     serializer_class = RiskAssessmentRecordSerializer
     permission_classes = [HasPermission("view_audits")]
@@ -467,7 +560,7 @@ class RiskAssessmentImportIssuesViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = [HasPermission("manage_settings")]
 
 
-class ApprovalRequestViewSet(viewsets.ModelViewSet):
+class ApprovalRequestViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
     queryset = ApprovalRequest.objects.prefetch_related("steps").all()
     serializer_class = ApprovalRequestSerializer
     permission_classes = [IsAuthenticated]
@@ -487,6 +580,15 @@ class ApprovalRequestViewSet(viewsets.ModelViewSet):
         if not obj.steps.filter(status="Pending").exists() and not obj.steps.filter(status="Rejected").exists():
             obj.status = "Approved"
         obj.save(update_fields=["current_step", "status"])
+        # Explicit audit event — approve is a domain action, not a CRUD verb
+        from iams.audit import record_audit_event
+        record_audit_event(
+            action=AuditLogEntry.ACTION_APPROVE,
+            actor=request.user,
+            target=obj,
+            details={"step_order": step.order, "step_role": step.role, "comments": comment},
+            request=request,
+        )
         return Response(ApprovalRequestSerializer(obj).data)
 
     @action(detail=True, methods=["post"], url_path="reject")
@@ -502,10 +604,18 @@ class ApprovalRequestViewSet(viewsets.ModelViewSet):
         step.save(update_fields=["status", "date", "comments"])
         obj.status = "Rejected"
         obj.save(update_fields=["status"])
+        from iams.audit import record_audit_event
+        record_audit_event(
+            action=AuditLogEntry.ACTION_REJECT,
+            actor=request.user,
+            target=obj,
+            details={"step_order": step.order, "step_role": step.role, "comments": comment},
+            request=request,
+        )
         return Response(ApprovalRequestSerializer(obj).data)
 
 
-class WorkProgramViewSet(viewsets.ModelViewSet):
+class WorkProgramViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
     queryset = WorkProgram.objects.select_related("audit").prefetch_related("procedures__steps").all()
     permission_classes = [HasPermission("view_audits")]
 
@@ -515,7 +625,7 @@ class WorkProgramViewSet(viewsets.ModelViewSet):
         return WorkProgramSerializer
 
 
-class WorkProcedureViewSet(viewsets.ModelViewSet):
+class WorkProcedureViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
     queryset = WorkProcedure.objects.select_related("work_program").prefetch_related("steps").all()
     permission_classes = [HasPermission("view_audits")]
 
@@ -525,7 +635,7 @@ class WorkProcedureViewSet(viewsets.ModelViewSet):
         return WorkProcedureSerializer
 
 
-class WorkProcedureStepViewSet(viewsets.ModelViewSet):
+class WorkProcedureStepViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
     queryset = WorkProcedureStep.objects.select_related("procedure").all()
     serializer_class = WorkProcedureStepSerializer
     permission_classes = [HasPermission("view_audits")]
@@ -536,7 +646,7 @@ class WorkProcedureStepViewSet(viewsets.ModelViewSet):
         return WorkProcedureStepSerializer
 
 
-class AuditReportViewSet(viewsets.ModelViewSet):
+class AuditReportViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
     queryset = AuditReport.objects.select_related("audit").prefetch_related("sections").all()
     permission_classes = [HasPermission("view_reports")]
 
@@ -546,7 +656,7 @@ class AuditReportViewSet(viewsets.ModelViewSet):
         return AuditReportSerializer
 
 
-class AuditReportSectionViewSet(viewsets.ModelViewSet):
+class AuditReportSectionViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
     queryset = AuditReportSection.objects.select_related("report").all()
     permission_classes = [HasPermission("view_reports")]
 
@@ -556,7 +666,7 @@ class AuditReportSectionViewSet(viewsets.ModelViewSet):
         return AuditReportSectionSerializer
 
 
-class ManagedDocumentViewSet(viewsets.ModelViewSet):
+class ManagedDocumentViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
     queryset = ManagedDocument.objects.all()
     parser_classes = [MultiPartParser, FormParser]
     permission_classes = [HasPermission("view_reports")]

@@ -193,6 +193,15 @@ def scan_uploaded_file(self, model_label: str, object_id: str) -> dict:
             signature,
             extra={"model": model_label, "object_id": object_id},
         )
+        # Record the quarantine as a first-class audit event so it shows up
+        # in the AuditLog page next to the upload event itself.
+        from iams.audit import record_audit_event  # local to avoid import cycles
+        record_audit_event(
+            action="file_quarantine",
+            actor="system:clamav",
+            target=instance,
+            details={"signature": signature, "model": model_label},
+        )
 
     return {
         "scanned": True,

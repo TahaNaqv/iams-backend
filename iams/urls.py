@@ -19,6 +19,7 @@ from iams.views import (
     FindingViewSet,
     FollowUpViewSet,
     HoursBudgetViewSet,
+    NotificationPreferenceViewSet,
     NotificationViewSet,
     PermissionViewSet,
     RiskAssessmentImportIssuesViewSet,
@@ -55,6 +56,7 @@ router.register("evidence-files", EvidenceFileViewSet, basename="evidence-file")
 router.register("auditable-entities", AuditableEntityViewSet, basename="auditable-entity")
 router.register("risk-history", RiskHistoryViewSet, basename="risk-history")
 router.register("notifications", NotificationViewSet, basename="notification")
+router.register("notification-preferences", NotificationPreferenceViewSet, basename="notification-preference")
 router.register("audit-log", AuditLogViewSet, basename="audit-log")
 router.register("follow-ups", FollowUpViewSet, basename="follow-up")
 router.register("comments", CommentViewSet, basename="comment")

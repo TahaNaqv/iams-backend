@@ -308,6 +308,28 @@ CELERY_TASK_ACKS_LATE = True
 CELERY_WORKER_PREFETCH_MULTIPLIER = 1
 CELERY_BEAT_SCHEDULER = "django_celery_beat.schedulers:DatabaseScheduler"
 
+# Static beat schedule — django_celery_beat overlays the DB rows on top of
+# this, so values here are the "out of the box" defaults that the
+# scheduler will install on first start.
+#
+# Times are in ``TIME_ZONE`` (TIME_ZONE setting). Adjust to local prod
+# business hours via env if needed.
+from celery.schedules import crontab  # noqa: E402 — needed by the dict below
+
+CELERY_BEAT_SCHEDULE = {
+    # Nightly at 02:00 local — find CAPs that are overdue or due in ≤3 days
+    # and notify their owners (deduplicated to once-per-24h per CAP).
+    "cap-overdue-scan-nightly": {
+        "task": "iams.notify.cap_overdue_scan",
+        "schedule": crontab(hour=2, minute=0),
+    },
+    # Monday 08:00 local — send each active user a weekly workload digest.
+    "weekly-digest-monday-morning": {
+        "task": "iams.notify.weekly_digest",
+        "schedule": crontab(day_of_week="monday", hour=8, minute=0),
+    },
+}
+
 # ──────────────────────────────────────────────────────────────────────
 # Email (overridden per env)
 # ──────────────────────────────────────────────────────────────────────

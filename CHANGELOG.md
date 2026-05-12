@@ -2,6 +2,71 @@
 
 All notable changes to the IAMS Django REST API backend.
 
+## [0.7.0] — Phase 2 Track 2: Notifications + email pipeline (2026-05-12)
+
+### Added
+- **14-kind notification taxonomy** on `Notification.KIND_*` — `audit_assigned`, `audit_status_change`, `finding_raised`, `cap_assigned`, `cap_due_soon`, `cap_overdue`, `approval_requested`, `approval_approved`, `approval_rejected`, `password_reset`, `file_quarantine`, `weekly_digest`, `mfa_reminder`, `generic`.
+- **Notification model extended** (migration 0010): `recipient` FK (NULL = system broadcast), `kind`, `target_content_type`/`target_object_id` GenericFK, `link`, `module`, `email_sent_at`, indexes on `(recipient, read, -timestamp)` + `(kind, -timestamp)`.
+- **`NotificationPreference` model** — per-user × per-kind toggles for in-app and email. Unique constraint on `(user, kind)`. Defaults supplied server-side so the FE matrix is always complete on first render.
+- **`iams.notifications.dispatch(...)`** — single chokepoint for every notification event. Resolves user prefs (with `DEFAULT_PREFS` fallback), writes in-app row, enqueues email task. Never raises into caller.
+- **`iams.notifications.dispatch_to_role(role_name, ...)`** — fan-out helper for escalation flows.
+- **`iams.tasks.notify.deliver_email`** Celery task — autoretrying, marks the originating `Notification.email_sent_at`.
+- **Scheduled tasks** (`CELERY_BEAT_SCHEDULE`):
+  - `iams.notify.cap_overdue_scan` — nightly at 02:00 local. Notifies CAP owners about overdue + due-in-3-days CAPs. Deduped to once-per-24h per CAP.
+  - `iams.notify.weekly_digest` — Mondays at 08:00 local. Each active user gets a personalised digest (open / overdue CAPs) plus org-wide stats.
+- **Email templates** at `iams/templates/iams/email/notification.{txt,html}` — responsive HTML + plain-text.
+- **Signal handlers** (`iams/signals.py` connected via `IamsConfig.ready()`):
+  - `CorrectiveAction.post_save` → notify owner on create
+  - `Finding.post_save` → notify owner + audit lead on create (severity-aware level)
+  - `AuditAssignment.post_save` → notify auditor on create
+  - `ApprovalRequest.post_save` → notify submitter on approved/rejected transition
+  - `ApprovalStep.post_save` → notify approver when their pending step is created
+- **API endpoints**:
+  - `GET /api/notifications/` is now **per-user scoped** (includes `recipient=NULL` broadcasts).
+  - `GET /api/notifications/unread-count/` — tiny endpoint the FE bell polls every 60s.
+  - `GET /api/notification-preferences/` — merged defaults + stored rows, one entry per kind.
+  - `POST /api/notification-preferences/` — upsert by `kind`.
+- **Existing `mark-read` / `mark-all-read`** actions now honor user scoping.
+- **22 new notification tests** in `iams/tests/test_notifications.py` (dispatcher pref-gating, signal-driven flows, beat tasks with dedupe, API scoping, preference upsert, role broadcast).
+
+### Configuration
+- `CELERY_BEAT_SCHEDULE` declared in `config/settings/base.py` — DatabaseScheduler still wins, but these are the defaults installed on first start.
+
+### Test totals
+- **Backend: 339 passing** (was 317; added 22 notification tests). Coverage stable.
+
+## [0.6.0] — Phase 2 Track 1: Automatic audit trail (2026-05-12)
+
+### Added
+- **`AuditedViewSetMixin`** in [iams/audit.py](iams/audit.py) — drop-in mixin for any `ModelViewSet` that captures every create/update/delete and writes an `AuditLogEntry` row with:
+  - actor (display + FK), action verb, target (str + GenericFK)
+  - `request_id` from middleware, IP (X-Forwarded-For aware), truncated user-agent
+  - `changes` payload: `{field: {old, new}}` diff on update, `{snapshot: {...}}` on create/delete
+  - Idempotent PATCH (no actual changes) does not write a row
+  - Failed audit capture never breaks the user request — exception is logged and swallowed
+- **`record_audit_event(...)` helper** for non-CRUD events: login, approval, password change/reset, file_quarantine, export.
+- **AuditLogEntry model fields** (migration 0008): `request_id`, `ip_address`, `user_agent`, `changes` (JSON). Plus DB indexes for `-timestamp`, `(actor_ref, -timestamp)`, `(target_content_type, target_object_id)`, `(action, -timestamp)`.
+- **Action verb constants** on `AuditLogEntry` — `ACTION_CREATE`, `ACTION_UPDATE`, `ACTION_DELETE`, `ACTION_APPROVE`, `ACTION_REJECT`, `ACTION_LOGIN`, `ACTION_LOGOUT`, `ACTION_PASSWORD_RESET`, `ACTION_PASSWORD_CHANGE`, `ACTION_FILE_UPLOAD`, `ACTION_FILE_QUARANTINE`, `ACTION_EXPORT`, `ACTION_OTHER`.
+- **Python append-only enforcement** — `AuditLogEntry.save()` rejects updates after first INSERT (via `_state.adding`); `delete()` raises `PermissionError`.
+- **DB-level append-only enforcement** (migration 0009) — Postgres `BEFORE UPDATE OR DELETE` trigger raises `iams_auditlogentry is append-only`. SQLite (test) skips the trigger; Python guard remains.
+- **Privileged retention escape** — trigger respects `current_setting('iams.allow_audit_log_modification')` so the Phase 5 retention worker can purge expired rows under controlled session.
+- **13 new audit-trail tests** in [iams/tests/test_audit_trail.py](iams/tests/test_audit_trail.py).
+
+### Behavior
+- Every write-able ViewSet now auto-captures:
+  `AuditViewSet`, `FindingViewSet`, `CorrectiveActionViewSet`, `ChecklistItemViewSet`, `FollowUpViewSet`, `CommentViewSet`, `AuditorViewSet`, `AssignmentViewSet`, `TimeEntryViewSet`, `HoursBudgetViewSet`, `RiskAssessmentViewSet`, `ApprovalRequestViewSet`, `WorkProgramViewSet`, `WorkProcedureViewSet`, `WorkProcedureStepViewSet`, `AuditReportViewSet`, `AuditReportSectionViewSet`, `ManagedDocumentViewSet`, `UserViewSet`.
+- **`ApprovalRequestViewSet.approve` / `.reject`** now record explicit `approve`/`reject` events with step role + comments in `details`.
+- **`PasswordChangeView`** records `password_change`.
+- **`PasswordResetConfirmView`** records `password_reset` with `via=reset_token`.
+- **AV scan task** records `file_quarantine` (actor `system:clamav`) when a file is flagged.
+- **User passwords** are in the global excluded-fields set — never appear in the audit log.
+
+### Serializer
+- `AuditLogEntrySerializer` now exposes: `requestId`, `ipAddress`, `userAgent`, `targetType`, `targetId`, `changes`, plus the existing `actor`/`action`/`target`/`timestamp`/`details`.
+
+### Test totals
+- **Backend: 317 passing** (was 304; added 13 audit-trail tests). Coverage stable.
+
 ## [0.5.0] — Phase 1 Track 3: MinIO storage + ClamAV virus scanning (2026-05-12)
 
 ### Added

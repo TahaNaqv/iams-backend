@@ -3,14 +3,15 @@ from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 
+from iams.audit import AuditedViewSetMixin
 from iams.models import UserProfile
-from iams.serializers import UserSerializer, UserCreateSerializer, UserUpdateSerializer
 from iams.permissions import HasPermission
+from iams.serializers import UserCreateSerializer, UserSerializer, UserUpdateSerializer
 
 User = get_user_model()
 
 
-class UserViewSet(viewsets.ModelViewSet):
+class UserViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
     queryset = (
         User.objects.select_related("profile__role")
         .prefetch_related("profile__role__permissions")
@@ -18,6 +19,7 @@ class UserViewSet(viewsets.ModelViewSet):
         .order_by("id")
     )
     permission_classes = [HasPermission("manage_users")]
+    audit_excluded_fields = {"password", "last_login", "date_joined"}
 
     def get_serializer_class(self):
         if self.action == "create":

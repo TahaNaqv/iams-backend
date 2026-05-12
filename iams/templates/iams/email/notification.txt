@@ -1,0 +1,12 @@
+Hello {{ user_name }},
+
+{{ title }}
+
+{{ message }}
+{% if link %}
+View it here: {{ link }}
+{% endif %}
+—
+The {{ site_name }} team
+This is an automated message. You can manage which IAMS notifications
+send emails in your profile under Notifications → Preferences.

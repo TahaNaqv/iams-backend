@@ -25,6 +25,8 @@ from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 from rest_framework_simplejwt.views import TokenObtainPairView
 
+from iams.audit import record_audit_event
+from iams.models import AuditLogEntry
 from iams.serializers import (
     MeSerializer,
     MeUpdateSerializer,
@@ -110,6 +112,12 @@ class PasswordChangeView(APIView):
         serializer.is_valid(raise_exception=True)
         serializer.save()
         logger.info("password_changed", extra={"user_id": str(request.user.pk)})
+        record_audit_event(
+            action=AuditLogEntry.ACTION_PASSWORD_CHANGE,
+            actor=request.user,
+            target=request.user,
+            request=request,
+        )
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
@@ -177,4 +185,11 @@ class PasswordResetConfirmView(APIView):
         serializer.is_valid(raise_exception=True)
         user = serializer.save()
         logger.info("password_reset_completed", extra={"user_id": str(user.pk)})
+        record_audit_event(
+            action=AuditLogEntry.ACTION_PASSWORD_RESET,
+            actor=user,
+            target=user,
+            details={"via": "reset_token"},
+            request=request,
+        )
         return Response(status=status.HTTP_204_NO_CONTENT)

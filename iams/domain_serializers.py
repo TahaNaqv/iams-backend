@@ -895,3 +895,252 @@ class AuditKPISerializer(serializers.ModelSerializer):
 
     def get_favorable(self, obj) -> bool:
         return obj.variance_is_favorable
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Phase 3 Track 3 — CSA serializers
+# ──────────────────────────────────────────────────────────────────────
+from iams.models import (  # noqa: E402
+    CSAAnswer,
+    CSAQuestion,
+    CSAQuestionnaire,
+    CSAResponse,
+)
+
+
+class CSAQuestionSerializer(serializers.ModelSerializer):
+    questionnaireId = serializers.PrimaryKeyRelatedField(
+        source="questionnaire", queryset=CSAQuestionnaire.objects.all(),
+    )
+    controlId = serializers.CharField(source="control_id", allow_blank=True, required=False)
+    responseType = serializers.CharField(source="response_type")
+
+    class Meta:
+        model = CSAQuestion
+        fields = [
+            "id", "questionnaireId", "controlId", "text",
+            "responseType", "category", "weight", "order",
+        ]
+
+
+class CSAQuestionnaireSerializer(serializers.ModelSerializer):
+    weakThreshold = serializers.IntegerField(source="weak_threshold", min_value=0, max_value=100)
+    questions = CSAQuestionSerializer(many=True, read_only=True)
+    questionCount = serializers.SerializerMethodField()
+
+    class Meta:
+        model = CSAQuestionnaire
+        fields = [
+            "id", "title", "framework", "version", "status",
+            "description", "weakThreshold",
+            "questions", "questionCount",
+        ]
+        read_only_fields = ["questions", "questionCount"]
+
+    def get_questionCount(self, obj) -> int:
+        if hasattr(obj, "_prefetched_objects_cache") and "questions" in obj._prefetched_objects_cache:
+            return len(obj._prefetched_objects_cache["questions"])
+        return obj.questions.count()
+
+
+class CSAAnswerSerializer(serializers.ModelSerializer):
+    responseId = serializers.PrimaryKeyRelatedField(
+        source="response", queryset=CSAResponse.objects.all(),
+    )
+    questionId = serializers.PrimaryKeyRelatedField(
+        source="question", queryset=CSAQuestion.objects.all(),
+    )
+    evidenceFileId = serializers.PrimaryKeyRelatedField(
+        source="evidence_file", queryset=EvidenceFile.objects.all(),
+        required=False, allow_null=True,
+    )
+    challengeStatus = serializers.CharField(source="challenge_status", read_only=True)
+    challengeNote = serializers.CharField(source="challenge_note", read_only=True)
+    challengedById = serializers.UUIDField(source="challenged_by_id", read_only=True, allow_null=True)
+    challengedAt = serializers.DateTimeField(source="challenged_at", read_only=True, allow_null=True)
+    resolutionNote = serializers.CharField(source="resolution_note", read_only=True)
+    resolvedById = serializers.UUIDField(source="resolved_by_id", read_only=True, allow_null=True)
+    resolvedAt = serializers.DateTimeField(source="resolved_at", read_only=True, allow_null=True)
+
+    class Meta:
+        model = CSAAnswer
+        fields = [
+            "id", "responseId", "questionId", "value", "evidenceFileId",
+            "challengeStatus", "challengeNote", "challengedById", "challengedAt",
+            "resolutionNote", "resolvedById", "resolvedAt",
+        ]
+        read_only_fields = [
+            "challengeStatus", "challengeNote", "challengedById", "challengedAt",
+            "resolutionNote", "resolvedById", "resolvedAt",
+        ]
+
+
+class CSAResponseSerializer(serializers.ModelSerializer):
+    questionnaireId = serializers.PrimaryKeyRelatedField(
+        source="questionnaire", queryset=CSAQuestionnaire.objects.all(),
+    )
+    questionnaireTitle = serializers.CharField(source="questionnaire.title", read_only=True)
+    entityId = serializers.PrimaryKeyRelatedField(
+        source="entity", queryset=AuditableEntity.objects.all(),
+        required=False, allow_null=True,
+    )
+    entityName = serializers.CharField(source="entity.name", read_only=True, default=None)
+    responderId = serializers.UUIDField(source="responder_id", read_only=True, allow_null=True)
+    scoreOverall = serializers.DecimalField(
+        source="score_overall", max_digits=5, decimal_places=2, read_only=True,
+    )
+    scoreDesign = serializers.DecimalField(
+        source="score_design", max_digits=5, decimal_places=2, read_only=True, allow_null=True,
+    )
+    scoreOperating = serializers.DecimalField(
+        source="score_operating", max_digits=5, decimal_places=2, read_only=True, allow_null=True,
+    )
+    isWeak = serializers.BooleanField(source="is_weak", read_only=True)
+    submittedAt = serializers.DateTimeField(source="submitted_at", read_only=True, allow_null=True)
+    closedAt = serializers.DateTimeField(source="closed_at", read_only=True, allow_null=True)
+    answers = CSAAnswerSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = CSAResponse
+        fields = [
+            "id", "questionnaireId", "questionnaireTitle",
+            "entityId", "entityName", "department", "responderId",
+            "status", "scoreOverall", "scoreDesign", "scoreOperating", "isWeak",
+            "submittedAt", "closedAt",
+            "answers",
+        ]
+        read_only_fields = [
+            "questionnaireTitle", "entityName", "responderId",
+            "status", "scoreOverall", "scoreDesign", "scoreOperating", "isWeak",
+            "submittedAt", "closedAt", "answers",
+        ]
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Phase 3 Track 4 — ICFR serializers
+# ──────────────────────────────────────────────────────────────────────
+from iams.models import (  # noqa: E402
+    Control,
+    ControlException,
+    ControlTest,
+    DeficiencyReport,
+)
+
+
+class ControlSerializer(serializers.ModelSerializer):
+    entityId = serializers.PrimaryKeyRelatedField(
+        source="entity", queryset=AuditableEntity.objects.all(),
+    )
+    entityName = serializers.CharField(source="entity.name", read_only=True)
+    controlId = serializers.CharField(source="control_id")
+    controlType = serializers.CharField(source="control_type")
+    riskRating = serializers.CharField(source="risk_rating")
+    ownerRefId = serializers.UUIDField(source="owner_ref_id", read_only=True, allow_null=True)
+
+    class Meta:
+        model = Control
+        fields = [
+            "id", "entityId", "entityName", "controlId", "name", "description",
+            "framework", "controlType", "nature", "frequency", "assertion",
+            "riskRating", "owner", "ownerRefId", "status",
+        ]
+        read_only_fields = ["entityName", "ownerRefId"]
+
+
+class ControlExceptionSerializer(serializers.ModelSerializer):
+    testId = serializers.PrimaryKeyRelatedField(
+        source="test", queryset=ControlTest.objects.all(),
+    )
+    sampleRef = serializers.CharField(source="sample_ref", allow_blank=True, required=False)
+    identifiedAt = serializers.DateField(source="identified_at", allow_null=True, required=False)
+    evidenceFileIds = serializers.PrimaryKeyRelatedField(
+        source="evidence_files", many=True,
+        queryset=EvidenceFile.objects.all(),
+        required=False,
+    )
+
+    class Meta:
+        model = ControlException
+        fields = [
+            "id", "testId", "sampleRef", "description", "severity",
+            "evidenceFileIds", "identifiedAt",
+        ]
+
+
+class DeficiencyReportSerializer(serializers.ModelSerializer):
+    testId = serializers.PrimaryKeyRelatedField(
+        source="test", queryset=ControlTest.objects.all(),
+    )
+    controlId = serializers.CharField(source="test.control.control_id", read_only=True)
+    controlName = serializers.CharField(source="test.control.name", read_only=True)
+    period = serializers.CharField(source="test.period", read_only=True)
+    managementResponse = serializers.CharField(source="management_response", allow_blank=True, required=False)
+    identifiedDate = serializers.DateField(source="identified_date", allow_null=True, required=False)
+    targetResolutionDate = serializers.DateField(source="target_resolution_date", allow_null=True, required=False)
+    actualResolutionDate = serializers.DateField(source="actual_resolution_date", read_only=True, allow_null=True)
+    ownerRefId = serializers.UUIDField(source="owner_ref_id", read_only=True, allow_null=True)
+
+    class Meta:
+        model = DeficiencyReport
+        fields = [
+            "id", "testId", "controlId", "controlName", "period",
+            "classification", "narrative", "recommendation", "managementResponse",
+            "identifiedDate", "targetResolutionDate", "actualResolutionDate",
+            "status", "owner", "ownerRefId",
+        ]
+        read_only_fields = [
+            "controlId", "controlName", "period",
+            "actualResolutionDate", "ownerRefId",
+        ]
+
+
+class ControlTestSerializer(serializers.ModelSerializer):
+    controlId = serializers.PrimaryKeyRelatedField(
+        source="control", queryset=Control.objects.all(),
+    )
+    controlReference = serializers.CharField(source="control.control_id", read_only=True)
+    controlName = serializers.CharField(source="control.name", read_only=True)
+    testType = serializers.CharField(source="test_type")
+    plannedSampleSize = serializers.IntegerField(source="planned_sample_size", required=False)
+    sampleSize = serializers.IntegerField(source="sample_size", required=False)
+    sampleMethod = serializers.CharField(source="sample_method", allow_blank=True, required=False)
+    testerId = serializers.PrimaryKeyRelatedField(
+        source="tester",
+        queryset=__import__("django.contrib.auth", fromlist=["get_user_model"]).get_user_model().objects.all(),
+        required=False, allow_null=True,
+    )
+    reviewerId = serializers.PrimaryKeyRelatedField(
+        source="reviewer",
+        queryset=__import__("django.contrib.auth", fromlist=["get_user_model"]).get_user_model().objects.all(),
+        required=False, allow_null=True,
+    )
+    managementAssessment = serializers.CharField(source="management_assessment", required=False)
+    managementAssessmentNotes = serializers.CharField(source="management_assessment_notes", allow_blank=True, required=False)
+    auditorAssessment = serializers.CharField(source="auditor_assessment", required=False)
+    auditorAssessmentNotes = serializers.CharField(source="auditor_assessment_notes", allow_blank=True, required=False)
+    conclusion = serializers.SerializerMethodField()
+    startedAt = serializers.DateField(source="started_at", allow_null=True, required=False)
+    completedAt = serializers.DateField(source="completed_at", allow_null=True, required=False)
+    exceptions = ControlExceptionSerializer(many=True, read_only=True)
+    deficiency = DeficiencyReportSerializer(read_only=True)
+
+    class Meta:
+        model = ControlTest
+        fields = [
+            "id", "controlId", "controlReference", "controlName",
+            "period", "testType", "status",
+            "plannedSampleSize", "sampleSize", "sampleMethod",
+            "testerId", "reviewerId",
+            "managementAssessment", "managementAssessmentNotes",
+            "auditorAssessment", "auditorAssessmentNotes",
+            "conclusion",
+            "startedAt", "completedAt",
+            "exceptions", "deficiency",
+        ]
+        read_only_fields = [
+            "controlReference", "controlName", "conclusion",
+            "exceptions", "deficiency",
+        ]
+
+    def get_conclusion(self, obj) -> str:
+        return obj.conclusion

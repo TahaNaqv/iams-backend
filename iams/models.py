@@ -1331,3 +1331,536 @@ class AuditKPI(TimeStampedModel):
         if self.direction == self.HIGHER_IS_BETTER:
             return diff > 0
         return diff < 0
+
+
+# ═════════════════════════════════════════════════════════════════════
+# Phase 3 Track 3 — Control Self-Assessment (CSA)
+#
+# Business units (auditees) self-evaluate their controls against a
+# questionnaire authored by Internal Audit. The system auto-scores the
+# response on submit, flags weak units (score < threshold) for next
+# year's risk-based audit plan, and exposes an auditor-challenge
+# workflow where IA reviewers can question specific answers.
+#
+# FR-CSA-01..05.
+# ═════════════════════════════════════════════════════════════════════
+
+
+class CSAQuestionnaire(TimeStampedModel):
+    """The questionnaire IA publishes for business units to respond to.
+
+    Reusable across many ``CSAResponse`` rows. Editing an active
+    questionnaire is allowed; archiving it stops new responses from
+    being created against it but keeps history viewable.
+    """
+
+    STATUS_DRAFT = "draft"
+    STATUS_ACTIVE = "active"
+    STATUS_ARCHIVED = "archived"
+    STATUS_CHOICES = [
+        (STATUS_DRAFT, "Draft"),
+        (STATUS_ACTIVE, "Active"),
+        (STATUS_ARCHIVED, "Archived"),
+    ]
+
+    FRAMEWORK_COSO = "COSO"
+    FRAMEWORK_COBIT = "COBIT"
+    FRAMEWORK_ISO27001 = "ISO 27001"
+    FRAMEWORK_CUSTOM = "Custom"
+    FRAMEWORK_CHOICES = [
+        (FRAMEWORK_COSO, "COSO"),
+        (FRAMEWORK_COBIT, "COBIT"),
+        (FRAMEWORK_ISO27001, "ISO 27001"),
+        (FRAMEWORK_CUSTOM, "Custom"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    title = models.CharField(max_length=255)
+    framework = models.CharField(max_length=30, choices=FRAMEWORK_CHOICES, default=FRAMEWORK_CUSTOM)
+    version = models.CharField(max_length=20, default="1.0")
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_DRAFT, db_index=True)
+    description = models.TextField(blank=True)
+    # Score below this threshold (out of 100) flags the responding entity
+    # for next year's audit plan + dispatches a CSA_WEAK_CONTROL
+    # notification to Audit Managers. Lives on the questionnaire so
+    # different frameworks can have different bars.
+    weak_threshold = models.PositiveIntegerField(
+        default=60,
+        help_text="Score (0-100) below which a response is flagged as a weak control.",
+    )
+
+    class Meta:
+        ordering = ["-version", "title"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["title", "version"],
+                name="iams_csa_questionnaire_title_version_unique",
+            ),
+        ]
+
+
+class CSAQuestion(TimeStampedModel):
+    """One question on a questionnaire.
+
+    Four response types:
+      - yes_no            → boolean; "yes" = full weight, "no" = 0
+      - scale_1_5         → 1..5 integer; score scales linearly to weight
+      - text              → free-form; weight awarded if non-empty
+      - evidence_required → free-form + must have ``evidence_file`` to score
+
+    ``category`` lets the scoring split into design vs operating
+    effectiveness (FR-CSA-03) — leave blank for an overall pool.
+    """
+
+    TYPE_YES_NO = "yes_no"
+    TYPE_SCALE_1_5 = "scale_1_5"
+    TYPE_TEXT = "text"
+    TYPE_EVIDENCE_REQUIRED = "evidence_required"
+    TYPE_CHOICES = [
+        (TYPE_YES_NO, "Yes / No"),
+        (TYPE_SCALE_1_5, "Scale 1-5"),
+        (TYPE_TEXT, "Free text"),
+        (TYPE_EVIDENCE_REQUIRED, "Free text + evidence file"),
+    ]
+
+    CATEGORY_DESIGN = "design"
+    CATEGORY_OPERATING = "operating"
+    CATEGORY_GENERAL = ""
+    CATEGORY_CHOICES = [
+        (CATEGORY_GENERAL, "General"),
+        (CATEGORY_DESIGN, "Control design"),
+        (CATEGORY_OPERATING, "Operating effectiveness"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    questionnaire = models.ForeignKey(
+        CSAQuestionnaire, on_delete=models.CASCADE, related_name="questions",
+    )
+    control_id = models.CharField(
+        max_length=50, blank=True,
+        help_text="Free-form control reference (e.g. 'COSO-CC1.1').",
+    )
+    text = models.TextField()
+    response_type = models.CharField(max_length=30, choices=TYPE_CHOICES, default=TYPE_YES_NO)
+    category = models.CharField(max_length=20, choices=CATEGORY_CHOICES, default=CATEGORY_GENERAL, blank=True)
+    weight = models.PositiveIntegerField(
+        default=1,
+        help_text="Relative weight in the final score (must be ≥ 1).",
+    )
+    order = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        ordering = ["questionnaire_id", "order", "created_at"]
+        indexes = [
+            models.Index(fields=["questionnaire", "order"]),
+        ]
+
+
+class CSAResponse(TimeStampedModel):
+    """One business unit's response to a questionnaire.
+
+    Lifecycle:
+      draft     — responder is filling it in; mutable
+      submitted — responder finished; auto-scored; immutable except by
+                  auditor challenge
+      under_review — auditor has issued one or more challenges
+      closed    — auditor has approved; row becomes read-only
+    """
+
+    STATUS_DRAFT = "draft"
+    STATUS_SUBMITTED = "submitted"
+    STATUS_UNDER_REVIEW = "under_review"
+    STATUS_CLOSED = "closed"
+    STATUS_CHOICES = [
+        (STATUS_DRAFT, "Draft"),
+        (STATUS_SUBMITTED, "Submitted"),
+        (STATUS_UNDER_REVIEW, "Under Review"),
+        (STATUS_CLOSED, "Closed"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    questionnaire = models.ForeignKey(
+        CSAQuestionnaire, on_delete=models.PROTECT, related_name="responses",
+    )
+    entity = models.ForeignKey(
+        AuditableEntity, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name="csa_responses",
+    )
+    department = models.CharField(max_length=200, blank=True)
+    responder = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name="csa_responses",
+    )
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_DRAFT, db_index=True)
+
+    # Computed on submit. Range 0..100. Split into design / operating
+    # when questions carry those categories.
+    score_overall = models.DecimalField(max_digits=5, decimal_places=2, default=0)
+    score_design = models.DecimalField(max_digits=5, decimal_places=2, null=True, blank=True)
+    score_operating = models.DecimalField(max_digits=5, decimal_places=2, null=True, blank=True)
+    is_weak = models.BooleanField(default=False, db_index=True)
+
+    submitted_at = models.DateTimeField(null=True, blank=True)
+    closed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-submitted_at", "-created_at"]
+        indexes = [
+            models.Index(fields=["questionnaire", "status"]),
+            models.Index(fields=["entity", "-submitted_at"]),
+        ]
+
+
+class CSAAnswer(TimeStampedModel):
+    """A single answer cell.
+
+    ``value`` carries everything: "yes"/"no" for yes_no, "1".."5" for
+    scale_1_5, plain text for text/evidence_required. The auditor
+    challenge workflow lives here too — once a challenge is opened on
+    an answer, the response moves to ``under_review`` and the responder
+    can edit just this cell to address the challenge.
+    """
+
+    CHALLENGE_NONE = ""
+    CHALLENGE_OPEN = "open"
+    CHALLENGE_RESOLVED = "resolved"
+    CHALLENGE_CHOICES = [
+        (CHALLENGE_NONE, "None"),
+        (CHALLENGE_OPEN, "Open"),
+        (CHALLENGE_RESOLVED, "Resolved"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    response = models.ForeignKey(CSAResponse, on_delete=models.CASCADE, related_name="answers")
+    question = models.ForeignKey(CSAQuestion, on_delete=models.PROTECT, related_name="answers")
+    value = models.TextField(blank=True)
+    evidence_file = models.ForeignKey(
+        EvidenceFile, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name="csa_answers",
+    )
+
+    # Auditor challenge thread on this answer
+    challenge_status = models.CharField(
+        max_length=20, choices=CHALLENGE_CHOICES, default=CHALLENGE_NONE, blank=True, db_index=True
+    )
+    challenge_note = models.TextField(blank=True)
+    challenged_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name="csa_challenges_opened",
+    )
+    challenged_at = models.DateTimeField(null=True, blank=True)
+    resolution_note = models.TextField(blank=True)
+    resolved_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name="csa_challenges_resolved",
+    )
+    resolved_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["response_id", "question__order"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["response", "question"],
+                name="iams_csa_answer_response_question_unique",
+            ),
+        ]
+
+
+# ═════════════════════════════════════════════════════════════════════
+# Phase 3 Track 4 — Internal Control over Financial Reporting (ICFR)
+#
+# ICFR formalizes the design + operating-effectiveness testing of
+# financial controls (SOX 404, COSO). Management performs an initial
+# self-assessment; internal audit (or external auditors) test the same
+# controls and may reach a different conclusion. Failed tests
+# materialize as ``DeficiencyReport`` rows classified by severity
+# (control deficiency / significant deficiency / material weakness).
+#
+# FR-ICFR-01..05.
+# ═════════════════════════════════════════════════════════════════════
+
+
+class Control(TimeStampedModel):
+    """A documented internal control over financial reporting.
+
+    Lives on a specific ``AuditableEntity`` (typically a process,
+    cycle, or system). Each row is the *catalog* entry — actual testing
+    instances are ``ControlTest`` rows below.
+    """
+
+    FRAMEWORK_SOX = "SOX"
+    FRAMEWORK_COSO = "COSO"
+    FRAMEWORK_COBIT = "COBIT"
+    FRAMEWORK_CUSTOM = "Custom"
+    FRAMEWORK_CHOICES = [
+        (FRAMEWORK_SOX, "SOX"),
+        (FRAMEWORK_COSO, "COSO"),
+        (FRAMEWORK_COBIT, "COBIT"),
+        (FRAMEWORK_CUSTOM, "Custom"),
+    ]
+
+    TYPE_PREVENTIVE = "preventive"
+    TYPE_DETECTIVE = "detective"
+    TYPE_CORRECTIVE = "corrective"
+    TYPE_CHOICES = [
+        (TYPE_PREVENTIVE, "Preventive"),
+        (TYPE_DETECTIVE, "Detective"),
+        (TYPE_CORRECTIVE, "Corrective"),
+    ]
+
+    NATURE_MANUAL = "manual"
+    NATURE_AUTOMATED = "automated"
+    NATURE_HYBRID = "hybrid"
+    NATURE_CHOICES = [
+        (NATURE_MANUAL, "Manual"),
+        (NATURE_AUTOMATED, "Automated"),
+        (NATURE_HYBRID, "Hybrid (IT-dependent manual)"),
+    ]
+
+    FREQUENCY_TRANSACTIONAL = "transactional"
+    FREQUENCY_DAILY = "daily"
+    FREQUENCY_WEEKLY = "weekly"
+    FREQUENCY_MONTHLY = "monthly"
+    FREQUENCY_QUARTERLY = "quarterly"
+    FREQUENCY_ANNUAL = "annual"
+    FREQUENCY_AD_HOC = "ad_hoc"
+    FREQUENCY_CHOICES = [
+        (FREQUENCY_TRANSACTIONAL, "Transactional"),
+        (FREQUENCY_DAILY, "Daily"),
+        (FREQUENCY_WEEKLY, "Weekly"),
+        (FREQUENCY_MONTHLY, "Monthly"),
+        (FREQUENCY_QUARTERLY, "Quarterly"),
+        (FREQUENCY_ANNUAL, "Annual"),
+        (FREQUENCY_AD_HOC, "Ad hoc"),
+    ]
+
+    STATUS_ACTIVE = "active"
+    STATUS_RETIRED = "retired"
+    STATUS_CHOICES = [(STATUS_ACTIVE, "Active"), (STATUS_RETIRED, "Retired")]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    entity = models.ForeignKey(
+        AuditableEntity, on_delete=models.CASCADE, related_name="icfr_controls",
+    )
+    control_id = models.CharField(
+        max_length=50, db_index=True,
+        help_text="Org-defined reference, e.g. 'AP-01' or 'FRC-13'.",
+    )
+    name = models.CharField(max_length=255)
+    description = models.TextField(blank=True)
+    framework = models.CharField(max_length=20, choices=FRAMEWORK_CHOICES, default=FRAMEWORK_SOX)
+    control_type = models.CharField(max_length=20, choices=TYPE_CHOICES, default=TYPE_PREVENTIVE)
+    nature = models.CharField(max_length=20, choices=NATURE_CHOICES, default=NATURE_MANUAL)
+    frequency = models.CharField(max_length=20, choices=FREQUENCY_CHOICES, default=FREQUENCY_MONTHLY)
+    assertion = models.CharField(
+        max_length=100, blank=True,
+        help_text="Financial-statement assertion: existence, completeness, accuracy, valuation, …",
+    )
+    risk_rating = models.CharField(max_length=20, default="Medium")
+    owner = models.CharField(max_length=200, blank=True)
+    owner_ref = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name="icfr_controls_owned",
+    )
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_ACTIVE, db_index=True)
+
+    class Meta:
+        ordering = ["entity_id", "control_id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["entity", "control_id"],
+                name="iams_icfr_control_entity_ref_unique",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["framework", "control_type"]),
+            models.Index(fields=["status", "risk_rating"]),
+        ]
+
+
+class ControlTest(TimeStampedModel):
+    """One test instance of a Control for a specific period.
+
+    Distinguishes **management assessment** (FR-ICFR-04) from **auditor
+    assessment** — both can coexist with potentially different
+    conclusions. The "official" record for SOX certification typically
+    uses the auditor conclusion when present.
+    """
+
+    TEST_TYPE_DESIGN = "design"
+    TEST_TYPE_OPERATING = "operating"
+    TEST_TYPE_CHOICES = [
+        (TEST_TYPE_DESIGN, "Test of Design"),
+        (TEST_TYPE_OPERATING, "Test of Operating Effectiveness"),
+    ]
+
+    STATUS_PLANNED = "planned"
+    STATUS_IN_PROGRESS = "in_progress"
+    STATUS_COMPLETED = "completed"
+    STATUS_CHOICES = [
+        (STATUS_PLANNED, "Planned"),
+        (STATUS_IN_PROGRESS, "In Progress"),
+        (STATUS_COMPLETED, "Completed"),
+    ]
+
+    CONCLUSION_NOT_TESTED = "not_tested"
+    CONCLUSION_EFFECTIVE = "effective"
+    CONCLUSION_DEFICIENT = "deficient"
+    CONCLUSION_CHOICES = [
+        (CONCLUSION_NOT_TESTED, "Not Tested"),
+        (CONCLUSION_EFFECTIVE, "Effective"),
+        (CONCLUSION_DEFICIENT, "Deficient"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    control = models.ForeignKey(Control, on_delete=models.CASCADE, related_name="tests")
+    period = models.CharField(max_length=32, db_index=True, help_text="e.g. 'FY2026-Q1'.")
+    test_type = models.CharField(max_length=20, choices=TEST_TYPE_CHOICES)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_PLANNED, db_index=True)
+
+    # Sampling
+    planned_sample_size = models.PositiveIntegerField(default=0)
+    sample_size = models.PositiveIntegerField(default=0)
+    sample_method = models.CharField(max_length=100, blank=True)
+
+    # Tester + reviewer
+    tester = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name="icfr_tests_run",
+    )
+    reviewer = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name="icfr_tests_reviewed",
+    )
+
+    # Dual conclusions (FR-ICFR-04 segregation)
+    management_assessment = models.CharField(
+        max_length=20, choices=CONCLUSION_CHOICES, default=CONCLUSION_NOT_TESTED,
+        help_text="Process owner's self-assessment.",
+    )
+    management_assessment_notes = models.TextField(blank=True)
+    auditor_assessment = models.CharField(
+        max_length=20, choices=CONCLUSION_CHOICES, default=CONCLUSION_NOT_TESTED,
+        help_text="Independent IA conclusion. Takes precedence in summary reports.",
+    )
+    auditor_assessment_notes = models.TextField(blank=True)
+
+    started_at = models.DateField(null=True, blank=True)
+    completed_at = models.DateField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["control_id", "-period", "test_type"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["control", "period", "test_type"],
+                name="iams_icfr_test_control_period_type_unique",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["period", "status"]),
+            models.Index(fields=["auditor_assessment"]),
+        ]
+
+    @property
+    def conclusion(self) -> str:
+        """Effective conclusion: auditor takes precedence when not_tested.
+
+        SOX certification typically uses the IA team's assessment when
+        present; management's stands as the official conclusion only
+        when IA hasn't tested independently.
+        """
+        if self.auditor_assessment != self.CONCLUSION_NOT_TESTED:
+            return self.auditor_assessment
+        return self.management_assessment
+
+
+class ControlException(TimeStampedModel):
+    """An exception observed during a ControlTest's sample testing.
+
+    Each row is one sample that failed (or surfaced an issue). Severity
+    is independent of the deficiency classification — multiple
+    exceptions can roll up into a single DeficiencyReport.
+    """
+
+    SEVERITY_LOW = "low"
+    SEVERITY_MEDIUM = "medium"
+    SEVERITY_HIGH = "high"
+    SEVERITY_CHOICES = [
+        (SEVERITY_LOW, "Low"),
+        (SEVERITY_MEDIUM, "Medium"),
+        (SEVERITY_HIGH, "High"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    test = models.ForeignKey(ControlTest, on_delete=models.CASCADE, related_name="exceptions")
+    sample_ref = models.CharField(
+        max_length=100, blank=True,
+        help_text="Sample identifier — e.g. transaction ID or document number.",
+    )
+    description = models.TextField()
+    severity = models.CharField(max_length=20, choices=SEVERITY_CHOICES, default=SEVERITY_MEDIUM)
+    evidence_files = models.ManyToManyField(
+        EvidenceFile, blank=True, related_name="icfr_exceptions",
+    )
+    identified_at = models.DateField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["test_id", "-identified_at"]
+        indexes = [
+            models.Index(fields=["test", "severity"]),
+        ]
+
+
+class DeficiencyReport(TimeStampedModel):
+    """A formal deficiency raised on a failed ControlTest (FR-ICFR-03).
+
+    Auto-created in draft when a ControlTest's auditor_assessment flips
+    to ``deficient`` (see ``iams/icfr.py``).
+    """
+
+    CLASSIFICATION_CONTROL = "control_deficiency"
+    CLASSIFICATION_SIGNIFICANT = "significant_deficiency"
+    CLASSIFICATION_MATERIAL = "material_weakness"
+    CLASSIFICATION_CHOICES = [
+        (CLASSIFICATION_CONTROL, "Control Deficiency"),
+        (CLASSIFICATION_SIGNIFICANT, "Significant Deficiency"),
+        (CLASSIFICATION_MATERIAL, "Material Weakness"),
+    ]
+
+    STATUS_DRAFT = "draft"
+    STATUS_OPEN = "open"
+    STATUS_REMEDIATING = "remediating"
+    STATUS_CLOSED = "closed"
+    STATUS_CHOICES = [
+        (STATUS_DRAFT, "Draft"),
+        (STATUS_OPEN, "Open"),
+        (STATUS_REMEDIATING, "Remediating"),
+        (STATUS_CLOSED, "Closed"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    test = models.OneToOneField(
+        ControlTest, on_delete=models.CASCADE, related_name="deficiency",
+    )
+    classification = models.CharField(
+        max_length=30, choices=CLASSIFICATION_CHOICES,
+        default=CLASSIFICATION_CONTROL, db_index=True,
+    )
+    narrative = models.TextField(blank=True)
+    recommendation = models.TextField(blank=True)
+    management_response = models.TextField(blank=True)
+    identified_date = models.DateField(null=True, blank=True)
+    target_resolution_date = models.DateField(null=True, blank=True)
+    actual_resolution_date = models.DateField(null=True, blank=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_DRAFT, db_index=True)
+    owner = models.CharField(max_length=200, blank=True)
+    owner_ref = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name="icfr_deficiencies_owned",
+    )
+
+    class Meta:
+        ordering = ["-identified_date", "classification"]
+        indexes = [
+            models.Index(fields=["classification", "status"]),
+        ]

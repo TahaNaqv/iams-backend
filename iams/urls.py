@@ -44,6 +44,15 @@ from iams.views import (
     StakeholderSurveyViewSet,
     AuditKPIViewSet,
     QAIPDashboardView,
+    CSAQuestionnaireViewSet,
+    CSAQuestionViewSet,
+    CSAResponseViewSet,
+    CSAAnswerViewSet,
+    ControlViewSet,
+    ControlTestViewSet,
+    ControlExceptionViewSet,
+    DeficiencyReportViewSet,
+    ICFRSummaryView,
     TimeEntryViewSet,
     TimelineByAuditView,
     UserViewSet,
@@ -89,6 +98,16 @@ router.register("qaip/assessments", QAIPAssessmentViewSet, basename="qaip-assess
 router.register("qaip/findings", QAIPFindingViewSet, basename="qaip-finding")
 router.register("qaip/surveys", StakeholderSurveyViewSet, basename="qaip-survey")
 router.register("qaip/kpis", AuditKPIViewSet, basename="qaip-kpi")
+# Phase 3 Track 3 — CSA
+router.register("csa/questionnaires", CSAQuestionnaireViewSet, basename="csa-questionnaire")
+router.register("csa/questions", CSAQuestionViewSet, basename="csa-question")
+router.register("csa/responses", CSAResponseViewSet, basename="csa-response")
+router.register("csa/answers", CSAAnswerViewSet, basename="csa-answer")
+# Phase 3 Track 4 — ICFR
+router.register("icfr/controls", ControlViewSet, basename="icfr-control")
+router.register("icfr/tests", ControlTestViewSet, basename="icfr-test")
+router.register("icfr/exceptions", ControlExceptionViewSet, basename="icfr-exception")
+router.register("icfr/deficiencies", DeficiencyReportViewSet, basename="icfr-deficiency")
 
 urlpatterns = [
     path("", include(router.urls)),
@@ -98,6 +117,7 @@ urlpatterns = [
     path("audits/<uuid:audit_id>/timeline/", TimelineByAuditView.as_view(), name="audit-timeline"),
     path("dashboard/kpis/", DashboardKPIView.as_view(), name="dashboard-kpis"),
     path("qaip/dashboard/", QAIPDashboardView.as_view(), name="qaip-dashboard"),
+    path("icfr/summary/", ICFRSummaryView.as_view(), name="icfr-summary"),
     path(
         "risk-assessment-import/issues/",
         RiskAssessmentImportIssuesViewSet.as_view({"get": "list"}),

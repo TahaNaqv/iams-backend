@@ -1092,3 +1092,389 @@ class QAIPDashboardView(APIView):
             "surveyResponseCount": survey_qs.count(),
             "kpis": kpi_payload,
         })
+
+
+# ═════════════════════════════════════════════════════════════════════
+# Phase 3 Track 3 — CSA viewsets
+# ═════════════════════════════════════════════════════════════════════
+from iams.models import CSAAnswer, CSAQuestion, CSAQuestionnaire, CSAResponse  # noqa: E402
+from iams.domain_serializers import (  # noqa: E402
+    CSAAnswerSerializer,
+    CSAQuestionSerializer,
+    CSAQuestionnaireSerializer,
+    CSAResponseSerializer,
+)
+
+
+class CSAQuestionnaireViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
+    """Questionnaire CRUD.
+
+    Read access requires ``view_audits`` (auditees need to see the
+    questionnaire before responding). Write requires ``manage_settings``
+    since publishing a questionnaire decides what every business unit
+    answers against.
+    """
+    queryset = CSAQuestionnaire.objects.prefetch_related("questions").all()
+    serializer_class = CSAQuestionnaireSerializer
+
+    def get_permissions(self):
+        if self.action in ("list", "retrieve"):
+            return [HasPermission("view_audits")]
+        return [HasPermission("manage_settings")]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        framework = self.request.query_params.get("framework")
+        if framework:
+            qs = qs.filter(framework=framework)
+        status_filter = self.request.query_params.get("status")
+        if status_filter:
+            qs = qs.filter(status=status_filter)
+        return qs
+
+
+class CSAQuestionViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
+    queryset = CSAQuestion.objects.select_related("questionnaire").all()
+    serializer_class = CSAQuestionSerializer
+
+    def get_permissions(self):
+        if self.action in ("list", "retrieve"):
+            return [HasPermission("view_audits")]
+        return [HasPermission("manage_settings")]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        questionnaire_id = self.request.query_params.get("questionnaire_id")
+        if questionnaire_id:
+            qs = qs.filter(questionnaire_id=questionnaire_id)
+        return qs
+
+
+class CSAResponseViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
+    """Response CRUD + submit/close actions.
+
+    Any authenticated user can list/view their own responses (or all,
+    when they have ``view_audits``); creating a response is open to
+    authenticated users (business-unit owners self-serve). Submit and
+    close are domain actions with their own auth checks in the service
+    layer.
+    """
+    queryset = (
+        CSAResponse.objects
+        .select_related("questionnaire", "entity", "responder")
+        .prefetch_related("answers", "answers__question")
+        .all()
+    )
+    serializer_class = CSAResponseSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        questionnaire_id = self.request.query_params.get("questionnaire_id")
+        if questionnaire_id:
+            qs = qs.filter(questionnaire_id=questionnaire_id)
+        entity_id = self.request.query_params.get("entity_id")
+        if entity_id:
+            qs = qs.filter(entity_id=entity_id)
+        status_filter = self.request.query_params.get("status")
+        if status_filter:
+            qs = qs.filter(status=status_filter)
+        if self.request.query_params.get("weak") == "true":
+            qs = qs.filter(is_weak=True)
+        return qs
+
+    def perform_create(self, serializer):
+        # Auto-stamp the responder as the calling user unless they're an
+        # auditor creating on someone else's behalf.
+        instance = serializer.save()
+        if instance.responder_id is None:
+            instance.responder = self.request.user
+            instance.save(update_fields=["responder", "updated_at"])
+
+    @action(detail=True, methods=["post"], url_path="submit")
+    def submit(self, request, pk=None):
+        from iams.audit import record_audit_event
+        from iams.csa import CSAError, submit_response
+        response = self.get_object()
+        try:
+            submit_response(response, by_user=request.user)
+        except CSAError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        record_audit_event(
+            action=AuditLogEntry.ACTION_OTHER,
+            actor=request.user,
+            target=response,
+            details={
+                "event": "csa_response_submitted",
+                "score_overall": str(response.score_overall),
+                "is_weak": response.is_weak,
+            },
+            request=request,
+        )
+        response.refresh_from_db()
+        return Response(CSAResponseSerializer(response).data)
+
+    @action(detail=True, methods=["post"], url_path="close")
+    def close(self, request, pk=None):
+        from iams.audit import record_audit_event
+        from iams.csa import CSAError, close_response
+        response = self.get_object()
+        try:
+            close_response(response, by_user=request.user)
+        except CSAError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        record_audit_event(
+            action=AuditLogEntry.ACTION_OTHER,
+            actor=request.user,
+            target=response,
+            details={"event": "csa_response_closed"},
+            request=request,
+        )
+        return Response(CSAResponseSerializer(response).data)
+
+
+class CSAAnswerViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
+    queryset = CSAAnswer.objects.select_related("response", "question", "evidence_file").all()
+    serializer_class = CSAAnswerSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        response_id = self.request.query_params.get("response_id")
+        if response_id:
+            qs = qs.filter(response_id=response_id)
+        return qs
+
+    @action(detail=True, methods=["post"], url_path="challenge")
+    def challenge(self, request, pk=None):
+        """Auditor opens a challenge on this answer. Body: ``{"note": "..."}``."""
+        from iams.audit import record_audit_event
+        from iams.csa import CSAError, open_challenge
+        answer = self.get_object()
+        note = (request.data.get("note") or "").strip()
+        try:
+            open_challenge(answer, by_user=request.user, note=note)
+        except CSAError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        record_audit_event(
+            action=AuditLogEntry.ACTION_OTHER,
+            actor=request.user,
+            target=answer.response,
+            details={"event": "csa_answer_challenged", "answer_id": str(answer.id), "note": note},
+            request=request,
+        )
+        return Response(CSAAnswerSerializer(answer).data)
+
+    @action(detail=True, methods=["post"], url_path="resolve")
+    def resolve(self, request, pk=None):
+        """Resolve a pending challenge. Body: ``{"note": "..."}``."""
+        from iams.audit import record_audit_event
+        from iams.csa import CSAError, resolve_challenge
+        answer = self.get_object()
+        note = (request.data.get("note") or "").strip()
+        try:
+            resolve_challenge(answer, by_user=request.user, note=note)
+        except CSAError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        record_audit_event(
+            action=AuditLogEntry.ACTION_OTHER,
+            actor=request.user,
+            target=answer.response,
+            details={"event": "csa_answer_resolved", "answer_id": str(answer.id)},
+            request=request,
+        )
+        return Response(CSAAnswerSerializer(answer).data)
+
+
+# ═════════════════════════════════════════════════════════════════════
+# Phase 3 Track 4 — ICFR viewsets
+# ═════════════════════════════════════════════════════════════════════
+from iams.models import (  # noqa: E402
+    Control,
+    ControlException,
+    ControlTest,
+    DeficiencyReport,
+)
+from iams.domain_serializers import (  # noqa: E402
+    ControlExceptionSerializer,
+    ControlSerializer,
+    ControlTestSerializer,
+    DeficiencyReportSerializer,
+)
+
+
+class ControlViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
+    queryset = Control.objects.select_related("entity", "owner_ref").all()
+    serializer_class = ControlSerializer
+    permission_classes = [HasPermission("view_audits")]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        framework = self.request.query_params.get("framework")
+        if framework:
+            qs = qs.filter(framework=framework)
+        entity_id = self.request.query_params.get("entity_id")
+        if entity_id:
+            qs = qs.filter(entity_id=entity_id)
+        status_filter = self.request.query_params.get("status")
+        if status_filter:
+            qs = qs.filter(status=status_filter)
+        return qs
+
+
+class ControlTestViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
+    queryset = (
+        ControlTest.objects
+        .select_related("control", "control__entity", "tester", "reviewer")
+        .prefetch_related("exceptions", "deficiency")
+        .all()
+    )
+    serializer_class = ControlTestSerializer
+    permission_classes = [HasPermission("view_audits")]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        control_id = self.request.query_params.get("control_id")
+        if control_id:
+            qs = qs.filter(control_id=control_id)
+        period = self.request.query_params.get("period")
+        if period:
+            qs = qs.filter(period=period)
+        test_type = self.request.query_params.get("test_type")
+        if test_type:
+            qs = qs.filter(test_type=test_type)
+        return qs
+
+    @action(detail=True, methods=["post"], url_path="record-result")
+    def record_result(self, request, pk=None):
+        """Record a management or auditor conclusion on this test.
+
+        Body::
+
+            {"role": "auditor"|"management",
+             "conclusion": "effective"|"deficient"|"not_tested",
+             "notes": "…"}
+
+        Returns the updated test. A ``deficient`` auditor conclusion
+        auto-creates a draft DeficiencyReport.
+        """
+        from iams.audit import record_audit_event
+        from iams.icfr import ICFRError, record_test_result
+        test = self.get_object()
+        try:
+            record_test_result(
+                test,
+                by_user=request.user,
+                role=(request.data.get("role") or ""),
+                conclusion=(request.data.get("conclusion") or ""),
+                notes=(request.data.get("notes") or ""),
+            )
+        except ICFRError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        record_audit_event(
+            action=AuditLogEntry.ACTION_OTHER,
+            actor=request.user,
+            target=test,
+            details={
+                "event": "icfr_test_result_recorded",
+                "role": request.data.get("role"),
+                "conclusion": request.data.get("conclusion"),
+            },
+            request=request,
+        )
+        test.refresh_from_db()
+        return Response(ControlTestSerializer(test).data)
+
+
+class ControlExceptionViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
+    queryset = ControlException.objects.select_related("test").prefetch_related("evidence_files").all()
+    serializer_class = ControlExceptionSerializer
+    permission_classes = [HasPermission("view_audits")]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        test_id = self.request.query_params.get("test_id")
+        if test_id:
+            qs = qs.filter(test_id=test_id)
+        severity = self.request.query_params.get("severity")
+        if severity:
+            qs = qs.filter(severity=severity)
+        return qs
+
+
+class DeficiencyReportViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
+    queryset = DeficiencyReport.objects.select_related("test", "test__control").all()
+    serializer_class = DeficiencyReportSerializer
+    permission_classes = [HasPermission("view_audits")]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        classification = self.request.query_params.get("classification")
+        if classification:
+            qs = qs.filter(classification=classification)
+        status_filter = self.request.query_params.get("status")
+        if status_filter:
+            qs = qs.filter(status=status_filter)
+        return qs
+
+    @action(detail=True, methods=["post"], url_path="open")
+    def open_action(self, request, pk=None):
+        from iams.audit import record_audit_event
+        from iams.icfr import ICFRError, open_deficiency
+        deficiency = self.get_object()
+        try:
+            open_deficiency(
+                deficiency,
+                by_user=request.user,
+                classification=(request.data.get("classification") or ""),
+                narrative=(request.data.get("narrative") or ""),
+                recommendation=(request.data.get("recommendation") or ""),
+                target_resolution_date=request.data.get("targetResolutionDate"),
+                owner=(request.data.get("owner") or ""),
+            )
+        except ICFRError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        record_audit_event(
+            action=AuditLogEntry.ACTION_OTHER,
+            actor=request.user,
+            target=deficiency.test,
+            details={"event": "icfr_deficiency_opened", "classification": deficiency.classification},
+            request=request,
+        )
+        return Response(DeficiencyReportSerializer(deficiency).data)
+
+    @action(detail=True, methods=["post"], url_path="close")
+    def close_action(self, request, pk=None):
+        from iams.audit import record_audit_event
+        from iams.icfr import ICFRError, close_deficiency
+        deficiency = self.get_object()
+        try:
+            close_deficiency(
+                deficiency,
+                by_user=request.user,
+                management_response=(request.data.get("managementResponse") or ""),
+            )
+        except ICFRError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        record_audit_event(
+            action=AuditLogEntry.ACTION_OTHER,
+            actor=request.user,
+            target=deficiency.test,
+            details={"event": "icfr_deficiency_closed"},
+            request=request,
+        )
+        return Response(DeficiencyReportSerializer(deficiency).data)
+
+
+class ICFRSummaryView(APIView):
+    """ICFR summary for FE dashboard + Phase 4 PDF export.
+
+    Query params:
+      - ?period=PERIOD   restrict test/exception/deficiency counts to that period
+    """
+    permission_classes = [HasPermission("view_audits")]
+
+    def get(self, request):
+        from iams.icfr import build_icfr_summary
+        payload = build_icfr_summary(period=request.query_params.get("period"))
+        return Response(payload)

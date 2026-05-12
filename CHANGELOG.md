@@ -2,6 +2,56 @@
 
 All notable changes to the IAMS Django REST API backend.
 
+## [0.12.0] — Phase 3 Track 4: ICFR (2026-05-12)
+
+### Added
+- **Four ICFR models** ([migration 0015](iams/migrations/0015_control_controltest_and_more.py)) — FR-ICFR-01..05:
+  - `Control` — catalog entry per AuditableEntity. Framework (SOX/COSO/COBIT/Custom), type (preventive/detective/corrective), nature (manual/automated/hybrid), frequency, assertion. Unique on (entity, control_id).
+  - `ControlTest` — one per (control, period, test_type). **Dual conclusions** for FR-ICFR-04 segregation: `management_assessment` + `auditor_assessment`. Computed `conclusion` property prefers auditor.
+  - `ControlException` — per-sample observation with severity + M2M to `EvidenceFile`.
+  - `DeficiencyReport` — OneToOne with `ControlTest`. Three classifications (control_deficiency / significant_deficiency / material_weakness) + lifecycle (draft → open → remediating → closed).
+- **`iams/icfr.py` service module**:
+  - `record_test_result(test, by_user, role, conclusion, notes)` — writes the right side's assessment, advances status (mgmt → in_progress, auditor → completed), and auto-creates a draft `DeficiencyReport` when the auditor concludes `deficient`. Idempotent on repeated calls.
+  - `open_deficiency(deficiency, by_user, classification, ...)` — promotes draft → open with the auditor's final classification.
+  - `close_deficiency(deficiency, by_user, management_response)` — final closure with management response capture.
+  - `build_icfr_summary(period=None)` — aggregator: controls-by-framework, tests-by-status, tests-by-conclusion, exceptions-by-severity, deficiencies-by-classification, **openMaterialWeaknesses** rollup, totals.
+- **API** at `/api/icfr/{controls,tests,exceptions,deficiencies}/` + `/api/icfr/summary/`:
+  - All endpoints gated by `view_audits`.
+  - Custom actions: `POST /icfr/tests/{id}/record-result/`, `POST /icfr/deficiencies/{id}/open/`, `POST /icfr/deficiencies/{id}/close/`.
+- **Audit-log** captures `icfr_test_result_recorded`, `icfr_deficiency_opened`, `icfr_deficiency_closed` with structured payloads.
+- **23 new tests** in `iams/tests/test_icfr.py` covering uniqueness constraints, dual-conclusion logic, auto-deficiency on failure, lifecycle transitions, exception+evidence attachment, summary math, period filter, API record-result validation, RBAC.
+
+### Test totals
+- **Backend: 444 passing** (was 421; added 23).
+
+## [0.11.0] — Phase 3 Track 3: Control Self-Assessment (CSA) (2026-05-12)
+
+### Added
+- **Four CSA models** ([migration 0014](iams/migrations/0014_csaanswer_csaquestion_csaquestionnaire_csaresponse.py)) — FR-CSA-01..05:
+  - `CSAQuestionnaire` — title, framework (COSO/COBIT/ISO 27001/Custom), version, status (draft/active/archived), `weak_threshold` (configurable per questionnaire). Unique `(title, version)`.
+  - `CSAQuestion` — four response types (`yes_no`, `scale_1_5`, `text`, `evidence_required`), optional `category` (design / operating effectiveness) for split scoring, `weight` (≥1), `order`.
+  - `CSAResponse` — one per business unit. Status (draft/submitted/under_review/closed), computed `score_overall` + per-category `score_design` / `score_operating`, `is_weak` boolean, lifecycle timestamps.
+  - `CSAAnswer` — one per (response, question) (unique). Carries `value`, optional `evidence_file` FK, and an embedded auditor-challenge thread (`challenge_status`, `challenge_note`, `challenged_by/at`, `resolution_note`, `resolved_by/at`).
+- **`iams/csa.py` service module**:
+  - `compute_scores(response)` — overall + per-category 0-100 score from `weight`-weighted answer fractions.
+  - `submit_response(response, by_user)` — atomic: refuses non-draft / inactive questionnaire / empty response; computes scores; flips status; if `score_overall < weak_threshold` fires side effects.
+  - `open_challenge(answer, by_user, note)` — auditor opens a challenge; moves parent to `under_review`.
+  - `resolve_challenge(answer, by_user, note)` — closes the challenge; rolls parent back to `submitted` when no challenges remain.
+  - `close_response(response, by_user)` — auditor closes; refuses while challenges open.
+- **Weak-control side effects** (FR-CSA-04): dispatches `Notification.KIND_GENERIC` to every Audit Manager via `dispatch_to_role` AND best-effort bumps the linked `AuditableEntity.risk_rating` to `High` (won't downgrade `Critical`). Both side effects are exception-swallowed so a notification failure can't roll back the submit.
+- **API** (gated by `view_audits` for reads, `manage_settings` for questionnaire writes; responses + answers are `IsAuthenticated`):
+  - `/api/csa/questionnaires/`, `/api/csa/questions/`, `/api/csa/responses/`, `/api/csa/answers/`
+  - `POST /api/csa/responses/{id}/submit/` — locks + scores + fires weak-control signals
+  - `POST /api/csa/responses/{id}/close/`
+  - `POST /api/csa/answers/{id}/challenge/`
+  - `POST /api/csa/answers/{id}/resolve/`
+  - `?weak=true` filter on responses surfaces just the flagged ones
+- **Audit-log integration** — every domain action (submit, challenge, resolve, close) records an `AuditLogEntry` with the structured event payload.
+- **23 new tests** in `iams/tests/test_csa.py` covering scoring math (yes/no, scale 1-5, evidence-required), per-category split, weak-control notification + entity risk bump (with Critical preservation), full challenge workflow (open → resolve → close), and RBAC gating.
+
+### Test totals
+- **Backend: 421 passing** (was 398; added 23).
+
 ## [0.10.0] — Phase 3 Track 2: QAIP (2026-05-12)
 
 ### Added

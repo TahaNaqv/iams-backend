@@ -763,3 +763,135 @@ class WorkingPaperWriteSerializer(serializers.ModelSerializer):
             "file", "fileType", "fileSizeKb", "status", "findingIds",
         ]
         read_only_fields = ["id"]
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Phase 3 Track 2 — QAIP
+# ──────────────────────────────────────────────────────────────────────
+from iams.models import AuditKPI, QAIPAssessment, QAIPFinding, StakeholderSurvey  # noqa: E402
+
+
+class QAIPFindingSerializer(serializers.ModelSerializer):
+    """Read+write serializer for QAIP findings.
+
+    `assessmentId` is the FE-facing alias for the FK. `owner` stays as a
+    free-text string for compatibility with the existing FE pattern;
+    `ownerRef` exposes the optional User FK when it's populated by the
+    server.
+    """
+    assessmentId = serializers.PrimaryKeyRelatedField(
+        source="assessment", queryset=QAIPAssessment.objects.all(),
+    )
+    dueDate = serializers.DateField(source="due_date", allow_null=True, required=False)
+    rootCause = serializers.CharField(source="root_cause", allow_blank=True, required=False)
+    ownerRefId = serializers.UUIDField(source="owner_ref_id", read_only=True, allow_null=True)
+
+    class Meta:
+        model = QAIPFinding
+        fields = [
+            "id", "assessmentId", "title", "description", "rating", "status",
+            "rootCause", "recommendation", "owner", "ownerRefId", "dueDate",
+        ]
+
+
+class QAIPAssessmentSerializer(serializers.ModelSerializer):
+    """Top-level QAIP assessment with nested findings on read.
+
+    Counts and aggregates are computed (not stored) — see the
+    serializer methods — so they can't drift from the underlying rows.
+    """
+    leadReviewerId = serializers.PrimaryKeyRelatedField(
+        source="lead_reviewer",
+        queryset=__import__("django.contrib.auth", fromlist=["get_user_model"]).get_user_model().objects.all(),
+        required=False, allow_null=True,
+    )
+    leadReviewerName = serializers.SerializerMethodField()
+    ratingOverall = serializers.CharField(source="rating_overall", allow_blank=True, required=False)
+    startedAt = serializers.DateField(source="started_at", allow_null=True, required=False)
+    completedAt = serializers.DateField(source="completed_at", allow_null=True, required=False)
+
+    # Computed counts
+    findingsCount = serializers.SerializerMethodField()
+    openFindingsCount = serializers.SerializerMethodField()
+    findings = QAIPFindingSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = QAIPAssessment
+        fields = [
+            "id", "title", "type", "period",
+            "leadReviewerId", "leadReviewerName",
+            "status", "ratingOverall",
+            "scope", "methodology", "summary",
+            "startedAt", "completedAt",
+            "findingsCount", "openFindingsCount",
+            "findings",
+        ]
+        read_only_fields = ["leadReviewerName", "findingsCount", "openFindingsCount", "findings"]
+
+    def get_leadReviewerName(self, obj):
+        u = obj.lead_reviewer
+        if not u:
+            return None
+        return (u.get_full_name() or u.email or u.username).strip()
+
+    def get_findingsCount(self, obj) -> int:
+        # Use the prefetched cache when present to avoid an N+1 in list responses.
+        if hasattr(obj, "_prefetched_objects_cache") and "findings" in obj._prefetched_objects_cache:
+            return len(obj._prefetched_objects_cache["findings"])
+        return obj.findings.count()
+
+    def get_openFindingsCount(self, obj) -> int:
+        if hasattr(obj, "_prefetched_objects_cache") and "findings" in obj._prefetched_objects_cache:
+            return sum(1 for f in obj._prefetched_objects_cache["findings"] if f.status != "closed")
+        return obj.findings.exclude(status="closed").count()
+
+
+class StakeholderSurveySerializer(serializers.ModelSerializer):
+    """Survey row serializer.
+
+    When ``anonymous=True``, ``respondentId`` is forcibly NULL on
+    output even if the model column happens to hold a value (defensive
+    re-blanking — the model's ``save()`` already clears it but a
+    legacy import could have bypassed save).
+    """
+    auditId = serializers.PrimaryKeyRelatedField(
+        source="audit", queryset=Audit.objects.all(),
+        required=False, allow_null=True,
+    )
+    respondentId = serializers.SerializerMethodField()
+    respondentRole = serializers.CharField(source="respondent_role")
+    satisfactionScore = serializers.IntegerField(source="satisfaction_score", min_value=1, max_value=5)
+    submittedAt = serializers.DateTimeField(source="submitted_at")
+
+    class Meta:
+        model = StakeholderSurvey
+        fields = [
+            "id", "auditId", "respondentRole", "respondentId",
+            "satisfactionScore", "feedback", "anonymous", "submittedAt",
+        ]
+
+    def get_respondentId(self, obj):
+        if obj.anonymous or obj.respondent_id is None:
+            return None
+        return str(obj.respondent_id)
+
+
+class AuditKPISerializer(serializers.ModelSerializer):
+    """KPI row with computed variance on the wire."""
+    kpiType = serializers.CharField(source="kpi_type")
+    variance = serializers.SerializerMethodField()
+    favorable = serializers.SerializerMethodField()
+
+    class Meta:
+        model = AuditKPI
+        fields = [
+            "id", "kpiType", "period", "target", "actual", "unit",
+            "direction", "notes", "variance", "favorable",
+        ]
+        read_only_fields = ["variance", "favorable"]
+
+    def get_variance(self, obj):
+        return obj.variance
+
+    def get_favorable(self, obj) -> bool:
+        return obj.variance_is_favorable

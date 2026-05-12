@@ -2,6 +2,24 @@
 
 All notable changes to the IAMS Django REST API backend.
 
+## [0.10.0] — Phase 3 Track 2: QAIP (2026-05-12)
+
+### Added
+- **Four QAIP models** ([migration 0013](iams/migrations/0013_auditkpi_qaipassessment_qaipfinding_and_more.py)) — FR-QAIP-01..06:
+  - `QAIPAssessment` — internal / external / peer / post-engagement review of the IA function. Status + overall rating + lead reviewer FK + scope/methodology/summary.
+  - `QAIPFinding` — *distinct* from regular `Finding`; raised against the audit function itself. Severity (critical/high/medium/low), owner (text + optional FK), recommendation, due date.
+  - `StakeholderSurvey` — satisfaction (1-5) with **DB-level check constraint**, optional audit FK, role taxonomy, **anonymous** flag (scrubs the respondent FK on save AND defensively on serialise).
+  - `AuditKPI` — kpi_type × period (unique constraint), target vs actual, direction (higher_is_better / lower_is_better), computed `variance` + `favorable` on read.
+- **Serializers** with camelCase + computed counts (`findingsCount`, `openFindingsCount` from prefetch cache to avoid N+1) + computed `variance` / `favorable`.
+- **Four QAIP ViewSets** at `/api/qaip/{assessments,findings,surveys,kpis}/` — gated by `view_reports` (read+write, matching `AuditReportViewSet` precedent). All run through `AuditedViewSetMixin` so every state change writes an `AuditLogEntry`.
+- **`/api/qaip/dashboard/`** aggregate endpoint — assessments-by-type/status, open + critical QAIP findings, avg satisfaction across surveys, latest-period KPI rollup. Supports `?period=` filter.
+- **18 QAIP tests** in `iams/tests/test_qaip.py` — CRUD, filters, computed counts, anonymity scrubbing on save + on serialise, DB check constraint on score range, KPI variance + favorable in both directions, uniqueness constraint, dashboard math, RBAC gating.
+
+### Notes
+- QAIP findings deliberately do **not** share a model with audit `Finding`. The two have different owners (IA team vs auditees), different lifecycles, and different reporting flows.
+- Annual QAIP Report PDF generation (FR-QAIP-04 export to PDF) is deferred to Phase 4 Track 2 where WeasyPrint integration lands.
+- **Backend tests: 398 passing** (was 380; added 18).
+
 ## [0.9.0] — Phase 3 Track 1: Working Papers + sign-off + versioning (2026-05-12)
 
 ### Added

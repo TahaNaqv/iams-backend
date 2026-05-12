@@ -1061,3 +1061,273 @@ class ManagedDocument(TimeStampedModel):
 
     class Meta:
         ordering = ["-modified_date", "-created_at"]
+
+
+# ═════════════════════════════════════════════════════════════════════
+# Phase 3 Track 2 — Quality Assurance & Improvement Program (QAIP)
+#
+# QAIP is the audit function auditing itself: it tracks internal /
+# external / peer reviews of the internal audit team's own work,
+# captures stakeholder satisfaction surveys, and measures the audit
+# function's KPIs (timeliness, quality, coverage) against targets.
+#
+# IIA Standards 1300-series. The findings here are about the *audit
+# function* — distinct from the regular ``Finding`` model which is
+# about the *audited entities*.
+# ═════════════════════════════════════════════════════════════════════
+
+
+class QAIPAssessment(TimeStampedModel):
+    """A quality assessment of the internal audit function (IIA 1310).
+
+    Three flavors:
+      - internal       — done quarterly/annually by the IA team itself
+      - external       — required every 5 years by IIA Standard 1312
+      - peer           — informal review by another IA department
+      - post_engagement — per-engagement evaluation by stakeholders
+    """
+
+    TYPE_INTERNAL = "internal"
+    TYPE_EXTERNAL = "external"
+    TYPE_PEER = "peer"
+    TYPE_POST_ENGAGEMENT = "post_engagement"
+    TYPE_CHOICES = [
+        (TYPE_INTERNAL, "Internal"),
+        (TYPE_EXTERNAL, "External"),
+        (TYPE_PEER, "Peer"),
+        (TYPE_POST_ENGAGEMENT, "Post-engagement"),
+    ]
+
+    STATUS_PLANNED = "planned"
+    STATUS_IN_PROGRESS = "in_progress"
+    STATUS_COMPLETED = "completed"
+    STATUS_CHOICES = [
+        (STATUS_PLANNED, "Planned"),
+        (STATUS_IN_PROGRESS, "In Progress"),
+        (STATUS_COMPLETED, "Completed"),
+    ]
+
+    RATING_SATISFACTORY = "satisfactory"
+    RATING_NEEDS_IMPROVEMENT = "needs_improvement"
+    RATING_UNSATISFACTORY = "unsatisfactory"
+    RATING_CHOICES = [
+        (RATING_SATISFACTORY, "Satisfactory"),
+        (RATING_NEEDS_IMPROVEMENT, "Needs Improvement"),
+        (RATING_UNSATISFACTORY, "Unsatisfactory"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    title = models.CharField(max_length=255)
+    type = models.CharField(max_length=20, choices=TYPE_CHOICES, db_index=True)
+    period = models.CharField(
+        max_length=32, db_index=True,
+        help_text="Free-form period label (e.g. '2026', '2026-Q1', 'External-2026').",
+    )
+    lead_reviewer = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name="qaip_assessments_led",
+    )
+    status = models.CharField(
+        max_length=20, choices=STATUS_CHOICES, default=STATUS_PLANNED, db_index=True
+    )
+    rating_overall = models.CharField(
+        max_length=20, choices=RATING_CHOICES, blank=True,
+        help_text="Set when status moves to Completed.",
+    )
+    scope = models.TextField(blank=True)
+    methodology = models.TextField(blank=True)
+    summary = models.TextField(blank=True)
+    started_at = models.DateField(null=True, blank=True)
+    completed_at = models.DateField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-period", "type"]
+        indexes = [
+            models.Index(fields=["type", "period"]),
+            models.Index(fields=["status", "-period"]),
+        ]
+
+
+class QAIPFinding(TimeStampedModel):
+    """A finding raised against the internal audit function itself.
+
+    Distinct from ``Finding`` (which is raised against audited entities).
+    Owners here are typically inside the IA team (Audit Manager, CAE).
+    """
+
+    RATING_CRITICAL = "critical"
+    RATING_HIGH = "high"
+    RATING_MEDIUM = "medium"
+    RATING_LOW = "low"
+    RATING_CHOICES = [
+        (RATING_CRITICAL, "Critical"),
+        (RATING_HIGH, "High"),
+        (RATING_MEDIUM, "Medium"),
+        (RATING_LOW, "Low"),
+    ]
+
+    STATUS_OPEN = "open"
+    STATUS_IN_PROGRESS = "in_progress"
+    STATUS_CLOSED = "closed"
+    STATUS_CHOICES = [
+        (STATUS_OPEN, "Open"),
+        (STATUS_IN_PROGRESS, "In Progress"),
+        (STATUS_CLOSED, "Closed"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    assessment = models.ForeignKey(
+        QAIPAssessment, on_delete=models.CASCADE, related_name="findings",
+    )
+    title = models.CharField(max_length=255)
+    description = models.TextField(blank=True)
+    rating = models.CharField(max_length=20, choices=RATING_CHOICES, db_index=True)
+    status = models.CharField(
+        max_length=20, choices=STATUS_CHOICES, default=STATUS_OPEN, db_index=True
+    )
+    root_cause = models.TextField(blank=True)
+    recommendation = models.TextField(blank=True)
+    owner = models.CharField(max_length=200, blank=True)
+    owner_ref = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name="qaip_findings_owned",
+    )
+    due_date = models.DateField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["assessment_id", "rating", "due_date"]
+
+
+class StakeholderSurvey(TimeStampedModel):
+    """A satisfaction survey response from an audit stakeholder.
+
+    Captured per-engagement (``audit`` FK) when post-audit, or
+    standalone for annual stakeholder pulse surveys. ``respondent``
+    may be left blank when ``anonymous=True``.
+    """
+
+    ROLE_AUDITEE = "auditee"
+    ROLE_DEPT_HEAD = "department_head"
+    ROLE_EXECUTIVE = "executive"
+    ROLE_BOARD = "board_member"
+    ROLE_AUDIT_COMMITTEE = "audit_committee"
+    ROLE_EXTERNAL_AUDITOR = "external_auditor"
+    ROLE_OTHER = "other"
+    ROLE_CHOICES = [
+        (ROLE_AUDITEE, "Auditee"),
+        (ROLE_DEPT_HEAD, "Department Head"),
+        (ROLE_EXECUTIVE, "Executive"),
+        (ROLE_BOARD, "Board Member"),
+        (ROLE_AUDIT_COMMITTEE, "Audit Committee"),
+        (ROLE_EXTERNAL_AUDITOR, "External Auditor"),
+        (ROLE_OTHER, "Other"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    audit = models.ForeignKey(
+        Audit, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="stakeholder_surveys",
+    )
+    respondent_role = models.CharField(
+        max_length=32, choices=ROLE_CHOICES, default=ROLE_AUDITEE,
+    )
+    respondent = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name="qaip_survey_responses",
+        help_text="Cleared automatically when anonymous=True.",
+    )
+    satisfaction_score = models.PositiveSmallIntegerField(
+        help_text="1 (very dissatisfied) to 5 (very satisfied).",
+    )
+    feedback = models.TextField(blank=True)
+    anonymous = models.BooleanField(default=False, db_index=True)
+    submitted_at = models.DateTimeField()
+
+    class Meta:
+        ordering = ["-submitted_at"]
+        indexes = [
+            models.Index(fields=["audit", "-submitted_at"]),
+            models.Index(fields=["respondent_role", "-submitted_at"]),
+        ]
+        constraints = [
+            # Score is constrained at the DB level so a bad client can't
+            # poison the average. ``Q`` works on Postgres + SQLite (3.37+).
+            models.CheckConstraint(
+                condition=models.Q(satisfaction_score__gte=1)
+                & models.Q(satisfaction_score__lte=5),
+                name="iams_qaip_survey_score_range",
+            ),
+        ]
+
+    def save(self, *args, **kwargs):
+        # Anonymous responses can't carry a respondent FK — clear it.
+        if self.anonymous:
+            self.respondent = None
+        super().save(*args, **kwargs)
+
+
+class AuditKPI(TimeStampedModel):
+    """A measured KPI for the internal audit function.
+
+    Variance is computed (``actual - target``) on read. We don't
+    persist it so the value can't go stale relative to its inputs.
+    """
+
+    KIND_TIMELINESS = "timeliness"
+    KIND_QUALITY = "quality"
+    KIND_COVERAGE = "coverage"
+    KIND_BUDGET = "budget_adherence"
+    KIND_RESPONSE_RATE = "response_rate"
+    KIND_REPORT_CYCLE = "report_cycle_days"
+    KIND_CHOICES = [
+        (KIND_TIMELINESS, "Timeliness"),
+        (KIND_QUALITY, "Quality"),
+        (KIND_COVERAGE, "Coverage"),
+        (KIND_BUDGET, "Budget Adherence"),
+        (KIND_RESPONSE_RATE, "Response Rate"),
+        (KIND_REPORT_CYCLE, "Report Cycle (days)"),
+    ]
+
+    HIGHER_IS_BETTER = "higher_is_better"
+    LOWER_IS_BETTER = "lower_is_better"
+    DIRECTION_CHOICES = [
+        (HIGHER_IS_BETTER, "Higher is better"),
+        (LOWER_IS_BETTER, "Lower is better"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    kpi_type = models.CharField(max_length=32, choices=KIND_CHOICES, db_index=True)
+    period = models.CharField(
+        max_length=32, db_index=True,
+        help_text="Free-form period label (e.g. '2026-Q1', 'FY2026').",
+    )
+    target = models.DecimalField(max_digits=10, decimal_places=2)
+    actual = models.DecimalField(max_digits=10, decimal_places=2)
+    unit = models.CharField(max_length=20, blank=True, help_text="%, days, count, …")
+    direction = models.CharField(
+        max_length=20, choices=DIRECTION_CHOICES, default=HIGHER_IS_BETTER,
+        help_text="Determines whether positive variance is good or bad.",
+    )
+    notes = models.TextField(blank=True)
+
+    class Meta:
+        ordering = ["-period", "kpi_type"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["kpi_type", "period"],
+                name="iams_qaip_kpi_kind_period_unique",
+            ),
+        ]
+
+    @property
+    def variance(self):
+        return self.actual - self.target
+
+    @property
+    def variance_is_favorable(self) -> bool:
+        diff = self.variance
+        if diff == 0:
+            return True
+        if self.direction == self.HIGHER_IS_BETTER:
+            return diff > 0
+        return diff < 0

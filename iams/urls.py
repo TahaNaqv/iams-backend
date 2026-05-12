@@ -39,6 +39,11 @@ from iams.views import (
     AuditReportSectionViewSet,
     ManagedDocumentViewSet,
     WorkingPaperViewSet,
+    QAIPAssessmentViewSet,
+    QAIPFindingViewSet,
+    StakeholderSurveyViewSet,
+    AuditKPIViewSet,
+    QAIPDashboardView,
     TimeEntryViewSet,
     TimelineByAuditView,
     UserViewSet,
@@ -79,6 +84,11 @@ router.register("audit-reports", AuditReportViewSet, basename="audit-report")
 router.register("audit-report-sections", AuditReportSectionViewSet, basename="audit-report-section")
 router.register("managed-documents", ManagedDocumentViewSet, basename="managed-document")
 router.register("working-papers", WorkingPaperViewSet, basename="working-paper")
+# Phase 3 Track 2 — QAIP
+router.register("qaip/assessments", QAIPAssessmentViewSet, basename="qaip-assessment")
+router.register("qaip/findings", QAIPFindingViewSet, basename="qaip-finding")
+router.register("qaip/surveys", StakeholderSurveyViewSet, basename="qaip-survey")
+router.register("qaip/kpis", AuditKPIViewSet, basename="qaip-kpi")
 
 urlpatterns = [
     path("", include(router.urls)),
@@ -87,6 +97,7 @@ urlpatterns = [
     path("audits/<uuid:audit_id>/evidence/", EvidenceByAuditView.as_view(), name="audit-evidence"),
     path("audits/<uuid:audit_id>/timeline/", TimelineByAuditView.as_view(), name="audit-timeline"),
     path("dashboard/kpis/", DashboardKPIView.as_view(), name="dashboard-kpis"),
+    path("qaip/dashboard/", QAIPDashboardView.as_view(), name="qaip-dashboard"),
     path(
         "risk-assessment-import/issues/",
         RiskAssessmentImportIssuesViewSet.as_view({"get": "list"}),

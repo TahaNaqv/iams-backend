@@ -933,3 +933,162 @@ class WorkingPaperViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
         if not url.startswith(("http://", "https://")):
             url = request.build_absolute_uri(url)
         return Response({"url": url})
+
+
+# ═════════════════════════════════════════════════════════════════════
+# Phase 3 Track 2 — QAIP viewsets + dashboard
+# ═════════════════════════════════════════════════════════════════════
+from iams.models import AuditKPI, QAIPAssessment, QAIPFinding, StakeholderSurvey  # noqa: E402
+from iams.domain_serializers import (  # noqa: E402
+    AuditKPISerializer,
+    QAIPAssessmentSerializer,
+    QAIPFindingSerializer,
+    StakeholderSurveySerializer,
+)
+
+
+class QAIPAssessmentViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
+    queryset = (
+        QAIPAssessment.objects
+        .select_related("lead_reviewer")
+        .prefetch_related("findings")
+        .all()
+    )
+    serializer_class = QAIPAssessmentSerializer
+    permission_classes = [HasPermission("view_reports")]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        type_filter = self.request.query_params.get("type")
+        if type_filter:
+            qs = qs.filter(type=type_filter)
+        period = self.request.query_params.get("period")
+        if period:
+            qs = qs.filter(period=period)
+        status_filter = self.request.query_params.get("status")
+        if status_filter:
+            qs = qs.filter(status=status_filter)
+        return qs
+
+
+class QAIPFindingViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
+    queryset = QAIPFinding.objects.select_related("assessment", "owner_ref").all()
+    serializer_class = QAIPFindingSerializer
+    permission_classes = [HasPermission("view_reports")]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        assessment_id = self.request.query_params.get("assessment_id")
+        if assessment_id:
+            qs = qs.filter(assessment_id=assessment_id)
+        status_filter = self.request.query_params.get("status")
+        if status_filter:
+            qs = qs.filter(status=status_filter)
+        return qs
+
+
+class StakeholderSurveyViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
+    queryset = StakeholderSurvey.objects.select_related("audit", "respondent").all()
+    serializer_class = StakeholderSurveySerializer
+    permission_classes = [HasPermission("view_reports")]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        audit_id = self.request.query_params.get("audit_id")
+        if audit_id:
+            qs = qs.filter(audit_id=audit_id)
+        role = self.request.query_params.get("respondent_role")
+        if role:
+            qs = qs.filter(respondent_role=role)
+        return qs
+
+
+class AuditKPIViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
+    queryset = AuditKPI.objects.all()
+    serializer_class = AuditKPISerializer
+    permission_classes = [HasPermission("view_reports")]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        kpi_type = self.request.query_params.get("kpi_type")
+        if kpi_type:
+            qs = qs.filter(kpi_type=kpi_type)
+        period = self.request.query_params.get("period")
+        if period:
+            qs = qs.filter(period=period)
+        return qs
+
+
+class QAIPDashboardView(APIView):
+    """Aggregated QAIP overview for the dashboard / annual report.
+
+    Returns a single payload with:
+      - assessmentsByType: counts of assessments grouped by type
+      - assessmentsByStatus: counts grouped by status
+      - openQaipFindings / criticalQaipFindings: rollup counts
+      - avgSatisfaction: across all surveys (optional period filter)
+      - kpis: list of {kpiType, target, actual, variance, favorable}
+              for the requested period (defaults to most recent period
+              present in the table)
+
+    Query params:
+      - ?period=PERIOD   restrict aggregations to that period label
+    """
+
+    permission_classes = [HasPermission("view_reports")]
+
+    def get(self, request):
+        from django.db.models import Avg
+        period = request.query_params.get("period")
+
+        # Assessments rollups
+        assessment_qs = QAIPAssessment.objects.all()
+        if period:
+            assessment_qs = assessment_qs.filter(period=period)
+
+        by_type = list(
+            assessment_qs.values("type").annotate(count=Count("id")).order_by("type")
+        )
+        by_status = list(
+            assessment_qs.values("status").annotate(count=Count("id")).order_by("status")
+        )
+
+        # Findings rollups (open + critical)
+        finding_qs = QAIPFinding.objects.all()
+        if period:
+            finding_qs = finding_qs.filter(assessment__period=period)
+        open_findings = finding_qs.exclude(status="closed").count()
+        critical_findings = finding_qs.filter(rating="critical").count()
+
+        # Avg satisfaction
+        survey_qs = StakeholderSurvey.objects.all()
+        if period:
+            # ``StakeholderSurvey`` doesn't have its own period field; we
+            # interpret period filter as a year and match against
+            # ``submitted_at__year`` when it's a 4-digit string.
+            if period.isdigit() and len(period) == 4:
+                survey_qs = survey_qs.filter(submitted_at__year=int(period))
+        avg_score = survey_qs.aggregate(avg=Avg("satisfaction_score"))["avg"]
+
+        # KPIs
+        kpi_qs = AuditKPI.objects.all()
+        if period:
+            kpi_qs = kpi_qs.filter(period=period)
+        else:
+            latest_period = (
+                AuditKPI.objects.order_by("-period").values_list("period", flat=True).first()
+            )
+            if latest_period:
+                kpi_qs = kpi_qs.filter(period=latest_period)
+        kpi_payload = AuditKPISerializer(kpi_qs.order_by("kpi_type"), many=True).data
+
+        return Response({
+            "period": period,
+            "assessmentsByType": by_type,
+            "assessmentsByStatus": by_status,
+            "openQaipFindings": open_findings,
+            "criticalQaipFindings": critical_findings,
+            "avgSatisfaction": float(avg_score) if avg_score is not None else None,
+            "surveyResponseCount": survey_qs.count(),
+            "kpis": kpi_payload,
+        })

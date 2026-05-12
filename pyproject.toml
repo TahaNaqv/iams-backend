@@ -143,6 +143,7 @@ ignore = [
     "E501",   # line too long (black handles)
     "S101",   # assert (allowed in tests)
     "DJ001",  # null=True on string fields (legacy compatibility)
+    "DJ012",  # field/manager/Meta ordering (cosmetic; not enforced consistently)
 ]
 
 [tool.ruff.lint.per-file-ignores]
@@ -194,7 +195,7 @@ django_settings_module = "config.settings.dev"
 # ───────────────────────────────────────────────────────────────────────
 [tool.pytest.ini_options]
 DJANGO_SETTINGS_MODULE = "config.settings.test"
-python_files = ["test_*.py", "tests.py"]
+python_files = ["test_*.py"]
 addopts = [
     "--strict-markers",
     "--strict-config",

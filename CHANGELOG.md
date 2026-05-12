@@ -2,6 +2,34 @@
 
 All notable changes to the IAMS Django REST API backend.
 
+## [0.3.0] — Phase 1 Milestone: Auth Hardening + RBAC Matrix (2026-05-12)
+
+### Added — Auth endpoints
+- `POST /api/auth/password/reset/` — anonymous password-reset request. Always returns 202 to prevent email enumeration. Sends email via Celery (`iams.send_password_reset_email`) using `default_token_generator`.
+- `POST /api/auth/password/reset/confirm/` — completes reset with `{uid, token, new_password}`. Validates token, enforces password complexity (≥12 chars by default), invalidates token on success (single-use).
+- `POST /api/auth/password/change/` — authenticated password change requiring current password.
+- `PATCH /api/auth/me/` — users can edit own `first_name`, `last_name`, `email` (role/status remain admin-only).
+- Email templates at `iams/templates/iams/email/password_reset.{txt,html}` (plain-text + responsive HTML).
+- Celery task `iams.send_password_reset_email` with autoretry (3×, exponential backoff up to 10min, jitter).
+
+### Added — Test infrastructure
+- `iams/tests/test_auth.py` — 19 tests covering every auth endpoint, including a full round-trip (request → email → confirm → new login).
+- `iams/tests/test_rbac_matrix.py` — **232 tests** asserting every endpoint × every role returns the expected 200/403, plus anonymous-rejection on every endpoint. This is the central RBAC guarantee.
+
+### Fixed
+- `ChecklistItemViewSet` required `edit_audits` even for GET — drift from the API contract caught by the new RBAC matrix test. Now uses `get_permissions()` to require `view_audits` for read and `edit_audits` for write (mirrors `AuditViewSet`).
+- `RiskAssessmentMatrixViewSet`, `RiskAssessmentSummaryViewSet`, `RiskAssessmentImportIssuesViewSet` — added `order_by` to silence `UnorderedObjectListWarning` and stabilize pagination.
+- `drf-spectacular` post-processing hook moved to the correct `drf_spectacular.contrib.djangorestframework_camel_case.camelize_serializer_fields` path.
+
+### Changed
+- Removed `djangorestframework-camel-case` parser/renderer from REST_FRAMEWORK defaults. The existing 30+ serializers already declare camelCase field names explicitly via `source="snake_case"` — adding the auto-translator caused double translation. Documented in `config/settings/base.py`.
+- `config/settings/test.py` now also zeros out `DEFAULT_THROTTLE_RATES` so views with explicit `throttle_classes = [ScopedRateThrottle]` don't fire 429s in tests.
+- Throttling on all auth-modifying endpoints is `auth_burst` (10/min) for brute-force resistance.
+
+### Notes
+- Frontend pages now reach `/api/auth/password/reset/` and `/api/auth/password/reset/confirm/` directly (no JWT required).
+- All 259 backend tests passing. Coverage at 85%.
+
 ## [0.2.0] — Phase 0: Foundation Hardening (2026-05-12)
 
 ### Added

@@ -10,7 +10,7 @@ import sentry_sdk
 from sentry_sdk.integrations.celery import CeleryIntegration
 from sentry_sdk.integrations.django import DjangoIntegration
 
-from .base import *  # noqa: F401, F403
+from .base import *  # noqa: F403
 from .base import REST_FRAMEWORK, env
 
 # ──────────────────────────────────────────────────────────────────────
@@ -69,7 +69,7 @@ STORAGES = {
 
 # Strip the browsable API in production
 REST_FRAMEWORK["DEFAULT_RENDERER_CLASSES"] = [
-    "djangorestframework_camel_case.render.CamelCaseJSONRenderer",
+    "rest_framework.renderers.JSONRenderer",
 ]
 
 # ──────────────────────────────────────────────────────────────────────

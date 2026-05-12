@@ -1,4 +1,10 @@
-from .auth import MeView, ThrottledTokenObtainPairView
+from .auth import (
+    MeView,
+    PasswordChangeView,
+    PasswordResetConfirmView,
+    PasswordResetRequestView,
+    ThrottledTokenObtainPairView,
+)
 from .health import HealthView, ReadinessView
 from .users import UserViewSet
 from .roles import RoleViewSet, RolePermissionsView
@@ -41,6 +47,9 @@ from .domain import (
 
 __all__ = [
     "MeView",
+    "PasswordChangeView",
+    "PasswordResetConfirmView",
+    "PasswordResetRequestView",
     "ThrottledTokenObtainPairView",
     "HealthView",
     "ReadinessView",

@@ -5,7 +5,7 @@ DEBUG=True, browsable API enabled, console email backend by default
 """
 from __future__ import annotations
 
-from .base import *  # noqa: F401, F403
+from .base import *  # noqa: F403
 from .base import INSTALLED_APPS, MIDDLEWARE, REST_FRAMEWORK, env
 
 DEBUG = True
@@ -13,7 +13,7 @@ ALLOWED_HOSTS = ["*"]  # dev only — never in prod
 
 # Enable browsable API renderer in dev for quick exploration
 REST_FRAMEWORK["DEFAULT_RENDERER_CLASSES"] = [
-    "djangorestframework_camel_case.render.CamelCaseJSONRenderer",
+    "rest_framework.renderers.JSONRenderer",
     "rest_framework.renderers.BrowsableAPIRenderer",
 ]
 
@@ -26,7 +26,7 @@ if env.bool("ENABLE_DEBUG_TOOLBAR", default=False):
 # Local media storage in dev (MinIO is opt-in via env)
 USE_S3_STORAGE = env.bool("USE_S3_STORAGE", default=False)
 if USE_S3_STORAGE:
-    from .base import STORAGES  # noqa: F401
+    from .base import STORAGES
 
     STORAGES["default"] = {
         "BACKEND": "storages.backends.s3.S3Storage",

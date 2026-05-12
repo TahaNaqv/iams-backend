@@ -225,15 +225,19 @@ REST_FRAMEWORK = {
         "rest_framework.filters.SearchFilter",
         "rest_framework.filters.OrderingFilter",
     ],
-    # CamelCase renderers/parsers — Python stays snake_case internally,
-    # FE sees camelCase. Browsable API renderer kept in dev only (added there).
+    # JSON contract: the existing serializers declare camelCase fields
+    # explicitly via ``source="snake_case"``. We therefore use the standard
+    # JSON renderer/parser (not the camel-case auto-translator) to avoid
+    # double translation. New serializers must follow the same convention.
+    # The OpenAPI post-processing hook still camelizes any stray snake_case
+    # fields in the schema (idempotent on already-camelCase fields).
     "DEFAULT_RENDERER_CLASSES": [
-        "djangorestframework_camel_case.render.CamelCaseJSONRenderer",
+        "rest_framework.renderers.JSONRenderer",
     ],
     "DEFAULT_PARSER_CLASSES": [
-        "djangorestframework_camel_case.parser.CamelCaseJSONParser",
-        "djangorestframework_camel_case.parser.CamelCaseMultiPartParser",
-        "djangorestframework_camel_case.parser.CamelCaseFormParser",
+        "rest_framework.parsers.JSONParser",
+        "rest_framework.parsers.MultiPartParser",
+        "rest_framework.parsers.FormParser",
     ],
     "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
     "EXCEPTION_HANDLER": "iams.exceptions.iams_exception_handler",
@@ -266,7 +270,7 @@ SPECTACULAR_SETTINGS = {
     "COMPONENT_SPLIT_REQUEST": True,
     "POSTPROCESSING_HOOKS": [
         "drf_spectacular.hooks.postprocess_schema_enums",
-        "djangorestframework_camel_case.util.camelize_serializer_fields",
+        "drf_spectacular.contrib.djangorestframework_camel_case.camelize_serializer_fields",
     ],
     "SWAGGER_UI_DIST": "SIDECAR",
     "SWAGGER_UI_FAVICON_HREF": "SIDECAR",

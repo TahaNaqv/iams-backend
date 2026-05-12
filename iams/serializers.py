@@ -1,4 +1,7 @@
-from django.contrib.auth import get_user_model
+from django.contrib.auth import get_user_model, password_validation
+from django.contrib.auth.tokens import default_token_generator
+from django.utils.encoding import force_str
+from django.utils.http import urlsafe_base64_decode
 from rest_framework import serializers
 
 from iams.models import Permission, Role, UserProfile
@@ -203,3 +206,106 @@ class MeSerializer(serializers.ModelSerializer):
                 else role.permissions.values_list("key", flat=True)
             ),
         }
+
+
+# ───────────────────────────────────────────────────────────────────────
+# Auth — profile self-edit, password change, password reset
+# ───────────────────────────────────────────────────────────────────────
+
+
+class MeUpdateSerializer(serializers.ModelSerializer):
+    """PATCH /auth/me/ payload — users editing their own profile.
+
+    Users can update their name and email, but **never** their role or status
+    (those require manage_users). Email change does not currently re-verify;
+    re-verification is a Phase 5 enhancement (alongside MFA setup).
+    """
+
+    class Meta:
+        model = User
+        fields = ["first_name", "last_name", "email"]
+
+    def validate_email(self, value: str) -> str:
+        if not value:
+            raise serializers.ValidationError("Email is required.")
+        # Prevent collision with another user's email
+        qs = User.objects.filter(email__iexact=value)
+        if self.instance is not None:
+            qs = qs.exclude(pk=self.instance.pk)
+        if qs.exists():
+            raise serializers.ValidationError("A user with this email already exists.")
+        return value
+
+
+class PasswordChangeSerializer(serializers.Serializer):
+    """POST /auth/password/change/ — authenticated user changing own password."""
+
+    current_password = serializers.CharField(write_only=True, trim_whitespace=False)
+    new_password = serializers.CharField(write_only=True, trim_whitespace=False)
+
+    def validate_current_password(self, value: str) -> str:
+        user = self.context["request"].user
+        if not user.check_password(value):
+            raise serializers.ValidationError("Current password is incorrect.")
+        return value
+
+    def validate_new_password(self, value: str) -> str:
+        user = self.context["request"].user
+        password_validation.validate_password(value, user=user)
+        return value
+
+    def save(self) -> User:
+        user = self.context["request"].user
+        user.set_password(self.validated_data["new_password"])
+        user.save(update_fields=["password"])
+        return user
+
+
+class PasswordResetRequestSerializer(serializers.Serializer):
+    """POST /auth/password/reset/ — anonymous request initiating reset.
+
+    Always returns successfully (whether or not the email exists) to prevent
+    enumeration. The view-layer dispatches the Celery task only if a matching
+    active user exists.
+    """
+
+    email = serializers.EmailField()
+
+    def find_user(self) -> User | None:
+        try:
+            return User.objects.get(email__iexact=self.validated_data["email"], is_active=True)
+        except User.DoesNotExist:
+            return None
+
+
+class PasswordResetConfirmSerializer(serializers.Serializer):
+    """POST /auth/password/reset/confirm/ — completes the reset with token."""
+
+    uid = serializers.CharField()
+    token = serializers.CharField()
+    new_password = serializers.CharField(write_only=True, trim_whitespace=False)
+
+    def validate(self, attrs: dict) -> dict:
+        # Decode UID
+        try:
+            user_pk = force_str(urlsafe_base64_decode(attrs["uid"]))
+            user = User.objects.get(pk=user_pk, is_active=True)
+        except (TypeError, ValueError, OverflowError, User.DoesNotExist) as exc:
+            raise serializers.ValidationError({"uid": "Invalid reset link."}) from exc
+
+        if not default_token_generator.check_token(user, attrs["token"]):
+            raise serializers.ValidationError(
+                {"token": "Reset link is invalid or has expired."}
+            )
+
+        # Validate password complexity
+        password_validation.validate_password(attrs["new_password"], user=user)
+
+        attrs["user"] = user
+        return attrs
+
+    def save(self) -> User:
+        user: User = self.validated_data["user"]
+        user.set_password(self.validated_data["new_password"])
+        user.save(update_fields=["password"])
+        return user

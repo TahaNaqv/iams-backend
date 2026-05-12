@@ -6,11 +6,11 @@ email, no cache.
 """
 from __future__ import annotations
 
-from .base import *  # noqa: F401, F403
+from .base import *  # noqa: F403
 from .base import REST_FRAMEWORK
 
 DEBUG = False
-SECRET_KEY = "test-secret-key-not-for-production"
+SECRET_KEY = "test-secret-key-not-for-production"  # noqa: S105 — test-only
 ALLOWED_HOSTS = ["*"]
 
 DATABASES = {
@@ -40,11 +40,17 @@ EMAIL_BACKEND = "django.core.mail.backends.locmem.EmailBackend"
 
 # Disable browsable API in tests
 REST_FRAMEWORK["DEFAULT_RENDERER_CLASSES"] = [
-    "djangorestframework_camel_case.render.CamelCaseJSONRenderer",
+    "rest_framework.renderers.JSONRenderer",
 ]
 
-# No throttling in tests
+# No throttling in tests — clear defaults AND raise scoped rates effectively to infinity
+# so views with explicit ``throttle_classes = [ScopedRateThrottle]`` don't fire 429s.
 REST_FRAMEWORK["DEFAULT_THROTTLE_CLASSES"] = []
+REST_FRAMEWORK["DEFAULT_THROTTLE_RATES"] = {
+    "anon": None,
+    "user": None,
+    "auth_burst": None,
+}
 
 # Suppress noisy logs during tests
 import logging  # noqa: E402

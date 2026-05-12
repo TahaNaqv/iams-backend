@@ -176,7 +176,12 @@ class ChecklistByAuditView(APIView):
 class ChecklistItemViewSet(viewsets.ModelViewSet):
     queryset = ChecklistItem.objects.all()
     serializer_class = ChecklistItemSerializer
-    permission_classes = [HasPermission("edit_audits")]
+
+    def get_permissions(self):
+        # Reads: anyone with view_audits. Writes: edit_audits.
+        if self.action in ("list", "retrieve"):
+            return [HasPermission("view_audits")]
+        return [HasPermission("edit_audits")]
 
     def get_serializer_class(self):
         if self.action in ("create", "update", "partial_update"):
@@ -402,19 +407,23 @@ class RiskAssessmentSheetsViewSet(viewsets.ReadOnlyModelViewSet):
 
 
 class RiskAssessmentMatrixViewSet(viewsets.ReadOnlyModelViewSet):
-    queryset = RiskAssessmentMatrixCell.objects.all()
+    queryset = RiskAssessmentMatrixCell.objects.all().order_by("likelihood", "impact")
     serializer_class = RiskAssessmentMatrixCellSerializer
     permission_classes = [HasPermission("view_audits")]
 
 
 class RiskAssessmentSummaryViewSet(viewsets.ReadOnlyModelViewSet):
-    queryset = RiskAssessmentSummaryItem.objects.select_related("record").all()
+    queryset = (
+        RiskAssessmentSummaryItem.objects.select_related("record")
+        .all()
+        .order_by("record__department", "id")
+    )
     serializer_class = RiskAssessmentSummaryItemSerializer
     permission_classes = [HasPermission("view_audits")]
 
 
 class RiskAssessmentImportIssuesViewSet(viewsets.ReadOnlyModelViewSet):
-    queryset = RiskAssessmentImportIssue.objects.all()
+    queryset = RiskAssessmentImportIssue.objects.all().order_by("severity", "id")
     serializer_class = RiskAssessmentImportIssueSerializer
     permission_classes = [HasPermission("manage_settings")]
 

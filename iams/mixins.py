@@ -55,6 +55,7 @@ class SoftDeleteMixin(models.Model):
     is_deleted = models.BooleanField(default=False, db_index=True)
     deleted_at = models.DateTimeField(null=True, blank=True)
 
+    # Custom managers — declared after fields, before Meta
     objects = SoftDeleteManager()
     all_objects = models.Manager()
 

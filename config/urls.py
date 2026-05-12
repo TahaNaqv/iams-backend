@@ -23,7 +23,15 @@ from drf_spectacular.views import (
 )
 from rest_framework_simplejwt.views import TokenBlacklistView, TokenRefreshView, TokenVerifyView
 
-from iams.views import HealthView, MeView, ReadinessView, ThrottledTokenObtainPairView
+from iams.views import (
+    HealthView,
+    MeView,
+    PasswordChangeView,
+    PasswordResetConfirmView,
+    PasswordResetRequestView,
+    ReadinessView,
+    ThrottledTokenObtainPairView,
+)
 
 urlpatterns = [
     path("admin/", admin.site.urls),
@@ -49,6 +57,21 @@ urlpatterns = [
     path("api/auth/token/refresh/", TokenRefreshView.as_view(), name="token_refresh"),
     path("api/auth/token/verify/", TokenVerifyView.as_view(), name="token_verify"),
     path("api/auth/token/blacklist/", TokenBlacklistView.as_view(), name="token_blacklist"),
+    path(
+        "api/auth/password/change/",
+        PasswordChangeView.as_view(),
+        name="auth_password_change",
+    ),
+    path(
+        "api/auth/password/reset/",
+        PasswordResetRequestView.as_view(),
+        name="auth_password_reset",
+    ),
+    path(
+        "api/auth/password/reset/confirm/",
+        PasswordResetConfirmView.as_view(),
+        name="auth_password_reset_confirm",
+    ),
     # Resource endpoints
     path("api/", include("iams.urls")),
 ]

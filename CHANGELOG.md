@@ -2,6 +2,31 @@
 
 All notable changes to the IAMS Django REST API backend.
 
+## [0.21.0] — Phase 6 Track 2: ERP / HR Integrations (2026-05-13)
+
+### Added
+- **Two new models + 6 column additions** ([migration 0021](iams/migrations/0021_integrations_phase6.py)):
+  - `IntegrationSource` — registered external system (SAP / Oracle / Odoo / AD / HRIS / generic). Tracks `inbound_enabled` + `inbound_secret` (HMAC-SHA256 shared secret), `outbound_enabled` + `outbound_url` + `outbound_token` + `outbound_pushes_users`, `status`, `last_inbound_at` / `last_outbound_at` / `last_error`.
+  - `IntegrationEvent` — append-only ledger of every inbound and outbound exchange (`direction`, `resource_type`, `external_id`, `status` ∈ accepted/rejected/failed, `error`, `payload`). Indexes on `(source, -timestamp)` and `(resource_type, external_id)` for forensic queries.
+  - `external_source` + `external_id` columns on `Audit`, `AuditableEntity`, `Finding` with partial unique constraints — idempotent upserts key off `(external_source, external_id)`.
+- **`iams.integrations` service module**:
+  - **HMAC**: `compute_signature(secret, body)` produces `sha256=<hex>`; `verify_signature(...)` uses `hmac.compare_digest` for constant-time comparison.
+  - **Inbound**: `ingest_auditable_entity(source, payload)` and `ingest_finding(source, payload)` — both idempotent `update_or_create` keyed on `(external_source, external_id)`. Required-field validation runs *outside* the atomic block so rejection events persist even on failure. The finding importer auto-creates the parent Audit when `audit_title` is supplied (ERP-driven workflow: audit only materializes once a finding lands).
+  - **Outbound**: `push_user(source, user)` POSTs the user payload (narrow shape — no password / MFA / lockout state) with HMAC-SHA256 signature header + bearer token. Network failures, HTTP non-2xx, and successes are all rowed in `IntegrationEvent`. `push_user_to_all_targets(user)` fans out to every active source with `outbound_pushes_users=True`.
+- **Webhook endpoint** at `POST /api/integrations/webhooks/<source_id>/<resource>/` — public-but-HMAC-signed. `X-IAMS-Signature: sha256=<hex>` header required; mismatch → 401. Resource ∈ `auditable-entities` / `findings`. Returns 201 on create, 200 on update, 400 on invalid payload (with `code: payload_invalid`), 401 on signature mismatch (with `code: signature_invalid`), 404 on unknown source / resource.
+- **REST surface** at `/api/integrations/sources/` (full CRUD) and `/api/integrations/events/` (read-only with `?source_id=`, `?direction=`, `?status=` filters). Both gated by `manage_settings`. Secrets (`inbound_secret`, `outbound_token`) are write-only — never echoed back to the FE.
+- **Signal handler**: `post_save` on `User` triggers `push_user_to_all_targets(user)` so every new / updated user is pushed to every outbound-enabled HRIS / AD target. Wrapped in try/except so a network failure can't break user creation.
+- **25 new tests** in `iams/tests/test_integrations.py` — HMAC round-trip + tamper resistance + constant-time, idempotent entity ingest, auto-create audit from finding payload, parent-audit-missing error path, all 6 webhook 4xx/5xx code paths, mocked outbound push (success / HTTP failure / network exception), signal fan-out (paused source skipped), admin-only REST + secret omission from response, event-ledger filtering.
+
+### Dependencies
+- Already present: `requests` (used by outbound HTTP push).
+
+### Notes
+- **Backend tests: 631 passing** (was 606; added 25).
+- The integration boundary is **trust-by-shared-secret** on both sides: inbound webhooks must HMAC-sign with `inbound_secret`, outbound posts include both a bearer token (RFC 6750) AND an HMAC signature of the body so the receiving system can verify origin even when TLS terminates early at a proxy.
+- Rejection-and-failure events keep working even on validation errors: required-field checks run before any `transaction.atomic()` so the `IntegrationEvent(status=rejected)` row persists. The operator sees every malformed delivery in the admin ledger, not just the successful ones.
+- The user-outbound signal handler swallows exceptions — observability + integration must never break user provisioning. Failures are logged and rowed as `IntegrationEvent(status=failed)` for retry.
+
 ## [0.20.0] — Phase 6 Track 1: Keycloak / OIDC SSO (2026-05-13)
 
 ### Added

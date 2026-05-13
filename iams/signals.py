@@ -379,3 +379,31 @@ def approval_metric(sender, instance: ApprovalRequest, created: bool, **kwargs):
         approvals_approved_total.labels(type=instance.type or "unknown").inc()
     elif prior != "Rejected" and instance.status == "Rejected":
         approvals_rejected_total.labels(type=instance.type or "unknown").inc()
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Phase 6 Track 2 — Outbound user push to AD/HRIS targets
+#
+# Fires on every User insert/update; iterates IntegrationSource rows
+# with ``outbound_pushes_users=True`` and posts the user payload.
+# Failures land as ``IntegrationEvent(status=failed)`` rows so the
+# operator can retry from the admin UI.
+# ══════════════════════════════════════════════════════════════════════
+from django.contrib.auth import get_user_model
+
+User = get_user_model()
+
+
+@receiver(post_save, sender=User, dispatch_uid="iams_user_outbound_push")
+def _user_outbound_push(sender, instance, created: bool, **kwargs):
+    """Push the user upsert to every outbound-enabled IntegrationSource."""
+    try:
+        # Lazy import to avoid module-import-time circulars and to
+        # let test mocks patch ``iams.integrations.push_user_to_all_targets``.
+        from iams.integrations import push_user_to_all_targets
+        push_user_to_all_targets(instance)
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "integration: outbound user push fan-out failed",
+            extra={"user_id": str(instance.pk)},
+        )

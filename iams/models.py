@@ -127,6 +127,10 @@ class Audit(TimeStampedModel):
     completion_percent = models.PositiveIntegerField(default=0)
     findings_count = models.PositiveIntegerField(default=0)
 
+    # Phase 6 Track 2 — external system provenance.
+    external_source = models.CharField(max_length=64, blank=True, db_index=True)
+    external_id = models.CharField(max_length=128, blank=True, db_index=True)
+
     class Meta:
         ordering = ["-start_date", "title"]
         indexes = [
@@ -136,6 +140,13 @@ class Audit(TimeStampedModel):
             models.Index(fields=["department", "status"]),
             models.Index(fields=["start_date"]),
             models.Index(fields=["lead_auditor"]),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["external_source", "external_id"],
+                condition=~models.Q(external_id=""),
+                name="iams_audit_external_unique",
+            ),
         ]
 
     def __str__(self):
@@ -164,6 +175,9 @@ class Finding(TimeStampedModel):
     root_cause = models.TextField(blank=True)
     recommendation = models.TextField(blank=True)
     created_date = models.DateField(null=True, blank=True)
+    # Phase 6 Track 2 — external provenance for inbound ERP findings.
+    external_source = models.CharField(max_length=64, blank=True, db_index=True)
+    external_id = models.CharField(max_length=128, blank=True, db_index=True)
 
     class Meta:
         ordering = ["-due_date", "title"]
@@ -175,6 +189,13 @@ class Finding(TimeStampedModel):
             models.Index(fields=["owner", "status", "due_date"]),
             models.Index(fields=["severity", "status"]),
             models.Index(fields=["created_date"]),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["external_source", "external_id"],
+                condition=~models.Q(external_id=""),
+                name="iams_finding_external_unique",
+            ),
         ]
 
     def __str__(self):
@@ -325,6 +346,20 @@ class AuditableEntity(TimeStampedModel):
     last_audit_date = models.DateField(null=True, blank=True)
     next_audit_date = models.DateField(null=True, blank=True)
     status = models.CharField(max_length=50, default="Active")
+    # Phase 6 Track 2 — external system provenance. Identifies the
+    # row when it was created (or last updated) from an inbound ERP
+    # feed; idempotent upserts key off (external_source, external_id).
+    external_source = models.CharField(max_length=64, blank=True, db_index=True)
+    external_id = models.CharField(max_length=128, blank=True, db_index=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["external_source", "external_id"],
+                condition=~models.Q(external_id=""),
+                name="iams_auditable_entity_external_unique",
+            ),
+        ]
 
 
 class RiskHistoryEntry(TimeStampedModel):
@@ -2410,3 +2445,125 @@ class KeycloakGroupRoleMap(TimeStampedModel):
 
     def __str__(self) -> str:
         return f"{self.group_name} → {self.role.name} (p{self.precedence})"
+
+
+# ═════════════════════════════════════════════════════════════════════
+# Phase 6 Track 2 — ERP / HR Integrations
+#
+# Two flavors live in the same registry:
+#   - **Inbound** sources push auditable_entity / finding rows into
+#     IAMS via signed webhooks. The shared-secret HMAC keeps the
+#     endpoint trustless.
+#   - **Outbound** targets receive ``user`` payloads when IAMS users
+#     are created or updated, so the HRIS/AD reflects the IA team
+#     roster.
+#
+# A single ``IntegrationSource`` row can be both — e.g. Odoo as
+# inbound entities + outbound user sync.
+# ═════════════════════════════════════════════════════════════════════
+class IntegrationSource(TimeStampedModel):
+    """A registered external system IAMS exchanges data with."""
+
+    KIND_SAP = "sap"
+    KIND_ORACLE = "oracle"
+    KIND_ODOO = "odoo"
+    KIND_AD = "active_directory"
+    KIND_HRIS = "hris"
+    KIND_GENERIC = "generic"
+    KIND_CHOICES = [
+        (KIND_SAP, "SAP"),
+        (KIND_ORACLE, "Oracle"),
+        (KIND_ODOO, "Odoo"),
+        (KIND_AD, "Active Directory"),
+        (KIND_HRIS, "HRIS"),
+        (KIND_GENERIC, "Generic"),
+    ]
+
+    STATUS_ACTIVE = "active"
+    STATUS_PAUSED = "paused"
+    STATUS_ERROR = "error"
+    STATUS_CHOICES = [
+        (STATUS_ACTIVE, "Active"),
+        (STATUS_PAUSED, "Paused"),
+        (STATUS_ERROR, "Error"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    name = models.CharField(max_length=128, unique=True)
+    kind = models.CharField(max_length=32, choices=KIND_CHOICES, default=KIND_GENERIC)
+    status = models.CharField(max_length=16, choices=STATUS_CHOICES, default=STATUS_ACTIVE)
+    # Inbound: webhook secret used to validate the HMAC-SHA256 signature
+    # the caller posts in the ``X-IAMS-Signature`` header.
+    inbound_enabled = models.BooleanField(default=False)
+    inbound_secret = models.CharField(
+        max_length=128, blank=True,
+        help_text="HMAC-SHA256 secret used to verify inbound webhooks.",
+    )
+    # Outbound: target URL + bearer token to push user upserts to.
+    outbound_enabled = models.BooleanField(default=False)
+    outbound_url = models.URLField(blank=True)
+    outbound_token = models.CharField(max_length=512, blank=True)
+    outbound_pushes_users = models.BooleanField(default=False)
+    last_inbound_at = models.DateTimeField(null=True, blank=True)
+    last_outbound_at = models.DateTimeField(null=True, blank=True)
+    last_error = models.TextField(blank=True)
+
+    class Meta:
+        ordering = ["name"]
+        indexes = [
+            models.Index(fields=["kind", "status"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.name} ({self.kind})"
+
+
+class IntegrationEvent(TimeStampedModel):
+    """One inbound or outbound event recorded for audit + retry.
+
+    Inbound: every webhook delivery (success or failure) is rowed.
+    Outbound: every user-push attempt is rowed. The audit committee
+    can inspect this table to verify the integration story is
+    delivering what the operator claims it is.
+    """
+
+    DIRECTION_INBOUND = "inbound"
+    DIRECTION_OUTBOUND = "outbound"
+    DIRECTION_CHOICES = [
+        (DIRECTION_INBOUND, "Inbound"),
+        (DIRECTION_OUTBOUND, "Outbound"),
+    ]
+
+    STATUS_ACCEPTED = "accepted"
+    STATUS_REJECTED = "rejected"
+    STATUS_FAILED = "failed"
+    STATUS_CHOICES = [
+        (STATUS_ACCEPTED, "Accepted"),
+        (STATUS_REJECTED, "Rejected"),
+        (STATUS_FAILED, "Failed"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    source = models.ForeignKey(
+        IntegrationSource, on_delete=models.CASCADE, related_name="events",
+    )
+    direction = models.CharField(max_length=16, choices=DIRECTION_CHOICES, db_index=True)
+    resource_type = models.CharField(
+        max_length=40, db_index=True,
+        help_text="auditable_entity | finding | user | ...",
+    )
+    external_id = models.CharField(max_length=128, blank=True, db_index=True)
+    status = models.CharField(max_length=16, choices=STATUS_CHOICES, db_index=True)
+    error = models.TextField(blank=True)
+    payload = models.JSONField(default=dict, blank=True)
+    timestamp = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        ordering = ["-timestamp"]
+        indexes = [
+            models.Index(fields=["source", "-timestamp"]),
+            models.Index(fields=["resource_type", "external_id"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.direction}:{self.resource_type}#{self.external_id} {self.status}"

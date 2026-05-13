@@ -15,6 +15,11 @@ from .auth import (
     ThrottledTokenObtainPairView,
 )
 from .health import HealthView, ReadinessView
+from .integrations import (
+    IntegrationEventViewSet,
+    IntegrationSourceViewSet,
+    IntegrationWebhookView,
+)
 from .users import UserViewSet
 from .roles import KeycloakGroupRoleMapViewSet, RoleViewSet, RolePermissionsView
 from .permissions import PermissionViewSet
@@ -102,6 +107,9 @@ __all__ = [
     "SSOCallbackView",
     "ThrottledTokenObtainPairView",
     "HealthView",
+    "IntegrationEventViewSet",
+    "IntegrationSourceViewSet",
+    "IntegrationWebhookView",
     "ReadinessView",
     "UserViewSet",
     "RoleViewSet",

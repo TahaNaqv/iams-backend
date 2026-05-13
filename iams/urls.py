@@ -34,6 +34,9 @@ from iams.views import (
     RiskAssessmentSummaryViewSet,
     RiskAssessmentViewSet,
     RiskHistoryViewSet,
+    IntegrationEventViewSet,
+    IntegrationSourceViewSet,
+    IntegrationWebhookView,
     KeycloakGroupRoleMapViewSet,
     RolePermissionsView,
     RoleViewSet,
@@ -79,6 +82,9 @@ router.register("roles", RoleViewSet, basename="role")
 router.register(
     "sso/group-role-maps", KeycloakGroupRoleMapViewSet, basename="sso-group-role-map",
 )
+# Phase 6 Track 2 — ERP / HR integrations
+router.register("integrations/sources", IntegrationSourceViewSet, basename="integration-source")
+router.register("integrations/events", IntegrationEventViewSet, basename="integration-event")
 router.register("permissions", PermissionViewSet, basename="permission")
 router.register("audits", AuditViewSet, basename="audit")
 router.register("findings", FindingViewSet, basename="finding")
@@ -164,5 +170,11 @@ urlpatterns = [
         "risk-assessment-import/issues/",
         RiskAssessmentImportIssuesViewSet.as_view({"get": "list"}),
         name="risk-assessment-import-issues",
+    ),
+    # Phase 6 Track 2 — inbound webhook ingestion (HMAC-signed)
+    path(
+        "integrations/webhooks/<uuid:source_id>/<str:resource>/",
+        IntegrationWebhookView.as_view(),
+        name="integration-webhook",
     ),
 ]

@@ -15,7 +15,7 @@ echo "==> Copying .env to server..."
 scp .env "$SERVER_USER@$SERVER_HOST:~/auditsence/iams-backend/.env"
 
 echo "==> Deploying on server..."
-ssh "$SERVER_USER@$SERVER_HOST" bash << ENDSSH
+ssh "$SERVER_USER@$SERVER_HOST" bash << 'ENDSSH'
   set -e
   cd ~/auditsence/iams-backend
 
@@ -25,8 +25,24 @@ ssh "$SERVER_USER@$SERVER_HOST" bash << ENDSSH
   echo "  -> Rebuilding and restarting containers..."
   docker-compose up -d --build
 
-  echo "  -> Running migrations..."
-  docker exec $CONTAINER uv run python manage.py migrate
+  # Migrations run automatically inside the backend container entrypoint
+  # (DJANGO_AUTO_MIGRATE=1 in compose). Don't ``docker exec`` another
+  # migrate here — it races against the still-booting container's PID
+  # namespace and fails with "setns process: exit status 1". The
+  # entrypoint owns this responsibility.
+
+  echo "  -> Waiting for backend health (up to 90s)..."
+  for i in $(seq 1 30); do
+    status="$(docker inspect --format '{{.State.Health.Status}}' iams-backend-backend-1 2>/dev/null || echo missing)"
+    if [ "$status" = "healthy" ]; then
+      echo "  -> Backend reports healthy."
+      exit 0
+    fi
+    sleep 3
+  done
+  echo "  -> Backend did not reach healthy in 90s. Recent logs:"
+  docker-compose logs --tail=80 backend
+  exit 1
 ENDSSH
 
 echo "==> Done. Backend is live at https://api.auditsence.leadrisks.com"

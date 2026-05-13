@@ -94,7 +94,7 @@ def record_login_attempt(
 
     meta = request_metadata(request)
     try:
-        return LoginAttempt.objects.create(
+        row = LoginAttempt.objects.create(
             username=(username or "")[:255],
             user=user,
             outcome=outcome,
@@ -106,6 +106,12 @@ def record_login_attempt(
     except Exception:  # noqa: BLE001 — never break auth on logging failure
         logger.exception("failed to record LoginAttempt")
         return None
+    try:
+        from iams.metrics import login_attempts_total
+        login_attempts_total.labels(outcome=outcome).inc()
+    except Exception:  # noqa: BLE001
+        logger.exception("metrics: failed to bump login_attempts_total")
+    return row
 
 
 def get_active_lockout(user):
@@ -177,6 +183,11 @@ def register_failure(*, user, request=None, outcome: str = "invalid_credentials"
         failed_attempt_count=recent_failures,
         note=f"Auto-locked after {recent_failures} failures within {_fail_window_min()}m.",
     )
+    try:
+        from iams.metrics import account_lockouts_total
+        account_lockouts_total.labels(reason=lockout.reason).inc()
+    except Exception:  # noqa: BLE001
+        logger.exception("metrics: failed to bump account_lockouts_total")
     logger.warning(
         "account_locked",
         extra={

@@ -2,6 +2,31 @@
 
 All notable changes to the IAMS Django REST API backend.
 
+## [0.18.0] — Phase 5 Track 3: Observability (2026-05-13)
+
+### Added
+- **`iams/logging.py` JsonFormatter** — every log record renders as one line of JSON with `time / level / logger / message / request_id / service / host / env / exception` plus any user-supplied `extra={}` keys folded in (non-serializable values are `repr`'d, never crash the log call). Wired into `LOGGING` as the default formatter; `LOG_FORMAT=text` env switches back to plain text for local dev. Promtail can ship straight to Loki without parsing.
+- **`iams/metrics.py` Prometheus counters/gauges** for business events (NFR-Observability):
+  - Counters: `iams_audits_created_total{department}`, `iams_audits_completed_total{department}`, `iams_findings_raised_total{severity}`, `iams_caps_created_total`, `iams_caps_closed_total`, `iams_approvals_requested_total{type}`, `iams_approvals_approved_total{type}`, `iams_approvals_rejected_total{type}`, `iams_login_attempts_total{outcome}`, `iams_account_lockouts_total{reason}`, `iams_report_jobs_total{kind}`, `iams_report_jobs_completed_total{kind}`, `iams_report_jobs_failed_total{kind}`.
+  - Gauges: `iams_caps_overdue_current`, `iams_approvals_pending_current`.
+  - `refresh_business_gauges()` syncs the gauges from the DB; called by the existing 5-minute `dashboards.refresh_caches` beat task so gauges stay accurate even if a process restart drops a signal.
+- **Signal-driven metric increments** — six new `pre_save` / `post_save` handlers in `iams/signals.py` capture status transitions (created → completed, → approved, → rejected, → closed) and bump the right counter. All wrapped in `_safe_metric` so observability can't break the request path. Login-attempt + lockout counters wired in `iams/security.py`; report-job counters in `iams/tasks/reports.py`.
+- **`iams/telemetry.py` OpenTelemetry SDK bootstrap** — initializes the tracer provider + OTLP HTTP exporter + auto-instruments Django, Celery, Redis, and Psycopg2 when `OTEL_ENABLED=true`. Default sample rate 10% via `ParentBased(TraceIdRatioBased(0.1))`. Idempotent (safe to call from `IamsConfig.ready()` and any other entry point).
+- **`deploy/grafana/`** — checked-in Grafana dashboards as JSON:
+  - `iams-system.json`: request rate by status class, latency p50/p95/p99, error rate (with threshold colors), DB pool, Celery queue depth, login attempts, lockouts.
+  - `iams-business.json`: overdue-CAPs gauge, approvals-pending gauge, daily findings by severity, audit lifecycle flow, CAP create/close flow, approval flow by type, report-job pass/fail by kind.
+- **`deploy/prometheus/iams-alerts.yml`** — alert rules grouped into `iams.system` (5xx > 1% / p95 > 1s / Celery backlog / DB errors), `iams.security` (lockout burst / failed-login spike), and `iams.business` (overdue CAP threshold / report-job failure rate). `severity=page` routes to PagerDuty; `warn` to Slack.
+- **`deploy/README.md`** — wiring summary + environment knobs (`LOG_FORMAT`, `OTEL_*`, `SENTRY_*`).
+- **13 new tests** in `iams/tests/test_observability.py` — JSON formatter shape + request-id correlation + extras folding + non-serializable repr + exception traceback capture, business counters bump on signal (audits / findings / CAPs / approvals), login-attempt counter, gauge refresh syncs state, `/metrics` endpoint exposes custom counters.
+
+### Dependencies
+- Added: `opentelemetry-sdk`, `opentelemetry-exporter-otlp`, `opentelemetry-instrumentation-django`, `opentelemetry-instrumentation-celery`, `opentelemetry-instrumentation-redis`, `opentelemetry-instrumentation-psycopg2`.
+
+### Notes
+- **Backend tests: 586 passing** (was 573; added 13).
+- Cardinality discipline: metrics only label by bounded enums (status / severity / outcome / kind / reason / type / department). No per-id labels.
+- Gauges *and* counters: `iams_caps_overdue_current` is a point-in-time gauge (refreshed by beat task), not a counter. Counters answer "how many ever"; gauges answer "how many right now". Both feed different Grafana panels.
+
 ## [0.17.0] — Phase 5 Track 2: Performance & Scale (2026-05-13)
 
 ### Changed

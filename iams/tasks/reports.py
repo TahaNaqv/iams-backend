@@ -29,15 +29,34 @@ def generate_report(job_id: str) -> dict:
         logger.info("reports: job %s vanished before render", job_id)
         return {"rendered": False, "reason": "missing"}
 
+    try:
+        from iams.metrics import report_jobs_total
+        report_jobs_total.labels(kind=job.kind or "unknown").inc()
+    except Exception:  # noqa: BLE001
+        logger.exception("metrics: failed to bump report_jobs_total")
+
     renderer_cls = RENDERERS.get(job.kind)
     if renderer_cls is None:
         job.status = ReportJob.STATUS_FAILED
         job.error = f"No renderer registered for kind '{job.kind}'."
         job.save(update_fields=["status", "error", "updated_at"])
+        try:
+            from iams.metrics import report_jobs_failed_total
+            report_jobs_failed_total.labels(kind=job.kind or "unknown").inc()
+        except Exception:  # noqa: BLE001
+            logger.exception("metrics: failed to bump report_jobs_failed_total")
         return {"rendered": False, "reason": "no_renderer"}
 
     renderer = renderer_cls()
     job = renderer.run(job)
+    try:
+        from iams.metrics import report_jobs_completed_total, report_jobs_failed_total
+        if job.status == ReportJob.STATUS_COMPLETED:
+            report_jobs_completed_total.labels(kind=job.kind or "unknown").inc()
+        elif job.status == ReportJob.STATUS_FAILED:
+            report_jobs_failed_total.labels(kind=job.kind or "unknown").inc()
+    except Exception:  # noqa: BLE001
+        logger.exception("metrics: failed to bump report-job lifecycle counter")
 
     # Notify the requester
     if job.requested_by_id:

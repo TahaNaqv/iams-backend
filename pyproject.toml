@@ -67,6 +67,7 @@ dependencies = [
     "pyotp>=2.9.0",
     "qrcode>=8.2",
     "nplusone>=1.0.0",
+    "opentelemetry-instrumentation-redis>=0.62b1",
 ]
 
 [dependency-groups]

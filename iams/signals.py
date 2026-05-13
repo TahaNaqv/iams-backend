@@ -274,3 +274,108 @@ def approval_request_rejected_side_effects(sender, instance: ApprovalRequest, **
         "workflow: request %s of type %s rejected",
         instance.pk, instance.type,
     )
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Phase 5 Track 3 — Prometheus business-metric signals
+#
+# These handlers exist *only* to bump counters. They never call out to
+# notifications or other side effects, so a metric mutation can't break
+# a save. Failures are swallowed silently — observability must never
+# block the request path.
+# ══════════════════════════════════════════════════════════════════════
+def _safe_metric(fn):
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except Exception:  # noqa: BLE001
+            logger.exception("metrics: handler failed")
+    return wrapper
+
+
+@receiver(pre_save, sender=Audit, dispatch_uid="iams_audit_metric_capture")
+def _capture_prior_audit_status(sender, instance: Audit, **kwargs):
+    """Stash the previous status so post_save can detect transitions."""
+    if instance.pk:
+        try:
+            prior = Audit.objects.only("status").get(pk=instance.pk)
+            instance._prior_status = prior.status
+        except Audit.DoesNotExist:
+            instance._prior_status = None
+    else:
+        instance._prior_status = None
+
+
+@receiver(post_save, sender=Audit, dispatch_uid="iams_audit_metric_emit")
+@_safe_metric
+def audit_lifecycle_metric(sender, instance: Audit, created: bool, **kwargs):
+    from iams.metrics import audits_completed_total, audits_created_total
+    if created:
+        audits_created_total.labels(department=instance.department or "unknown").inc()
+        return
+    prior = getattr(instance, "_prior_status", None)
+    if prior != "Completed" and instance.status == "Completed":
+        audits_completed_total.labels(department=instance.department or "unknown").inc()
+
+
+@receiver(post_save, sender=Finding, dispatch_uid="iams_finding_metric_emit")
+@_safe_metric
+def finding_metric(sender, instance: Finding, created: bool, **kwargs):
+    if not created:
+        return
+    from iams.metrics import findings_raised_total
+    findings_raised_total.labels(severity=instance.severity or "Medium").inc()
+
+
+@receiver(pre_save, sender=CorrectiveAction, dispatch_uid="iams_cap_metric_capture")
+def _capture_prior_cap_status(sender, instance: CorrectiveAction, **kwargs):
+    if instance.pk:
+        try:
+            prior = CorrectiveAction.objects.only("status").get(pk=instance.pk)
+            instance._prior_status = prior.status
+        except CorrectiveAction.DoesNotExist:
+            instance._prior_status = None
+    else:
+        instance._prior_status = None
+
+
+@receiver(post_save, sender=CorrectiveAction, dispatch_uid="iams_cap_metric_emit")
+@_safe_metric
+def cap_metric(sender, instance: CorrectiveAction, created: bool, **kwargs):
+    from iams.metrics import caps_closed_total, caps_created_total
+    if created:
+        caps_created_total.inc()
+        return
+    prior = getattr(instance, "_prior_status", None)
+    if prior != "Closed" and instance.status == "Closed":
+        caps_closed_total.inc()
+
+
+@receiver(pre_save, sender=ApprovalRequest, dispatch_uid="iams_approval_metric_capture")
+def _capture_prior_approval_status(sender, instance: ApprovalRequest, **kwargs):
+    if instance.pk:
+        try:
+            prior = ApprovalRequest.objects.only("status").get(pk=instance.pk)
+            instance._prior_status = prior.status
+        except ApprovalRequest.DoesNotExist:
+            instance._prior_status = None
+    else:
+        instance._prior_status = None
+
+
+@receiver(post_save, sender=ApprovalRequest, dispatch_uid="iams_approval_metric_emit")
+@_safe_metric
+def approval_metric(sender, instance: ApprovalRequest, created: bool, **kwargs):
+    from iams.metrics import (
+        approvals_approved_total,
+        approvals_rejected_total,
+        approvals_requested_total,
+    )
+    if created:
+        approvals_requested_total.labels(type=instance.type or "unknown").inc()
+        return
+    prior = getattr(instance, "_prior_status", None)
+    if prior != "Approved" and instance.status == "Approved":
+        approvals_approved_total.labels(type=instance.type or "unknown").inc()
+    elif prior != "Rejected" and instance.status == "Rejected":
+        approvals_rejected_total.labels(type=instance.type or "unknown").inc()

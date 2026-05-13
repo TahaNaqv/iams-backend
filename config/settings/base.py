@@ -381,6 +381,14 @@ LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
     "formatters": {
+        # Phase 5 Track 3 — JSON formatter for Promtail/Loki ingestion.
+        # One JSON object per line; ``request_id`` correlates entries
+        # to incoming requests via ``RequestIdMiddleware``.
+        "json": {
+            "()": "iams.logging.JsonFormatter",
+        },
+        # Plain-text fallback for local dev terminals where JSON is
+        # noisier than helpful. ``LOG_FORMAT=text`` env switches.
         "structured": {
             "format": (
                 "%(asctime)s level=%(levelname)s logger=%(name)s "
@@ -396,7 +404,7 @@ LOGGING = {
     "handlers": {
         "console": {
             "class": "logging.StreamHandler",
-            "formatter": "structured",
+            "formatter": env("LOG_FORMAT", default="json"),
             "filters": ["request_id"],
         },
     },

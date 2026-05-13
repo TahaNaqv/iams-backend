@@ -20,9 +20,20 @@ logger = logging.getLogger(__name__)
 
 @shared_task(name="iams.dashboards.refresh_caches")
 def refresh_dashboard_caches() -> dict:
-    """Drop all dashboard cache keys so the next request fetches fresh."""
+    """Drop dashboard cache keys + sync live-state Prometheus gauges.
+
+    The cache invalidation lets the next FE poll repopulate keys with
+    current data. The gauge refresh keeps ``iams_caps_overdue_current``
+    and ``iams_approvals_pending_current`` accurate even if some
+    individual signals were missed (process restart, lost message).
+    """
     from iams.dashboards import invalidate_dashboard_cache
+    from iams.metrics import refresh_business_gauges
 
     removed = invalidate_dashboard_cache()
-    logger.info("dashboards: invalidated %s cache key(s)", removed)
-    return {"invalidated": removed}
+    gauges = refresh_business_gauges()
+    logger.info(
+        "dashboards: invalidated %s cache key(s); gauges %s",
+        removed, gauges,
+    )
+    return {"invalidated": removed, "gauges": gauges}

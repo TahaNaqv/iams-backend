@@ -1498,6 +1498,7 @@ dependencies = [
     { name = "opentelemetry-instrumentation-celery" },
     { name = "opentelemetry-instrumentation-django" },
     { name = "opentelemetry-instrumentation-psycopg2" },
+    { name = "opentelemetry-instrumentation-redis" },
     { name = "opentelemetry-sdk" },
     { name = "psycopg2-binary" },
     { name = "pyotp" },
@@ -1568,6 +1569,7 @@ requires-dist = [
     { name = "opentelemetry-instrumentation-celery", specifier = ">=0.50b0" },
     { name = "opentelemetry-instrumentation-django", specifier = ">=0.50b0" },
     { name = "opentelemetry-instrumentation-psycopg2", specifier = ">=0.50b0" },
+    { name = "opentelemetry-instrumentation-redis", specifier = ">=0.62b1" },
     { name = "opentelemetry-sdk", specifier = ">=1.29.0" },
     { name = "psycopg2-binary", specifier = ">=2.9.11" },
     { name = "pyotp", specifier = ">=2.9.0" },
@@ -2213,6 +2215,21 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/45/14/302c4c96bd4ec97656217e715f20e69f61dc79e3478c95e883ed50cd8100/opentelemetry_instrumentation_psycopg2-0.62b1.tar.gz", hash = "sha256:0f756c7e00babb04429c528e8cd0054b348a8458a7a986a6807c0d413222f45c", size = 12077, upload-time = "2026-04-24T13:22:57.343Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/0e/da/e650b7077ad57048cd765d91d7c4f002bd3ec6101fc7920b14e956f73404/opentelemetry_instrumentation_psycopg2-0.62b1-py3-none-any.whl", hash = "sha256:b1de5da4b300504dbe52145d3098092b5caab2b50373809cf11506e0adddd0eb", size = 11585, upload-time = "2026-04-24T13:22:05.857Z" },
+]
+
+[[package]]
+name = "opentelemetry-instrumentation-redis"
+version = "0.62b1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "opentelemetry-api" },
+    { name = "opentelemetry-instrumentation" },
+    { name = "opentelemetry-semantic-conventions" },
+    { name = "wrapt" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/f5/ff/35414ad80409bd9e472c7959832524c5f2c8f63965af08c41c2b42d3a6a6/opentelemetry_instrumentation_redis-0.62b1.tar.gz", hash = "sha256:2d3c421d95e05ade075bee5becbe34e743b1cdf5bdee2085cb524f88c4f13dcb", size = 14796, upload-time = "2026-04-24T13:23:01.138Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/31/37/bc2271f3472e3041eeade8b8da1cfd3b06badae76fe5d0ff135b6285e70c/opentelemetry_instrumentation_redis-0.62b1-py3-none-any.whl", hash = "sha256:9aedd02c1acf631251d1d676634db47da9da04e0a626cd0c7d83fe0eb791d165", size = 15501, upload-time = "2026-04-24T13:22:11.705Z" },
 ]
 
 [[package]]

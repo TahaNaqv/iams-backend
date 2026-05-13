@@ -4,8 +4,14 @@ from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from django.shortcuts import get_object_or_404
 
-from iams.models import Role
-from iams.serializers import RoleSerializer, RoleWriteSerializer, RolePermissionsUpdateSerializer
+from iams.audit import AuditedViewSetMixin
+from iams.models import KeycloakGroupRoleMap, Role
+from iams.serializers import (
+    KeycloakGroupRoleMapSerializer,
+    RoleSerializer,
+    RoleWriteSerializer,
+    RolePermissionsUpdateSerializer,
+)
 from iams.permissions import HasPermission
 
 
@@ -30,6 +36,22 @@ class RoleViewSet(viewsets.ModelViewSet):
             )
         self.perform_destroy(instance)
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class KeycloakGroupRoleMapViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
+    """CRUD for Keycloak group → IAMS role mappings.
+
+    Read access is gated by ``manage_roles``; mutations by
+    ``manage_settings`` since changing the mapping table effectively
+    grants/revokes role across the IAMS user base on the next SSO sign-in.
+    """
+    queryset = KeycloakGroupRoleMap.objects.select_related("role").all()
+    serializer_class = KeycloakGroupRoleMapSerializer
+
+    def get_permissions(self):
+        if self.action in ("list", "retrieve"):
+            return [HasPermission("manage_roles")]
+        return [HasPermission("manage_settings")]
 
 
 class RolePermissionsView(APIView):

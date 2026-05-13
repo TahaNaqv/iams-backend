@@ -2368,3 +2368,45 @@ class MFADevice(TimeStampedModel):
 
     def __str__(self) -> str:
         return f"MFA({self.user_id}, {self.kind}, confirmed={self.confirmed})"
+
+
+# ═════════════════════════════════════════════════════════════════════
+# Phase 6 Track 1 — Keycloak SSO
+#
+# When a user signs in via OIDC, the access token's ``groups`` claim
+# carries the Keycloak groups the user belongs to. We map each group
+# name (case-sensitive, full Keycloak path) to an IAMS Role; if a
+# user is in multiple mapped groups the highest-precedence row wins.
+# Lower ``precedence`` number = higher priority (so a "Super Admin"
+# mapping at precedence 1 beats an "Auditor" mapping at precedence 10).
+# ═════════════════════════════════════════════════════════════════════
+class KeycloakGroupRoleMap(TimeStampedModel):
+    """Maps a Keycloak group claim → IAMS Role for JIT provisioning.
+
+    Editable in Django admin (no FE management UI yet — Phase 6 scope
+    keeps the surface area tight). The OIDC backend reads this table on
+    every SSO login so changes take effect on next sign-in.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    group_name = models.CharField(
+        max_length=255, unique=True,
+        help_text="Full Keycloak group path, e.g. '/IAMS/Auditors'.",
+    )
+    role = models.ForeignKey(
+        Role, on_delete=models.PROTECT, related_name="keycloak_mappings",
+    )
+    precedence = models.PositiveSmallIntegerField(
+        default=10,
+        help_text="Lower wins when a user is in multiple mapped groups.",
+    )
+    is_active = models.BooleanField(default=True, db_index=True)
+
+    class Meta:
+        ordering = ["precedence", "group_name"]
+        indexes = [
+            models.Index(fields=["group_name", "is_active"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.group_name} → {self.role.name} (p{self.precedence})"

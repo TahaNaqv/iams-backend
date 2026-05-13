@@ -59,6 +59,10 @@ THIRD_PARTY_APPS = [
     "django_celery_beat",
     "django_celery_results",
     "django_prometheus",
+    # Phase 6 Track 1 — OIDC client for Keycloak SSO. Apps remain loaded
+    # even when SSO is disabled (IAMS_SSO_ENABLED=False); the runtime
+    # check gates the endpoints.
+    "mozilla_django_oidc",
 ]
 
 LOCAL_APPS = [
@@ -170,6 +174,49 @@ IAMS_MFA_TOTP_ISSUER = env("IAMS_MFA_TOTP_ISSUER", default="IAMS")
 IAMS_SESSION_INACTIVITY_MINUTES = env.int(
     "IAMS_SESSION_INACTIVITY_MINUTES", default=60
 )
+
+# ──────────────────────────────────────────────────────────────────────
+# Phase 6 Track 1 — Keycloak / OIDC single sign-on
+# ──────────────────────────────────────────────────────────────────────
+# SSO is opt-in: the FE login page calls /api/auth/sso/config/ and only
+# shows the "Sign in with corporate account" button when this is True
+# AND a discovery endpoint + client_id are configured.
+IAMS_SSO_ENABLED = env.bool("IAMS_SSO_ENABLED", default=False)
+IAMS_SSO_PROVIDER_NAME = env("IAMS_SSO_PROVIDER_NAME", default="Corporate SSO")
+
+# Keycloak realm endpoints (set when SSO is enabled).
+# Typical Keycloak layout:
+#   issuer              = https://keycloak.iams.internal/realms/iams
+#   authorization       = ${issuer}/protocol/openid-connect/auth
+#   token / userinfo    = ${issuer}/protocol/openid-connect/{token,userinfo}
+#   end-session         = ${issuer}/protocol/openid-connect/logout
+#   jwks                = ${issuer}/protocol/openid-connect/certs
+OIDC_RP_CLIENT_ID = env("OIDC_RP_CLIENT_ID", default="")
+OIDC_RP_CLIENT_SECRET = env("OIDC_RP_CLIENT_SECRET", default="")
+OIDC_OP_AUTHORIZATION_ENDPOINT = env("OIDC_OP_AUTHORIZATION_ENDPOINT", default="")
+OIDC_OP_TOKEN_ENDPOINT = env("OIDC_OP_TOKEN_ENDPOINT", default="")
+OIDC_OP_USER_ENDPOINT = env("OIDC_OP_USER_ENDPOINT", default="")
+OIDC_OP_JWKS_ENDPOINT = env("OIDC_OP_JWKS_ENDPOINT", default="")
+OIDC_OP_LOGOUT_ENDPOINT = env("OIDC_OP_LOGOUT_ENDPOINT", default="")
+OIDC_RP_SIGN_ALGO = env("OIDC_RP_SIGN_ALGO", default="RS256")
+OIDC_RP_SCOPES = env("OIDC_RP_SCOPES", default="openid email profile groups")
+
+# Authentication backends — keep ModelBackend for password / service
+# accounts; the OIDC backend handles SSO callbacks.
+AUTHENTICATION_BACKENDS = [
+    "iams.sso.IAMSOIDCAuthenticationBackend",
+    "django.contrib.auth.backends.ModelBackend",
+]
+
+# JIT user provisioning: first SSO login creates a UserProfile with the
+# named role unless a Keycloak-group → role mapping says otherwise.
+IAMS_SSO_DEFAULT_ROLE = env("IAMS_SSO_DEFAULT_ROLE", default="Viewer")
+
+# When True, an SSO-provisioned user inherits ``mfa_required=True``
+# implicitly (Keycloak is enforcing MFA at the IdP layer so the
+# in-app MFA prompt becomes redundant). Leave False to keep the
+# in-app MFA gate as a defense-in-depth second factor.
+IAMS_SSO_TRUSTS_IDP_MFA = env.bool("IAMS_SSO_TRUSTS_IDP_MFA", default=True)
 
 # ──────────────────────────────────────────────────────────────────────
 # Internationalization

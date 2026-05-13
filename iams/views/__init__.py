@@ -9,11 +9,14 @@ from .auth import (
     PasswordChangeView,
     PasswordResetConfirmView,
     PasswordResetRequestView,
+    SSOCallbackView,
+    SSOConfigView,
+    SSOLoginView,
     ThrottledTokenObtainPairView,
 )
 from .health import HealthView, ReadinessView
 from .users import UserViewSet
-from .roles import RoleViewSet, RolePermissionsView
+from .roles import KeycloakGroupRoleMapViewSet, RoleViewSet, RolePermissionsView
 from .permissions import PermissionViewSet
 from .domain import (
     ActivityViewSet,
@@ -84,6 +87,7 @@ from .domain import (
 
 __all__ = [
     "AccountUnlockView",
+    "KeycloakGroupRoleMapViewSet",
     "MeView",
     "MFABackupCodesRegenerateView",
     "MFAStatusView",
@@ -93,6 +97,9 @@ __all__ = [
     "PasswordChangeView",
     "PasswordResetConfirmView",
     "PasswordResetRequestView",
+    "SSOConfigView",
+    "SSOLoginView",
+    "SSOCallbackView",
     "ThrottledTokenObtainPairView",
     "HealthView",
     "ReadinessView",

@@ -34,6 +34,7 @@ from iams.views import (
     RiskAssessmentSummaryViewSet,
     RiskAssessmentViewSet,
     RiskHistoryViewSet,
+    KeycloakGroupRoleMapViewSet,
     RolePermissionsView,
     RoleViewSet,
     ApprovalChainTemplateViewSet,
@@ -75,6 +76,9 @@ from iams.views import (
 router = DefaultRouter()
 router.register("users", UserViewSet, basename="user")
 router.register("roles", RoleViewSet, basename="role")
+router.register(
+    "sso/group-role-maps", KeycloakGroupRoleMapViewSet, basename="sso-group-role-map",
+)
 router.register("permissions", PermissionViewSet, basename="permission")
 router.register("audits", AuditViewSet, basename="audit")
 router.register("findings", FindingViewSet, basename="finding")

@@ -4,7 +4,7 @@ from django.utils.encoding import force_str
 from django.utils.http import urlsafe_base64_decode
 from rest_framework import serializers
 
-from iams.models import Permission, Role, UserProfile
+from iams.models import KeycloakGroupRoleMap, Permission, Role, UserProfile
 
 User = get_user_model()
 
@@ -315,3 +315,19 @@ class PasswordResetConfirmSerializer(serializers.Serializer):
         user.save(update_fields=["password"])
         record_password_change(user=user, new_hash=user.password)
         return user
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Phase 6 Track 1 — Keycloak group → role mapping
+# ──────────────────────────────────────────────────────────────────────
+class KeycloakGroupRoleMapSerializer(serializers.ModelSerializer):
+    groupName = serializers.CharField(source="group_name")
+    roleId = serializers.PrimaryKeyRelatedField(
+        source="role", queryset=Role.objects.all(),
+    )
+    roleName = serializers.CharField(source="role.name", read_only=True)
+    isActive = serializers.BooleanField(source="is_active")
+
+    class Meta:
+        model = KeycloakGroupRoleMap
+        fields = ["id", "groupName", "roleId", "roleName", "precedence", "isActive"]

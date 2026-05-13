@@ -2,6 +2,40 @@
 
 All notable changes to the IAMS Django REST API backend.
 
+## [0.20.0] — Phase 6 Track 1: Keycloak / OIDC SSO (2026-05-13)
+
+### Added
+- **`KeycloakGroupRoleMap` model** ([migration 0020](iams/migrations/0020_sso_phase6.py)) — maps a Keycloak group path (e.g. `/IAMS/Auditors`) to an IAMS `Role`. Precedence-ordered (lower wins) so a user in multiple mapped groups deterministically picks one role. `is_active` flag for transient disabling.
+- **`iams.sso` service module**:
+  - `sso_enabled()` — True iff `IAMS_SSO_ENABLED=True` *and* the OIDC endpoints are configured.
+  - `sso_config_payload()` — payload returned by `/api/auth/sso/config/` for the FE login page.
+  - `build_sso_redirect_url(...)`, `mint_jwt_pair(...)` — server-side SSO orchestration helpers.
+  - `resolve_role_from_groups(groups)` — picks the highest-precedence Role matching the user's group claim.
+  - `IAMSOIDCAuthenticationBackend` (subclass of `mozilla_django_oidc.auth.OIDCAuthenticationBackend`) with:
+    - `create_user(claims)` — JIT provisions a fresh User + UserProfile, role from group mapping or `IAMS_SSO_DEFAULT_ROLE` (auto-creates "Viewer" if absent), unusable password (never lets SSO users password-log-in).
+    - `update_user(user, claims)` — re-syncs role from group claim on every sign-in, stamps `last_login_at` / `last_activity_at`.
+    - `filter_users_by_claims(claims)` — matches by `preferred_username` → `email` (case-insensitive).
+- **3 new SSO endpoints**:
+  - `GET /api/auth/sso/config/` — public discovery; FE login page reads this to decide whether to show the SSO button.
+  - `GET /api/auth/sso/login/?return_to=…` — server-side 302 to Keycloak with PKCE state in the session.
+  - `GET /api/auth/sso/callback/` — exchanges the auth code, runs `IAMSOIDCAuthenticationBackend.authenticate()`, mints a SimpleJWT pair, and redirects the browser to `${FE}/login/sso/callback#access=…&refresh=…&return_to=…`. Audit-log captures `sso_login`.
+- **Admin REST surface** for the group→role mapping table at `/api/sso/group-role-maps/`:
+  - Read: `manage_roles` (so role admins can see what's wired).
+  - Write: `manage_settings` (changing a mapping effectively grants/revokes access on the next SSO sign-in).
+- **Settings & auth backend chain**:
+  - `AUTHENTICATION_BACKENDS = ["iams.sso.IAMSOIDCAuthenticationBackend", "django.contrib.auth.backends.ModelBackend"]`. Password login keeps working (additive, not exclusive).
+  - 9 new env-driven settings: `IAMS_SSO_ENABLED`, `IAMS_SSO_PROVIDER_NAME`, `IAMS_SSO_DEFAULT_ROLE`, `IAMS_SSO_TRUSTS_IDP_MFA`, plus the standard `OIDC_*` block.
+- **20 new tests** in `iams/tests/test_sso.py` — discovery (disabled by default / enabled-when-configured / endpoints-must-be-set / config endpoint shape), login redirect (503 when disabled / 302 with correct query string when enabled), callback (503 / missing code / state mismatch), `resolve_role_from_groups` (no match / precedence / inactive filter), JIT provisioning (default role / group-driven role / re-sync on subsequent login / case-insensitive email match), admin REST surface (RBAC + create-with-payload), password coexistence with SSO enabled.
+
+### Dependencies
+- Added: `mozilla-django-oidc` 5.0+ as the OIDC client. `mozilla_django_oidc` added to `INSTALLED_APPS`.
+
+### Notes
+- **Backend tests: 606 passing** (was 586; added 20).
+- SSO is **opt-in** at runtime: `IAMS_SSO_ENABLED=False` (default) keeps every SSO endpoint returning 503 and the login page falls back to password login.
+- The OIDC backend writes an unusable password on JIT-provisioned users so they can't be password-authed even if `IAMS_SSO_ENABLED` is later turned off — they must be re-authenticated via SSO or have a password set by an admin.
+- We mint our own SimpleJWT tokens after a successful OIDC code exchange instead of trusting Keycloak's access token end-to-end. The downstream API path stays unchanged (same JWT auth, same throttling, same refresh).
+
 ## [0.19.0] — Phase 5 Track 4: CI/CD (2026-05-13)
 
 ### Added (repo-root)

@@ -36,6 +36,9 @@ from iams.views import (
     PasswordResetConfirmView,
     PasswordResetRequestView,
     ReadinessView,
+    SSOCallbackView,
+    SSOConfigView,
+    SSOLoginView,
     ThrottledTokenObtainPairView,
 )
 
@@ -94,6 +97,10 @@ urlpatterns = [
         AccountUnlockView.as_view(),
         name="auth_account_unlock",
     ),
+    # SSO (Phase 6 Track 1)
+    path("api/auth/sso/config/", SSOConfigView.as_view(), name="auth_sso_config"),
+    path("api/auth/sso/login/", SSOLoginView.as_view(), name="auth_sso_login"),
+    path("api/auth/sso/callback/", SSOCallbackView.as_view(), name="auth_sso_callback"),
     # Resource endpoints
     path("api/", include("iams.urls")),
 ]

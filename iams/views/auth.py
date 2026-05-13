@@ -544,6 +544,147 @@ class MFABackupCodesRegenerateView(APIView):
         return Response({"codes": codes}, status=status.HTTP_201_CREATED)
 
 
+# ──────────────────────────────────────────────────────────────────────
+# Phase 6 Track 1 — Keycloak SSO endpoints
+# ──────────────────────────────────────────────────────────────────────
+class SSOConfigView(APIView):
+    """Public endpoint that the FE login page queries on mount.
+
+    Returns ``{enabled, providerName, loginUrl}``. Used to decide
+    whether to show the "Sign in with corporate account" button.
+    """
+    permission_classes = [AllowAny]
+    authentication_classes: list = []
+
+    @extend_schema(
+        operation_id="auth_sso_config",
+        tags=["auth"],
+        responses={200: OpenApiResponse(description="SSO config payload")},
+        summary="Get SSO configuration for the login UI",
+    )
+    def get(self, request):
+        from iams.sso import sso_config_payload
+        return Response(sso_config_payload())
+
+
+class SSOLoginView(APIView):
+    """Server-side 302 → Keycloak authorization endpoint.
+
+    The browser hits ``/api/auth/sso/login/?return_to=/dashboard`` and
+    we redirect to Keycloak with the ``state`` containing the
+    return-to path. After the user authenticates, Keycloak posts back
+    to ``SSOCallbackView``.
+    """
+    permission_classes = [AllowAny]
+    authentication_classes: list = []
+
+    @extend_schema(
+        operation_id="auth_sso_login",
+        tags=["auth"],
+        responses={
+            302: OpenApiResponse(description="Redirect to IdP"),
+            503: OpenApiResponse(description="SSO disabled"),
+        },
+        summary="Begin an SSO login flow",
+    )
+    def get(self, request):
+        from django.http import HttpResponseRedirect
+        from secrets import token_urlsafe
+
+        from iams.sso import build_sso_redirect_url, sso_enabled
+
+        if not sso_enabled():
+            return Response(
+                {"detail": "SSO is not enabled.", "code": "sso_disabled"},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        state = token_urlsafe(32)
+        return_to = request.query_params.get("return_to", "/")
+        request.session["sso_state"] = state
+        request.session["sso_return_to"] = return_to
+        # Build the callback URL with the current host so dev and prod
+        # both work without hard-coding the origin.
+        callback = request.build_absolute_uri("/api/auth/sso/callback/")
+        return HttpResponseRedirect(
+            build_sso_redirect_url(redirect_uri=callback, state=state)
+        )
+
+
+class SSOCallbackView(APIView):
+    """IdP callback — completes the OIDC code exchange and mints JWTs.
+
+    Keycloak redirects here with ``?code=…&state=…``. We delegate the
+    code-exchange + user-resolution to mozilla-django-oidc's backend,
+    then mint a SimpleJWT access/refresh pair and redirect the browser
+    to the FE with the tokens in the fragment (so they don't appear
+    in server access logs).
+    """
+    permission_classes = [AllowAny]
+    authentication_classes: list = []
+
+    @extend_schema(
+        operation_id="auth_sso_callback",
+        tags=["auth"],
+        responses={
+            302: OpenApiResponse(description="Redirect back to FE with tokens"),
+            400: OpenApiResponse(description="Bad state / code"),
+            503: OpenApiResponse(description="SSO disabled"),
+        },
+        summary="OIDC callback — exchange code, mint JWTs, redirect to FE",
+    )
+    def get(self, request):
+        from django.http import HttpResponseRedirect
+        from urllib.parse import urlencode
+
+        from iams.sso import (
+            IAMSOIDCAuthenticationBackend,
+            mint_jwt_pair,
+            sso_enabled,
+        )
+
+        if not sso_enabled():
+            return Response(
+                {"detail": "SSO is not enabled.", "code": "sso_disabled"},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+        code = request.query_params.get("code")
+        state = request.query_params.get("state")
+        if not code or not state:
+            return Response(
+                {"detail": "Missing code/state.", "code": "sso_invalid"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if state != request.session.get("sso_state"):
+            return Response(
+                {"detail": "State mismatch.", "code": "sso_state_mismatch"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        backend = IAMSOIDCAuthenticationBackend()
+        user = backend.authenticate(request=request, code=code)
+        if user is None:
+            return Response(
+                {"detail": "SSO authentication failed.", "code": "sso_failed"},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+
+        tokens = mint_jwt_pair(user)
+        record_audit_event(
+            action="sso_login",
+            actor=user, target=user,
+            details={"provider": "keycloak"},
+            request=request,
+        )
+        # Send the browser back to the FE with the tokens in the URL
+        # fragment so they're not in server access logs / referrer.
+        return_to = request.session.pop("sso_return_to", "/")
+        request.session.pop("sso_state", None)
+        fe_url = _frontend_base_url(request)
+        params = urlencode({"access": tokens["access"], "refresh": tokens["refresh"]})
+        return HttpResponseRedirect(f"{fe_url}/login/sso/callback#{params}&return_to={return_to}")
+
+
 class PasswordResetConfirmView(APIView):
     """Complete a password reset with a valid uid+token pair."""
 

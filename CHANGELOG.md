@@ -2,6 +2,39 @@
 
 All notable changes to the IAMS Django REST API backend.
 
+## [0.19.0] — Phase 5 Track 4: CI/CD (2026-05-13)
+
+### Added (repo-root)
+- **`.github/workflows/ci.yml`** rewritten — three parallel jobs:
+  - `backend`: `uv sync` → ruff (soft) → `makemigrations --check --dry-run` (fails on missing migrations) → pytest with coverage → coverage artifact.
+  - `frontend`: `npm ci` → `tsc --noEmit` → lint (soft) → `npm run build` → dist artifact.
+  - `contract`: exports the OpenAPI schema via `manage.py spectacular` and uploads it as an artifact.
+  - `concurrency: cancel-in-progress` on the same branch — CI cost discipline.
+- **`.github/workflows/release.yml`** — image build + Trivy scan + blue-green deploy pipeline:
+  - Builds backend + frontend images, tags with `sha-{12-char-sha}` or the git tag.
+  - Pushes to the configured registry (defaults to `harbor.iams.internal`).
+  - Trivy scans both images for `CRITICAL,HIGH` vulns; fails the build on findings (`ignore-unfixed: true`).
+  - Auto-deploys to staging on `main` pushes; manual or tag-driven promotion to production via the protected `production` environment.
+- **`docker-compose.yml`** — full-stack topology with `blue` / `green` profiles for backend + frontend, plus shared Postgres, pgbouncer, Redis, MinIO, ClamAV, Celery worker + beat, and nginx. Health-checks on every long-lived service.
+- **`iams-frontend/Dockerfile`** + **`iams-frontend/nginx.conf`** + **`iams-frontend/.dockerignore`** — multi-stage build (Vite → `nginx:alpine`); SPA-friendly history routing; aggressive caching on hashed `/assets/` (`max-age=1y, immutable`); short cache on favicons / robots; no-cache on `index.html`; container-internal `/healthz`.
+- **`deploy/blue_green.sh`** — atomic blue-green orchestration:
+  1. Reads the current live color (`/opt/iams/current-color`).
+  2. Pulls images + runs `manage.py migrate` inside the **new** color's container *before* the swap (a broken migration aborts the deploy with the old color still live).
+  3. Waits up to `HEALTH_TIMEOUT_S` for `/ready/` on the new color.
+  4. Swaps the nginx upstream symlink + `nginx -s reload`.
+  5. 30s drain grace before stopping the old color. Idempotent; safe to re-run.
+- **`deploy/smoke_test.sh`** — post-deploy curl-based check (`/health/`, `/ready/`, `/metrics`, `/api/schema/`, FE `/`, `/api/audits/` returns 401). Fails the deploy if any check is wrong.
+- **`deploy/nginx/`** — `iams.conf` (TLS-terminating reverse proxy) + `upstream-blue.conf` / `upstream-green.conf` (one-symlink-flip color swap).
+- **`deploy/backup.sh`** — nightly `pg_dump` (custom format) + MinIO `mc mirror`, encrypted with `age` (multi-recipient), shipped via `restic` to NAS + optional offsite repo. Retention: 7 daily / 4 weekly / 12 monthly. Verifies dump readability before encrypting.
+- **`deploy/restore.sh`** — counterpart for the quarterly restore drill: `restic restore` → `age -d` → `pg_restore` into a target DB URL.
+- **`MIGRATION-CHECKLIST.md`** at repo root — the N-1 rule, safe patterns for adding NOT NULL columns, renaming columns, concurrent index creation, deleting models, data migrations with `reverse_code`, partial unique constraints, and the rollback procedure. CI's `makemigrations --check` is the auto-gate; this checklist is the rest.
+
+### Notes
+- **Backend tests: 586 passing** (Track 4 is process/infra, no new tests).
+- Test count, model count, and migration count are unchanged from Track 3 (this track only adds CI / deploy / docker / docs).
+- The deploy pipeline is **fail-closed**: a broken migration, failing Trivy scan, failing `/ready/` health check, or failing smoke test all leave the old color serving production traffic. No "fail forward" automation — operator decides whether to roll forward or back.
+- Registry push (and therefore staging/prod deploy) is gated on `secrets.REGISTRY_USERNAME` being set. PRs build images locally for scanning but don't push, so forks can run the full pipeline without credentials.
+
 ## [0.18.0] — Phase 5 Track 3: Observability (2026-05-13)
 
 ### Added

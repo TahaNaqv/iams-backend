@@ -240,7 +240,7 @@ REST_FRAMEWORK = {
         "auth_burst": "10/minute",
     },
     "DEFAULT_PAGINATION_CLASS": "iams.pagination.DefaultPagination",
-    "PAGE_SIZE": 100,
+    "PAGE_SIZE": 25,
     "DEFAULT_FILTER_BACKENDS": [
         "django_filters.rest_framework.DjangoFilterBackend",
         "rest_framework.filters.SearchFilter",

@@ -2,6 +2,35 @@
 
 All notable changes to the IAMS Django REST API backend.
 
+## [0.17.0] — Phase 5 Track 2: Performance & Scale (2026-05-13)
+
+### Changed
+- **Default page size dropped 100 → 25** (NFR-Performance, p95 < 500ms target). `DefaultPagination.page_size = 25`, `max_page_size = 200` (cap unchanged). Endpoints that need denser views pass `?page_size=…` up to 200.
+
+### Added
+- **Composite indexes on hot dashboard / overdue-scan paths** ([migration 0019](iams/migrations/0019_perf_indexes_phase5.py)):
+  - `Audit`: `(department, status)`, `(start_date)`, `(lead_auditor)`
+  - `Finding`: `(department, status)`, `(owner, status, due_date)`, `(severity, status)`, `(created_date)`
+  - `CorrectiveAction`: `(department, status)`, `(owner, status, due_date)`, `(finding, status)`
+- **N+1 fixes on the two GenericForeignKey-using endpoints**:
+  - `NotificationViewSet` now `select_related("target_content_type")` — the FE bell polls this every 60s and the `get_targetType` serializer method previously fired a ContentType lookup per row.
+  - `AuditLogViewSet` same fix.
+- **Query-budget regression tests** in `iams/tests/test_performance.py` (9 tests) using Django's `CaptureQueriesContext`:
+  - Pagination defaults + envelope shape + max_page_size cap.
+  - List endpoints (notifications, audit-log, findings, CAPs, audits) all bounded ≤ 12 queries on 20-50 row pages.
+  - Dashboard KPIs bounded on first call + verified cache cuts second-call budget to ≤ 8.
+- **Locust load-test scenario** at `loadtests/locustfile.py` — 11 weighted tasks mirroring the FE polling pattern (dashboard KPIs + notifications bell at weight 10, list endpoints at 4-6, less-frequent surfaces lower). README documents target (`500 concurrent users, p95 < 500ms`), how to seed a load-test user, and how to interpret reports.
+
+### Dependencies
+- Added: `nplusone` (available for future runtime detection; tests use Django's built-in `CaptureQueriesContext` instead — clearer failure messages).
+- Already present: `locust` 2.x.
+
+### Notes
+- **Backend tests: 573 passing** (was 564; added 9).
+- Indexes are all additive — migration 0019 is forward-only with no data movement.
+- The query budgets in `test_performance.py` deliberately have ≈2x slack on the current numbers. They flag N+1 regressions (one new per-row query in a 50-row list explodes the budget) but tolerate harmless changes (an extra auth query, a session-touch UPDATE).
+- pgbouncer sidecar + nginx static-asset cache tuning are operator-side; the IAMS app side of Track 2 is complete.
+
 ## [0.16.0] — Phase 5 Track 1: Security Hardening (2026-05-13)
 
 ### Added

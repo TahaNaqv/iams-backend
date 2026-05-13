@@ -319,7 +319,11 @@ class NotificationViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        qs = Notification.objects.all()
+        # Phase 5 Track 2 — ``select_related("target_content_type")``
+        # avoids the N+1 that ``get_targetType`` would otherwise trigger
+        # for every notification in a page (the FE bell polls this
+        # endpoint at 60s, so the saving compounds).
+        qs = Notification.objects.select_related("target_content_type").all()
         user = self.request.user
         if user and user.is_authenticated:
             qs = qs.filter(Q(recipient=user) | Q(recipient__isnull=True))
@@ -405,7 +409,9 @@ class NotificationPreferenceViewSet(viewsets.ModelViewSet):
 
 
 class AuditLogViewSet(viewsets.ReadOnlyModelViewSet):
-    queryset = AuditLogEntry.objects.all()
+    # Phase 5 Track 2 — ``select_related("target_content_type")`` removes
+    # the per-row ContentType lookup that ``get_targetType`` triggers.
+    queryset = AuditLogEntry.objects.select_related("target_content_type").all()
     serializer_class = AuditLogEntrySerializer
     permission_classes = [HasPermission("view_reports")]
 

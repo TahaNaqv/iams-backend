@@ -129,7 +129,14 @@ class Audit(TimeStampedModel):
 
     class Meta:
         ordering = ["-start_date", "title"]
-        indexes = [models.Index(fields=["status", "start_date"])]
+        indexes = [
+            models.Index(fields=["status", "start_date"]),
+            # Phase 5 Track 2 — dashboards.upcoming_audits filters
+            # ``start_date >= today`` + optional department.
+            models.Index(fields=["department", "status"]),
+            models.Index(fields=["start_date"]),
+            models.Index(fields=["lead_auditor"]),
+        ]
 
     def __str__(self):
         return self.title
@@ -160,7 +167,15 @@ class Finding(TimeStampedModel):
 
     class Meta:
         ordering = ["-due_date", "title"]
-        indexes = [models.Index(fields=["status", "due_date"])]
+        indexes = [
+            models.Index(fields=["status", "due_date"]),
+            # Phase 5 Track 2 — dashboards filter by (department, status)
+            # and the auditor role bundle hits (owner, status, due_date).
+            models.Index(fields=["department", "status"]),
+            models.Index(fields=["owner", "status", "due_date"]),
+            models.Index(fields=["severity", "status"]),
+            models.Index(fields=["created_date"]),
+        ]
 
     def __str__(self):
         return self.title
@@ -189,7 +204,13 @@ class CorrectiveAction(TimeStampedModel):
 
     class Meta:
         ordering = ["-due_date", "title"]
-        indexes = [models.Index(fields=["status", "due_date"])]
+        indexes = [
+            models.Index(fields=["status", "due_date"]),
+            # Phase 5 Track 2 — CAP-overdue scan + auditee role bundle.
+            models.Index(fields=["department", "status"]),
+            models.Index(fields=["owner", "status", "due_date"]),
+            models.Index(fields=["finding", "status"]),
+        ]
 
     def __str__(self):
         return self.title

@@ -2,6 +2,20 @@
 
 All notable changes to the IAMS Django REST API backend.
 
+## [0.23.0] — Phase 6 Track 4: Documentation (2026-05-13)
+
+### Added (repo-root)
+- **`README.md`** — root entry point with quick links to every other doc, phase reports, run-local commands.
+- **`docs/admin-guide.md`** — operator runbook covering architecture, the full env-var matrix (across all 22 settings the project has accumulated), initial deployment, day-2 operations, Keycloak SSO setup, ERP / HR integration wiring, backup + restore, monitoring + alerting, and troubleshooting.
+- **`docs/user-guide.md`** — end-user documentation by role: auditors, audit managers, auditees, executives / audit committee. Covers MFA enrollment, working papers, CAP response, CSA, language switching.
+- **`docs/api-reference.md`** — narrative API docs that complement the auto-generated OpenAPI schema: conventions (camelCase JSON), auth flow, pagination envelope, the curated error-code taxonomy, every domain endpoint group with a one-paragraph orientation, rate limiting, and how to generate typed clients via `openapi-typescript` / `openapi-generator`.
+- **`docs/training-scripts/`** — five video scripts (`01-intro`, `02-auditor`, `03-manager`, `04-auditee`, `05-admin`) structured as time/narration/on-screen tables so a producer can record straight through.
+
+### Notes
+- No code changes this track. Backend tests unchanged at **637 passing**.
+- The docs deliberately point back into the per-phase reports in `docs/phase-N-track-M-report.md` for the design rationale; the guides are the *how*, the reports are the *why*.
+- Project status: **Phase 6 closed out. Production-shippable.** Ongoing work is operational.
+
 ## [0.22.0] — Phase 6 Track 3: i18n preference (2026-05-13)
 
 ### Added

@@ -18,8 +18,11 @@ services:
   db:
     image: postgres:16-alpine
     restart: unless-stopped
-    ports:
-      - "5433:5432"
+    # No host port binding — the app reaches Postgres at ``db:5432`` via
+    # the docker network. For ad-hoc psql from the host, SSH-tunnel or
+    # use ``docker compose exec db psql``.
+    expose:
+      - "5432"
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-iams_db}
       POSTGRES_USER: ${POSTGRES_USER:-iams_user}
@@ -35,8 +38,11 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
-    ports:
-      - "6379:6379"
+    # Pure-internal — backend reaches it at ``redis:6379`` via the
+    # docker network. Removing the host binding lets us share a VPS
+    # with other projects that already own host port 6379.
+    expose:
+      - "6379"
     command: ["redis-server", "--appendonly", "yes", "--save", "60", "1"]
     volumes:
       - redis_data:/data
@@ -49,9 +55,12 @@ services:
   minio:
     image: minio/minio:latest
     restart: unless-stopped
+    # S3 API stays internal-only; console binds to 127.0.0.1 so an
+    # operator can SSH-tunnel into it without exposing on the public IP.
+    expose:
+      - "9000"
     ports:
-      - "9000:9000"   # S3 API
-      - "9001:9001"   # console
+      - "127.0.0.1:9001:9001"   # console — tunnel: ssh -L 9001:127.0.0.1:9001
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
@@ -86,9 +95,11 @@ services:
   mailhog:
     image: mailhog/mailhog:latest
     restart: unless-stopped
+    # SMTP stays internal; UI binds to 127.0.0.1 only (tunnel to view).
+    expose:
+      - "1025"
     ports:
-      - "1025:1025"   # SMTP
-      - "8025:8025"   # web UI
+      - "127.0.0.1:8025:8025"   # UI — tunnel: ssh -L 8025:127.0.0.1:8025
 
   clamav:
     # Self-hosted ClamAV daemon for AV scanning of uploaded evidence.
@@ -97,8 +108,9 @@ services:
     # requests, so dependent services wait correctly.
     image: clamav/clamav:stable
     restart: unless-stopped
-    ports:
-      - "3310:3310"
+    # Pure-internal — worker calls clamd at ``clamav:3310``.
+    expose:
+      - "3310"
     environment:
       CLAMAV_NO_FRESHCLAMD: "false"
     volumes:
@@ -181,7 +193,7 @@ services:
     image: iams-backend:dev
     restart: unless-stopped
     ports:
-      - "5555:5555"
+      - "127.0.0.1:5555:5555"   # tunnel: ssh -L 5555:127.0.0.1:5555
     env_file:
       - .env
     environment:

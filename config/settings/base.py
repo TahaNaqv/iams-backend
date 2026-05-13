@@ -73,6 +73,7 @@ INSTALLED_APPS = DJANGO_APPS + THIRD_PARTY_APPS + LOCAL_APPS
 MIDDLEWARE = [
     "django_prometheus.middleware.PrometheusBeforeMiddleware",
     "django.middleware.security.SecurityMiddleware",
+    "iams.middleware.SecurityHeadersMiddleware",
     "whitenoise.middleware.WhiteNoiseMiddleware",
     "iams.middleware.RequestIdMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
@@ -80,6 +81,7 @@ MIDDLEWARE = [
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
+    "iams.middleware.SessionActivityMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
     "django_prometheus.middleware.PrometheusAfterMiddleware",
@@ -148,7 +150,26 @@ AUTH_PASSWORD_VALIDATORS = [
     },
     {"NAME": "django.contrib.auth.password_validation.CommonPasswordValidator"},
     {"NAME": "django.contrib.auth.password_validation.NumericPasswordValidator"},
+    # Phase 5 — reject reuse of the last N passwords. N is tunable via
+    # ``IAMS_PASSWORD_HISTORY_N``; default 5.
+    {"NAME": "iams.security.PasswordHistoryValidator"},
 ]
+
+# ──────────────────────────────────────────────────────────────────────
+# Phase 5 Track 1 — Security tunables
+# ──────────────────────────────────────────────────────────────────────
+IAMS_LOGIN_FAIL_THRESHOLD = env.int("IAMS_LOGIN_FAIL_THRESHOLD", default=5)
+IAMS_LOGIN_LOCKOUT_MINUTES = env.int("IAMS_LOGIN_LOCKOUT_MINUTES", default=15)
+IAMS_LOGIN_FAIL_WINDOW_MIN = env.int("IAMS_LOGIN_FAIL_WINDOW_MIN", default=15)
+IAMS_PASSWORD_HISTORY_N = env.int("IAMS_PASSWORD_HISTORY_N", default=5)
+IAMS_MFA_GRACE_DAYS = env.int("IAMS_MFA_GRACE_DAYS", default=30)
+IAMS_MFA_TOTP_ISSUER = env("IAMS_MFA_TOTP_ISSUER", default="IAMS")
+# Session inactivity timeout — refresh tokens are auto-blacklisted on
+# ``last_activity_at`` exceeding this many minutes (enforced by the
+# token-refresh view).
+IAMS_SESSION_INACTIVITY_MINUTES = env.int(
+    "IAMS_SESSION_INACTIVITY_MINUTES", default=60
+)
 
 # ──────────────────────────────────────────────────────────────────────
 # Internationalization

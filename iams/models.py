@@ -24,6 +24,12 @@ class Role(models.Model):
     name = models.CharField(max_length=100, unique=True)
     description = models.TextField(blank=True)
     is_super_admin = models.BooleanField(default=False)
+    # Phase 5 — per-role MFA enforcement. When True, users with this role
+    # MUST have a confirmed MFADevice before they can complete login.
+    mfa_required = models.BooleanField(
+        default=False,
+        help_text="Force MFA enrollment for every user with this role.",
+    )
     permissions = models.ManyToManyField(Permission, related_name="roles", blank=True)
 
     class Meta:
@@ -54,6 +60,15 @@ class UserProfile(models.Model):
     )
     department = models.CharField(max_length=200, blank=True)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="Active")
+    # Phase 5 — set whenever the password is changed; the MFA grace
+    # period (30 days from account creation OR last password change)
+    # uses this to decide whether to enforce MFA setup.
+    password_changed_at = models.DateTimeField(null=True, blank=True)
+    # Phase 5 — last successful login + last activity. Driven by the
+    # login flow and the SessionTouchMiddleware. Used by the session
+    # timeout policy and the admin "stale account" report.
+    last_login_at = models.DateTimeField(null=True, blank=True)
+    last_activity_at = models.DateTimeField(null=True, blank=True)
 
     def __str__(self):
         return f"{self.user.email} - {self.role.name if self.role else 'No role'}"
@@ -2128,3 +2143,207 @@ class ReportJob(TimeStampedModel):
             models.Index(fields=["requested_by", "-created_at"]),
             models.Index(fields=["kind", "status", "-created_at"]),
         ]
+
+
+# ═════════════════════════════════════════════════════════════════════
+# Phase 5 Track 1 — Security
+#
+# Login attempts, account lockouts, password history (no reuse of the
+# last 5), and per-user TOTP devices. All on-prem; no SMS gateway.
+# ═════════════════════════════════════════════════════════════════════
+class LoginAttempt(TimeStampedModel):
+    """Append-only ledger of every authentication attempt (FR-UAM-07).
+
+    Records *every* login attempt — successful or not — with the request
+    metadata we have at hand. ``username`` is stored even on failure so
+    forensic queries can group attempts against a target account even
+    when the user doesn't exist.
+    """
+
+    OUTCOME_SUCCESS = "success"
+    OUTCOME_INVALID_CREDENTIALS = "invalid_credentials"
+    OUTCOME_USER_NOT_FOUND = "user_not_found"
+    OUTCOME_USER_INACTIVE = "user_inactive"
+    OUTCOME_ACCOUNT_LOCKED = "account_locked"
+    OUTCOME_MFA_REQUIRED = "mfa_required"
+    OUTCOME_MFA_FAILED = "mfa_failed"
+    OUTCOME_THROTTLED = "throttled"
+
+    OUTCOME_CHOICES = [
+        (OUTCOME_SUCCESS, "Success"),
+        (OUTCOME_INVALID_CREDENTIALS, "Invalid credentials"),
+        (OUTCOME_USER_NOT_FOUND, "User not found"),
+        (OUTCOME_USER_INACTIVE, "User inactive"),
+        (OUTCOME_ACCOUNT_LOCKED, "Account locked"),
+        (OUTCOME_MFA_REQUIRED, "MFA required"),
+        (OUTCOME_MFA_FAILED, "MFA failed"),
+        (OUTCOME_THROTTLED, "Throttled"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    username = models.CharField(max_length=255, db_index=True)
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name="login_attempts",
+    )
+    outcome = models.CharField(max_length=40, choices=OUTCOME_CHOICES, db_index=True)
+    ip_address = models.GenericIPAddressField(null=True, blank=True)
+    user_agent = models.CharField(max_length=512, blank=True)
+    request_id = models.CharField(max_length=64, blank=True, db_index=True)
+    timestamp = models.DateTimeField(auto_now_add=True, db_index=True)
+    details = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        ordering = ["-timestamp"]
+        indexes = [
+            models.Index(fields=["username", "-timestamp"]),
+            models.Index(fields=["outcome", "-timestamp"]),
+            models.Index(fields=["ip_address", "-timestamp"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.username} {self.outcome} @ {self.timestamp:%Y-%m-%d %H:%M}"
+
+
+class AccountLockout(TimeStampedModel):
+    """An active lockout — present when an account is locked out (FR-UAM-04).
+
+    We use one *row per lockout window* rather than a boolean on
+    UserProfile so that:
+      - the history of lockouts is auditable (forensic queries),
+      - admin unlock just closes the row by setting ``cleared_at``,
+      - the lockout window is bounded by ``locked_until`` for auto-clear.
+    """
+
+    REASON_FAILED_ATTEMPTS = "failed_attempts"
+    REASON_ADMIN = "admin_action"
+    REASON_SUSPECTED_COMPROMISE = "suspected_compromise"
+    REASON_CHOICES = [
+        (REASON_FAILED_ATTEMPTS, "Failed attempt threshold"),
+        (REASON_ADMIN, "Administrative action"),
+        (REASON_SUSPECTED_COMPROMISE, "Suspected compromise"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="lockouts",
+    )
+    reason = models.CharField(max_length=40, choices=REASON_CHOICES, default=REASON_FAILED_ATTEMPTS)
+    locked_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    locked_until = models.DateTimeField(null=True, blank=True, db_index=True)
+    cleared_at = models.DateTimeField(null=True, blank=True)
+    cleared_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name="lockouts_cleared",
+    )
+    failed_attempt_count = models.PositiveIntegerField(default=0)
+    note = models.TextField(blank=True)
+
+    class Meta:
+        ordering = ["-locked_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["user"],
+                condition=models.Q(cleared_at__isnull=True),
+                name="iams_account_lockout_one_active",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["user", "-locked_at"]),
+        ]
+
+    def is_active(self) -> bool:
+        from django.utils import timezone
+        if self.cleared_at is not None:
+            return False
+        if self.locked_until and self.locked_until <= timezone.now():
+            return False
+        return True
+
+    def __str__(self) -> str:
+        active = "active" if self.is_active() else "cleared"
+        return f"Lockout({self.user_id}, {self.reason}, {active})"
+
+
+class PasswordHistory(TimeStampedModel):
+    """Hashed history of past passwords for reuse prevention (FR-UAM-04).
+
+    We keep the last N (default 5) hashes so the validator can reject a
+    new password if it matches any of them via Django's password hasher
+    ``check_password`` semantics.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="password_history",
+    )
+    password_hash = models.CharField(max_length=255)
+    set_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        ordering = ["-set_at"]
+        indexes = [
+            models.Index(fields=["user", "-set_at"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"PWHist({self.user_id}, {self.set_at:%Y-%m-%d})"
+
+
+class MFADevice(TimeStampedModel):
+    """A second-factor device registered for a user.
+
+    For Phase 5 Track 1 we ship TOTP only (RFC 6238). The shared secret
+    is stored encrypted-at-rest if ``SECRET_KEY`` is the standard
+    Django key (Fernet wraps it transparently); other device kinds
+    (WebAuthn, push) are reserved for future expansion.
+
+    A user may have multiple devices — primary + backup codes are
+    modeled as separate rows. ``confirmed=True`` only after the user
+    has demonstrated possession by entering a valid token once.
+    """
+
+    KIND_TOTP = "totp"
+    KIND_BACKUP_CODES = "backup_codes"
+    KIND_CHOICES = [
+        (KIND_TOTP, "TOTP authenticator"),
+        (KIND_BACKUP_CODES, "Backup codes"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="mfa_devices",
+    )
+    kind = models.CharField(max_length=20, choices=KIND_CHOICES, default=KIND_TOTP)
+    name = models.CharField(max_length=100, blank=True, help_text="User-facing label.")
+    secret = models.CharField(max_length=255, help_text="Base32-encoded TOTP secret OR Fernet-encrypted backup-code JSON.")
+    confirmed = models.BooleanField(default=False, db_index=True)
+    last_used_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        constraints = [
+            # Exactly one confirmed TOTP device per user. Backup codes
+            # are exempt — multiple rows are allowed.
+            models.UniqueConstraint(
+                fields=["user", "kind"],
+                condition=models.Q(kind="totp", confirmed=True),
+                name="iams_mfa_device_one_confirmed_totp",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["user", "kind", "confirmed"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"MFA({self.user_id}, {self.kind}, confirmed={self.confirmed})"

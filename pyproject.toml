@@ -12,56 +12,43 @@ dependencies = [
     "djangorestframework-camel-case>=1.4.2",
     "django-filter>=25.2",
     "django-cors-headers>=4.9.0",
-
     # Configuration
     "django-environ>=0.12.0",
-
     # API documentation
     "drf-spectacular>=0.28.0",
     "drf-spectacular-sidecar>=2025.10.1",
-
     # Database & caching
     "psycopg2-binary>=2.9.11",
     "redis>=5.2.1",
     "django-redis>=5.4.0",
-
     # Object storage (MinIO via S3 protocol)
     "django-storages[boto3]>=1.14.6",
-
     # Async task queue
     "celery[redis]>=5.4.0",
     "django-celery-beat>=2.7.0",
     "django-celery-results>=2.5.1",
     "flower>=2.0.1",
-
     # Email
     "django-anymail[sendgrid]>=12.0",
-
     # WSGI/ASGI server
     "gunicorn>=23.0.0",
     "uvicorn[standard]>=0.32.1",
     "whitenoise>=6.8.2",
-
     # Security & MFA (used in Phase 5; declared now to lock versions)
     "django-otp>=1.5.4",
     "django-two-factor-auth>=1.17.0",
     "django-csp>=3.8",
     "django-axes>=7.0.2",
-
     # SSO (OIDC — used in Phase 6)
     "mozilla-django-oidc>=4.0.1",
-
     # Secrets management
     "hvac>=2.3.0",
-
     # PDF / report generation
     "weasyprint>=63.1",
     "openpyxl>=3.1.5",
     "jinja2>=3.1.4",
-
     # Document text extraction (used in Phase 3 working papers)
     "python-magic>=0.4.27",
-
     # Observability
     "sentry-sdk[django]>=2.19.2",
     "django-prometheus>=2.3.1",
@@ -71,14 +58,14 @@ dependencies = [
     "opentelemetry-instrumentation-psycopg2>=0.50b0",
     "opentelemetry-instrumentation-celery>=0.50b0",
     "opentelemetry-exporter-otlp>=1.29.0",
-
     # Antivirus on uploads via ClamAV daemon (see docker-compose clamav service).
     # ``clamd`` is the pure-Python protocol client; the daemon itself runs as a
     # separate container in production.
     "clamd>=1.0.2",
-
     # Utilities
     "python-dateutil>=2.9.0",
+    "pyotp>=2.9.0",
+    "qrcode>=8.2",
 ]
 
 [dependency-groups]

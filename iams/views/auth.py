@@ -87,10 +87,229 @@ class MeView(APIView):
 
 
 class ThrottledTokenObtainPairView(TokenObtainPairView):
-    """JWT login with per-scope throttling to slow brute-force attempts."""
+    """JWT login with throttling, lockout enforcement, MFA gating, and
+    attempt logging (FR-UAM-04, FR-UAM-07).
+
+    The flow:
+
+      1. Throttle (per IP) — slow brute-force attempts.
+      2. Resolve the user by ``username``. Missing user → log
+         ``user_not_found`` and return 401.
+      3. Check for an active lockout — if present, log
+         ``account_locked`` and return 423 with ``locked_until``.
+      4. Check inactive flag — log ``user_inactive``, return 401.
+      5. Validate credentials (delegate to ``TokenObtainPairSerializer``).
+         On failure: ``register_failure`` increments counter and may
+         open a lockout. Return 401 (or 423 if just locked).
+      6. **MFA gate**: if the user must enroll/use MFA and didn't
+         provide a valid ``otp_token`` in the payload, return 401 with
+         ``code=mfa_required`` (FE shows the OTP prompt). If they did
+         and it's valid, proceed.
+      7. Issue tokens, log ``success``, stamp ``last_login_at``.
+    """
 
     throttle_classes = [ScopedRateThrottle]
     throttle_scope = "auth_burst"
+
+    def post(self, request, *args, **kwargs):
+        from django.contrib.auth import get_user_model
+        from iams.models import LoginAttempt, MFADevice
+        from iams.security import (
+            get_active_lockout,
+            mfa_enforcement_required,
+            record_login_attempt,
+            register_failure,
+        )
+        from iams.mfa import verify_totp_token
+
+        User = get_user_model()
+        username = (request.data.get("username") or "").strip()
+        password = request.data.get("password") or ""
+        otp_token = (request.data.get("otp_token") or "").strip()
+
+        if not username or not password:
+            record_login_attempt(
+                username=username, outcome=LoginAttempt.OUTCOME_INVALID_CREDENTIALS,
+                request=request,
+            )
+            return Response(
+                {"detail": "Username and password are required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            user = User.objects.get(username=username)
+        except User.DoesNotExist:
+            record_login_attempt(
+                username=username, outcome=LoginAttempt.OUTCOME_USER_NOT_FOUND,
+                request=request,
+            )
+            return Response(
+                {"detail": "Invalid credentials."},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+
+        active_lock = get_active_lockout(user)
+        if active_lock is not None:
+            record_login_attempt(
+                username=username, user=user,
+                outcome=LoginAttempt.OUTCOME_ACCOUNT_LOCKED, request=request,
+            )
+            return Response(
+                {
+                    "detail": "Account is locked. Contact an administrator.",
+                    "code": "account_locked",
+                    "lockedUntil": (
+                        active_lock.locked_until.isoformat()
+                        if active_lock.locked_until else None
+                    ),
+                },
+                status=423,  # 423 Locked
+            )
+
+        if not user.is_active:
+            record_login_attempt(
+                username=username, user=user,
+                outcome=LoginAttempt.OUTCOME_USER_INACTIVE, request=request,
+            )
+            return Response(
+                {"detail": "Account is inactive."},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+
+        if not user.check_password(password):
+            lock, just_locked = register_failure(user=user, request=request)
+            if just_locked:
+                return Response(
+                    {
+                        "detail": "Account locked due to failed attempts.",
+                        "code": "account_locked",
+                        "lockedUntil": (
+                            lock.locked_until.isoformat()
+                            if lock and lock.locked_until else None
+                        ),
+                    },
+                    status=423,
+                )
+            return Response(
+                {"detail": "Invalid credentials."},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+
+        # MFA gate — two paths:
+        #   - User has a confirmed TOTP device → MUST present otp_token.
+        #   - User has no confirmed device but enrollment is required by
+        #     policy (role / grace expired) → block with mfa_required so
+        #     the FE prompts enrollment.
+        totp = MFADevice.objects.filter(
+            user=user, kind=MFADevice.KIND_TOTP, confirmed=True,
+        ).first()
+        enforce = mfa_enforcement_required(user) or totp is not None
+        if enforce:
+            if totp is None or not otp_token:
+                record_login_attempt(
+                    username=username, user=user,
+                    outcome=LoginAttempt.OUTCOME_MFA_REQUIRED, request=request,
+                    details={"has_confirmed_totp": totp is not None},
+                )
+                return Response(
+                    {
+                        "detail": "MFA token required.",
+                        "code": "mfa_required",
+                        "mfaEnrolled": totp is not None,
+                    },
+                    status=status.HTTP_401_UNAUTHORIZED,
+                )
+            if not verify_totp_token(device=totp, token=otp_token):
+                record_login_attempt(
+                    username=username, user=user,
+                    outcome=LoginAttempt.OUTCOME_MFA_FAILED, request=request,
+                )
+                # Repeated MFA failures count toward lockout too.
+                register_failure(
+                    user=user, request=request,
+                    outcome=LoginAttempt.OUTCOME_MFA_FAILED,
+                )
+                return Response(
+                    {"detail": "Invalid MFA token.", "code": "mfa_invalid"},
+                    status=status.HTTP_401_UNAUTHORIZED,
+                )
+
+        # Credentials + MFA OK — delegate token issuance to simplejwt.
+        response = super().post(request, *args, **kwargs)
+        if response.status_code == 200:
+            from django.utils import timezone
+
+            record_login_attempt(
+                username=username, user=user,
+                outcome=LoginAttempt.OUTCOME_SUCCESS, request=request,
+            )
+            # Stamp profile + bump activity. Skip if user has no profile.
+            from iams.models import UserProfile
+
+            UserProfile.objects.filter(user=user).update(
+                last_login_at=timezone.now(),
+                last_activity_at=timezone.now(),
+            )
+        return response
+
+
+class AccountUnlockView(APIView):
+    """Admin-only: clear an active lockout for a given user.
+
+    POST /api/auth/lockouts/<user_id>/unlock/
+    """
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        operation_id="auth_account_unlock",
+        tags=["auth"],
+        request=None,
+        responses={
+            204: OpenApiResponse(description="Lockout cleared"),
+            404: OpenApiResponse(description="No active lockout"),
+            403: OpenApiResponse(description="Caller lacks manage_users"),
+        },
+        summary="Admin: clear a user's lockout",
+    )
+    def post(self, request, user_id):
+        from django.contrib.auth import get_user_model
+
+        from iams.permissions import HasPermission
+        from iams.security import clear_lockout
+
+        # Permission inline (using HasPermission as a class returns
+        # a permission instance — we want to check now, not via the
+        # framework's gate, because we want to allow super_admin too).
+        perm = HasPermission("manage_users")()
+        if not perm.has_permission(request, self):
+            return Response(
+                {"detail": "Forbidden."}, status=status.HTTP_403_FORBIDDEN
+            )
+
+        User = get_user_model()
+        try:
+            target = User.objects.get(pk=user_id)
+        except User.DoesNotExist:
+            return Response(
+                {"detail": "User not found."}, status=status.HTTP_404_NOT_FOUND
+            )
+        cleared = clear_lockout(
+            user=target, cleared_by=request.user,
+            note=f"Cleared by {request.user.username}",
+        )
+        if not cleared:
+            return Response(
+                {"detail": "No active lockout."}, status=status.HTTP_404_NOT_FOUND
+            )
+        record_audit_event(
+            action="account_unlock",
+            actor=request.user,
+            target=target,
+            details={"by": request.user.username},
+            request=request,
+        )
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class PasswordChangeView(APIView):
@@ -163,6 +382,166 @@ class PasswordResetRequestView(APIView):
                 extra={"email": serializer.validated_data["email"]},
             )
         return Response(status=status.HTTP_202_ACCEPTED)
+
+
+class MFAStatusView(APIView):
+    """GET current user's MFA enrollment state."""
+
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        operation_id="auth_mfa_status",
+        tags=["auth"],
+        summary="Get current user's MFA state",
+        responses={200: OpenApiResponse(description="MFA status snapshot")},
+    )
+    def get(self, request):
+        from iams.mfa import get_mfa_status
+        return Response(get_mfa_status(request.user))
+
+
+class MFATOTPEnrollView(APIView):
+    """POST to begin TOTP enrollment (returns provisioning URI)."""
+
+    permission_classes = [IsAuthenticated]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "auth_burst"
+
+    @extend_schema(
+        operation_id="auth_mfa_totp_enroll",
+        tags=["auth"],
+        request=None,
+        responses={
+            201: OpenApiResponse(description="Enrollment started"),
+            409: OpenApiResponse(description="TOTP already confirmed"),
+        },
+        summary="Start TOTP enrollment",
+    )
+    def post(self, request):
+        from iams.mfa import begin_totp_enrollment
+        from iams.models import MFADevice
+
+        existing = MFADevice.objects.filter(
+            user=request.user, kind=MFADevice.KIND_TOTP, confirmed=True,
+        ).exists()
+        if existing:
+            return Response(
+                {"detail": "TOTP already enrolled; remove the existing device first.",
+                 "code": "totp_already_confirmed"},
+                status=status.HTTP_409_CONFLICT,
+            )
+        device, uri = begin_totp_enrollment(request.user)
+        return Response(
+            {
+                "deviceId": str(device.pk),
+                "provisioningUri": uri,
+                "secret": device.secret,
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class MFATOTPConfirmView(APIView):
+    """POST {token} — confirm TOTP enrollment by validating one token."""
+
+    permission_classes = [IsAuthenticated]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "auth_burst"
+
+    @extend_schema(
+        operation_id="auth_mfa_totp_confirm",
+        tags=["auth"],
+        responses={
+            204: OpenApiResponse(description="Confirmed"),
+            400: OpenApiResponse(description="Invalid token"),
+        },
+        summary="Confirm TOTP enrollment",
+    )
+    def post(self, request):
+        from iams.mfa import confirm_totp_enrollment
+
+        token = (request.data.get("token") or "").strip()
+        if not token:
+            return Response(
+                {"detail": "token is required.",
+                 "code": "token_required"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if not confirm_totp_enrollment(request.user, token):
+            return Response(
+                {"detail": "Invalid token.",
+                 "code": "totp_invalid"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        record_audit_event(
+            action="mfa_totp_confirmed",
+            actor=request.user, target=request.user,
+            request=request,
+        )
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class MFATOTPDisableView(APIView):
+    """POST {password} — disable TOTP (re-verifies password before removal)."""
+
+    permission_classes = [IsAuthenticated]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "auth_burst"
+
+    @extend_schema(
+        operation_id="auth_mfa_totp_disable",
+        tags=["auth"],
+        responses={
+            204: OpenApiResponse(description="Disabled"),
+            400: OpenApiResponse(description="Bad password"),
+        },
+        summary="Disable TOTP",
+    )
+    def post(self, request):
+        from iams.models import MFADevice
+
+        password = request.data.get("password") or ""
+        if not request.user.check_password(password):
+            return Response(
+                {"detail": "Password is incorrect.",
+                 "code": "password_incorrect"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        MFADevice.objects.filter(
+            user=request.user, kind=MFADevice.KIND_TOTP,
+        ).delete()
+        record_audit_event(
+            action="mfa_totp_disabled",
+            actor=request.user, target=request.user,
+            request=request,
+        )
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class MFABackupCodesRegenerateView(APIView):
+    """POST — generate a fresh batch of backup codes (replaces any prior set)."""
+
+    permission_classes = [IsAuthenticated]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "auth_burst"
+
+    @extend_schema(
+        operation_id="auth_mfa_backup_codes_regenerate",
+        tags=["auth"],
+        request=None,
+        responses={201: OpenApiResponse(description="Codes generated (show once)")},
+        summary="Regenerate backup codes",
+    )
+    def post(self, request):
+        from iams.mfa import generate_backup_codes
+
+        codes = generate_backup_codes(request.user)
+        record_audit_event(
+            action="mfa_backup_codes_regenerated",
+            actor=request.user, target=request.user,
+            request=request,
+        )
+        return Response({"codes": codes}, status=status.HTTP_201_CREATED)
 
 
 class PasswordResetConfirmView(APIView):

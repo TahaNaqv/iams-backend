@@ -255,9 +255,12 @@ class PasswordChangeSerializer(serializers.Serializer):
         return value
 
     def save(self) -> User:
+        from iams.security import record_password_change
+
         user = self.context["request"].user
         user.set_password(self.validated_data["new_password"])
         user.save(update_fields=["password"])
+        record_password_change(user=user, new_hash=user.password)
         return user
 
 
@@ -305,7 +308,10 @@ class PasswordResetConfirmSerializer(serializers.Serializer):
         return attrs
 
     def save(self) -> User:
+        from iams.security import record_password_change
+
         user: User = self.validated_data["user"]
         user.set_password(self.validated_data["new_password"])
         user.save(update_fields=["password"])
+        record_password_change(user=user, new_hash=user.password)
         return user

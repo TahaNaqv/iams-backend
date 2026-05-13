@@ -2,6 +2,44 @@
 
 All notable changes to the IAMS Django REST API backend.
 
+## [0.16.0] — Phase 5 Track 1: Security Hardening (2026-05-13)
+
+### Added
+- **Four new models** ([migration 0018](iams/migrations/0018_security_phase5.py)) plus three field additions:
+  - `LoginAttempt` (FR-UAM-07) — append-only ledger of every auth attempt (success / invalid_credentials / user_not_found / user_inactive / account_locked / mfa_required / mfa_failed / throttled) with IP, user-agent, and request-id correlation.
+  - `AccountLockout` (FR-UAM-04) — one row per lockout window, partial-unique on `cleared_at IS NULL` so only one active lockout per user. Auto-clears on `locked_until` expiry; admin can clear via the unlock endpoint.
+  - `PasswordHistory` — hashed history of the last N passwords (configurable, default 5). Powers the `PasswordHistoryValidator`.
+  - `MFADevice` — per-user TOTP / backup-codes rows with partial-unique on `(kind=totp, confirmed=true)` so a user can only have one active authenticator app.
+  - `Role.mfa_required` flag for per-role MFA enforcement.
+  - `UserProfile.password_changed_at`, `last_login_at`, `last_activity_at` — driven by the login + session-activity flows.
+- **`iams.security` service module** — `record_login_attempt`, `register_failure` (opens a lockout when the rolling-window threshold is crossed), `get_active_lockout` (with lazy auto-clear on expiry), `clear_lockout`, `record_password_change`, `mfa_enforcement_required`, plus the `PasswordHistoryValidator` (registered in `AUTH_PASSWORD_VALIDATORS`).
+- **`iams.mfa` service module** — `generate_totp_secret`, `totp_provisioning_uri`, `verify_totp_token` (pyotp, ±1 window drift), `begin_totp_enrollment`, `confirm_totp_enrollment`, `generate_backup_codes` (10 codes × 10 alphanum chars, hashed with Django's hasher), `consume_backup_code` (one-shot consumption), `get_mfa_status`.
+- **Hardened JWT login view** at `POST /api/auth/token/` (FR-UAM-04, FR-UAM-07): looks up user → checks active lockout → checks `is_active` → validates password → opens a lockout if the failure threshold is crossed → enforces MFA when a confirmed TOTP device exists or when policy requires enrollment → returns specific error codes (`account_locked` with `lockedUntil`, `mfa_required` with `mfaEnrolled`, `mfa_invalid`).
+- **6 new auth endpoints**:
+  - `GET /api/auth/mfa/` — MFA status snapshot
+  - `POST /api/auth/mfa/totp/enroll/` — start enrollment (returns provisioning URI + secret)
+  - `POST /api/auth/mfa/totp/confirm/` — confirm with a valid token
+  - `POST /api/auth/mfa/totp/disable/` — re-verifies password before removal
+  - `POST /api/auth/mfa/backup-codes/` — regenerate (replaces any prior set; shown once)
+  - `POST /api/auth/lockouts/<user_id>/unlock/` — admin (`manage_users`) clears an active lockout
+- **`iams.middleware.SecurityHeadersMiddleware`** adds `Content-Security-Policy` (configurable via `IAMS_CSP`), `Permissions-Policy` (deny camera/mic/geo/etc.), `Cross-Origin-Resource-Policy: same-origin`, and `Referrer-Policy: same-origin` to every response.
+- **`iams.middleware.SessionActivityMiddleware`** stamps `UserProfile.last_activity_at` on every authenticated request (drives the session-inactivity policy).
+- **6 new security tunables** (all env-driven):
+  - `IAMS_LOGIN_FAIL_THRESHOLD` (5), `IAMS_LOGIN_LOCKOUT_MINUTES` (15), `IAMS_LOGIN_FAIL_WINDOW_MIN` (15)
+  - `IAMS_PASSWORD_HISTORY_N` (5)
+  - `IAMS_MFA_GRACE_DAYS` (30), `IAMS_MFA_TOTP_ISSUER` ("IAMS")
+  - `IAMS_SESSION_INACTIVITY_MINUTES` (60)
+- **24 new tests** in `iams/tests/test_security.py` — every login outcome → LoginAttempt row, threshold-based lockout (open / 423 with `lockedUntil` / valid-pw-still-rejected / auto-expiry / admin-unlock / non-admin-403), password history (reuse rejected / hash recorded / trimmed to N / `password_changed_at` stamped), MFA TOTP (status / enroll → confirm / invalid-token rejected / login requires token when enrolled / disable requires password / backup codes generate + consume-once), security headers present on response, session activity stamping, `mfa_enforcement_required` unit tests for role + grace-period paths.
+
+### Dependencies
+- Added: `pyotp` (RFC 6238 TOTP), `qrcode` (FE-side QR rendering — actual QR rendered from the provisioning URI).
+
+### Notes
+- **Backend tests: 564 passing** (was 540; added 24).
+- `mfa_enforcement_required(user)` returns True when the user's role has `mfa_required=True` *or* the MFA grace period has elapsed since the last password change. The login view treats this independently of whether a device is already enrolled — if a device exists, the OTP is *always* required; if no device exists and enforcement is on, login is blocked with `mfa_required` so the FE prompts enrollment.
+- Migrations are backward-compat: every new model is additive, every field is nullable or has a sensible default.
+- The CSP allows `'unsafe-inline'` for inline scripts to keep Swagger UI / ReDoc usable. Production deployments may tighten this via `IAMS_CSP` env override; staging-grade hardening is left to the operator until the inline-removal sweep in Phase 6.
+
 ## [0.15.0] — Phase 4 Track 3: Dashboards Backend (2026-05-12)
 
 ### Added

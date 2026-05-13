@@ -1,0 +1,52 @@
+{% extends "iams/reports/_base.html" %}
+{% block body %}
+  <p class="meta">Year: <strong>{{ year }}</strong> ·
+    Scoring model: <strong>{{ scoring_model.name }} v{{ scoring_model.version }}</strong>
+    ({{ scoring_model.formula }}, threshold {{ scoring_model.high_risk_threshold }})</p>
+
+  {% if approval %}
+  <h2>Approval Status</h2>
+  <table>
+    <tr><th>Reference</th><td>{{ approval.reference_id }}</td>
+        <th>Status</th><td><span class="pill {{ approval.status|lower }}">{{ approval.status }}</span></td></tr>
+    <tr><th>Submitted by</th><td>{{ approval.submitted_by }}</td>
+        <th>Submitted</th><td>{{ approval.submitted_date }}</td></tr>
+  </table>
+  <h3>Approval Chain</h3>
+  <table>
+    <thead><tr><th>#</th><th>Role</th><th>Approver</th><th>Status</th><th>Date</th><th>Comments</th></tr></thead>
+    <tbody>
+    {% for s in approval_steps %}
+      <tr>
+        <td>{{ s.order|add:1 }}</td>
+        <td>{{ s.role }}</td>
+        <td>{{ s.approver }}</td>
+        <td><span class="pill {{ s.status|lower }}">{{ s.status }}</span></td>
+        <td>{{ s.date }}</td>
+        <td>{{ s.comments }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+    <p><em>No matching ApprovalRequest found for reference_id.</em></p>
+  {% endif %}
+
+  <h2>Top Entities by Composite Risk Score ({{ scores|length }})</h2>
+  <table>
+    <thead><tr><th>Rank</th><th>Entity</th><th>Department</th><th>Composite</th><th>High Risk?</th></tr></thead>
+    <tbody>
+    {% for s in scores %}
+      <tr>
+        <td>{{ s.rank }}</td>
+        <td>{{ s.entity.name }}</td>
+        <td>{{ s.entity.department }}</td>
+        <td><strong>{{ s.composite_score }}</strong></td>
+        <td>{% if s.is_high_risk %}<span class="pill critical">High</span>{% else %}—{% endif %}</td>
+      </tr>
+    {% empty %}
+      <tr><td colspan="5"><em>No current scores for this model.</em></td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+{% endblock %}

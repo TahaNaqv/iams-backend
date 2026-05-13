@@ -2,6 +2,92 @@
 
 All notable changes to the IAMS Django REST API backend.
 
+## [0.15.0] — Phase 4 Track 3: Dashboards Backend (2026-05-12)
+
+### Added
+- **`iams/dashboards.py` service module** (FR-DASH-01..11) — pure, cacheable aggregator functions that the dashboard endpoints call:
+  - `core_kpis(period?, department?)` — open-audits / overdue-findings / pending-CAPs / CAP-completion-rate. Accepts `YYYY` or `YYYY-Qn` period and free-text department.
+  - `trends(period="YoY"|"FY{N}", department?)` — 8-quarter rolling YoY (or 4-quarter FY) series with `findings / auditsCompleted / capsClosed` per bucket.
+  - `risk_heatmap_by_department()` — current `EntityRiskScore` rows bucketed by department × {Critical ≥80, High 60–79, Medium 40–59, Low <40}. Returns `{categories, departments, cells}`.
+  - `rating_summary(period?)` — three-way rollup across QAIP `rating_overall`, ICFR `auditor_assessment` conclusions, and CSA weak-flag/average score.
+  - `recent_activity(limit)` — last N `AuditLogEntry` rows (live; not cached — auditors want freshness).
+  - `upcoming_audits(limit, department?)` — `start_date >= today` ordered ASC.
+  - `role_bundle(role, user_email?)` — pre-composed panels for **executive / manager / auditor / auditee**. Auditor and auditee bundles slice by `user_email` ownership (`my_open_findings`, `my_open_caps`, `my_csa_responses`).
+  - `cache_or_compute(key, fn, ttl=45s)` — read-through Redis cache helper, degrades gracefully when Redis is down (`IGNORE_EXCEPTIONS=True`).
+  - `invalidate_dashboard_cache()` — flushes the `iams:dashboard:*` namespace; called by the beat task and ad-hoc on settings changes.
+- **6 new API endpoints** at `/api/dashboard/...` (FR-DASH-02..11), all cached:
+  - `GET /api/dashboard/trends/?period=YoY|FY2026&department=…`
+  - `GET /api/dashboard/risk-heatmap/`
+  - `GET /api/dashboard/ratings/?period=…`
+  - `GET /api/dashboard/activity/?limit=…` (uncached — live feed)
+  - `GET /api/dashboard/upcoming-audits/?limit=…&department=…`
+  - `GET /api/dashboard/role/<executive|manager|auditor|auditee>/` (per-user cache key when role is auditor/auditee)
+  - Existing `GET /api/dashboard/kpis/` now routes through the service and accepts `?period=…&department=…`.
+- **Celery beat task** `iams.dashboards.refresh_caches` registered on `crontab(minute="*/5")` — warms the common dashboard payloads after invalidation so the next FE poll hits a fresh cache.
+- **5 additional PDF renderers** (registered in `RENDERERS`):
+  - `DepartmentRiskProfileRenderer` (FR-RPT-04) — consumes `risk_heatmap_by_department`; optional `?department=` filter.
+  - `OpenIssuesRenderer` (FR-RPT-05) — every non-closed `Finding` × non-closed `CorrectiveAction`, grouped.
+  - `ICFRSummaryRenderer` (FR-ICFR-05) — wraps `iams.icfr.build_icfr_summary`.
+  - `QAIPAnnualRenderer` (FR-QAIP-04) — mirrors the QAIP dashboard JSON into a print-ready document; `period` required.
+  - `AuditCommitteePackRenderer` (FR-DASH-11) — the board-facing roll-up: executive KPIs + trends + risk heat-map + ratings + upcoming audits in one PDF.
+  - Templates land in `iams/templates/iams/reports/` and extend the shared `_base.html` (severity/status pills, KPI tiles, page footer).
+- **38 new tests** in `iams/tests/test_dashboards.py` — aggregator math (KPIs, trends, heat-map, ratings, activity, upcoming), period + department filter precision, role-bundle panel composition, auditor/auditee user-scoping, cache hit-vs-miss instrumentation, every new API endpoint, every new renderer's context + filter behavior, registry-coverage check, IAMS_DISABLE_PDF_RENDER round-trip.
+
+### Notes
+- **Backend tests: 540 passing** (was 502; added 38).
+- The dashboard cache uses sha256-digested kwargs JSON for stable keys (`iams:dashboard:<prefix>:<hash16>`); collisions are theoretical but the TTL bound keeps the blast radius to 45s.
+- Materialized views for the slowest aggregators (heat-map + YoY trends) are deferred to Phase 5 — the current cache layer holds well under expected load (≈60s FE polls × 4 roles × ~20 concurrent users).
+
+## [0.14.0] — Phase 4 Track 2: Report Generation Engine (2026-05-12)
+
+### Added
+- **`ReportJob` model** ([migration 0017](iams/migrations/0017_reportjob.py)) — async report-generation request. Tracks `kind`, `output_format`, `parameters` (JSON), `requested_by`, `status` (pending/running/completed/failed), `output_file` (FileField → MinIO in prod), `file_size_kb`, `error`, lifecycle timestamps.
+- **`iams/reports/` renderer package** with a base class and **7 registered renderers**:
+  - PDF (WeasyPrint + Jinja templates with shared base, header/footer, page-numbered footer): `AuditSummaryRenderer`, `FindingTrendsRenderer`, `CAPStatusRenderer`, `AnnualPlanRenderer`
+  - Excel (openpyxl): `FindingsExcelRenderer`, `CAPsExcelRenderer`, `TimeEntriesExcelRenderer`
+- **Templates** at `iams/templates/iams/reports/` with shared `_base.html` (severity/status pills, KPI tiles, page footer with counter).
+- **`IAMS_DISABLE_PDF_RENDER=1` escape hatch** — emit raw HTML instead of calling WeasyPrint when system libs (pango/cairo) are unavailable. Used by the test suite and dev machines without the libs installed.
+- **`iams.reports.generate_report` Celery task** — dispatches to the right renderer via the `RENDERERS` registry, writes the file, flips status, and dispatches a `Notification.KIND_GENERIC` to the requester with a deep link (success or failure).
+- **API**:
+  - `POST /api/reports/generate/` — `{kind, title?, parameters?}` → 201 with the new `ReportJob`. Validates kind against the registry; 400 with `supportedKinds` on unknown.
+  - `GET /api/reports/jobs/` — scoped to the caller unless they hold `manage_settings` (admin sees the org); filterable by `kind` and `status`.
+  - `GET /api/reports/jobs/{id}/` — poll status.
+  - `GET /api/reports/jobs/{id}/download/` — 409 while pending/running, 404 when failed (with `error` body), 200 with `{url, fileSizeKb}` when completed.
+- **RBAC** — `view_reports` gates all read paths; **Excel exports additionally require `export_reports`** (organization-level data leaves the system).
+- **Audit log** captures `report_job_created` with kind + params as `ACTION_EXPORT`.
+- **26 new tests** in `iams/tests/test_reports.py` — every renderer's context, Jinja output, Excel header+rows, filter precision, registry coverage, job lifecycle, Celery dispatch + notification, unknown-kind handling, all download states (409 pending / 404 failed / 200 completed), Excel permission gate, list scoping, RBAC matrix.
+
+### Notes
+- Five additional canonical reports (Department Risk Profile, Open Issues, ICFR Summary, QAIP Annual, Audit Committee Pack) follow the same `BaseRenderer` pattern and can be added by subclassing + adding to `RENDERERS`. Track 3 (dashboards backend) provides their aggregator endpoints first.
+- **Backend tests: 502 passing** (was 476; added 26).
+
+## [0.13.0] — Phase 4 Track 1: Configurable Risk Engine (2026-05-12)
+
+### Added
+- **Four risk-engine models** ([migration 0016](iams/migrations/0016_riskfactor_riskscoringmodel_and_more.py)) — FR-RISK-01..10:
+  - `RiskFactor` — catalog of rateable dimensions (code/name/scale_min/scale_max). DB-level check on `scale_max > scale_min`.
+  - `RiskScoringModel` — name/version/formula bundle with `high_risk_threshold` + active-per-name partial unique. Three formulas: `weighted_sum`, `weighted_avg`, `multiplicative`.
+  - `RiskFactorWeight` — through-table; per-model factor weight.
+  - `EntityRiskScore` — append-only snapshot per `(entity, scoring_model)` with `is_current` partial-unique. Holds `factor_values` JSON + computed `composite_score` (0-100 normalized) + `rank` + `is_high_risk` flag.
+- **`iams/risk_engine.py` service** (FR-RISK-02..05, 07-08):
+  - `compute_composite(model, factor_values)` — formula-aware, range-validated, returns Decimal in 0..100.
+  - `record_score(entity, model, factor_values, by_user)` — atomic snapshot + previous-row `is_current` flip + auto-bump `entity.risk_rating` to High when composite ≥ threshold (preserves Critical).
+  - `recompute_ranks(model)` — dense ranking across current scores (ties share rank).
+  - `heat_map(model)` — likelihood × impact bucketed grid with per-cell entity lists.
+  - `generate_audit_plan_draft(model, year, top_n, requested_by)` — top-N entities → draft `ApprovalRequest` of type Audit Plan; the existing post_save signal auto-applies the chain template (FR-PLAN-01).
+  - `recompute_all_scores_for_model(model)` — bulk re-snapshot after weight/formula edits.
+- **API** at `/api/risk/{factors,models,factor-weights,scores}/` plus three top-level endpoints:
+  - `POST /api/risk/scores/record/` — write a new snapshot (direct CRUD on `/scores/` returns 405 to enforce single-entry).
+  - `GET /api/risk/heat-map/?scoring_model_id=…`
+  - `POST /api/risk/generate-plan/` — `{scoringModelId, year, topN}` → 201 with the created ApprovalRequest.
+  - `POST /api/risk/models/{id}/recompute/` — bulk re-snapshot.
+- **RBAC** — reads gated by `view_audits`; writes by `manage_settings`; `generate-plan` by `create_audits`.
+- **Audit log** captures `risk_score_recorded`, `risk_model_bulk_recompute`, `audit_plan_generated_from_risk` with structured details.
+- **32 new tests** in `iams/tests/test_risk_engine.py` — all three formulas with edge cases, range validation, missing-factor errors, current-row flip, high-risk threshold + risk_rating bump + Critical preservation, dense ranking with ties, heat-map placement, plan-draft + chain auto-apply, recompute bulk, full API + RBAC matrix.
+
+### Test totals
+- **Backend: 476 passing** (was 444; added 32).
+
 ## [0.12.0] — Phase 3 Track 4: ICFR (2026-05-12)
 
 ### Added

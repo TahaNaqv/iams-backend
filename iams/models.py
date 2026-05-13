@@ -1864,3 +1864,267 @@ class DeficiencyReport(TimeStampedModel):
         indexes = [
             models.Index(fields=["classification", "status"]),
         ]
+
+
+# ═════════════════════════════════════════════════════════════════════
+# Phase 4 Track 1 — Configurable Risk Engine
+#
+# Pluggable scoring of ``AuditableEntity`` rows. The org defines a set
+# of named ``RiskFactor`` rows (e.g. "Impact", "Likelihood", "Control
+# Maturity") with min/max scales, then bundles them into one or more
+# ``RiskScoringModel`` rows that pick a formula (weighted sum /
+# weighted average / multiplicative). Each entity gets a per-model
+# ``EntityRiskScore`` row that holds the factor values, the computed
+# composite, the rank within the model, and a ``is_current`` flag so
+# every recalculation produces a new immutable historical snapshot
+# (FR-RISK-06) without losing the previous one.
+#
+# FR-RISK-01..10.
+# ═════════════════════════════════════════════════════════════════════
+
+
+class RiskFactor(TimeStampedModel):
+    """A single rateable dimension of risk.
+
+    ``code`` is a short slug used in factor_values JSON keys
+    (e.g. ``"impact"``); ``name`` is the human label.
+    Two reserved codes — ``impact`` and ``likelihood`` — are recognised
+    by the heat-map endpoint.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    code = models.SlugField(max_length=50, unique=True, db_index=True)
+    name = models.CharField(max_length=100)
+    description = models.TextField(blank=True)
+    scale_min = models.PositiveSmallIntegerField(default=1)
+    scale_max = models.PositiveSmallIntegerField(default=5)
+    is_active = models.BooleanField(default=True, db_index=True)
+
+    class Meta:
+        ordering = ["name"]
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(scale_max__gt=models.F("scale_min")),
+                name="iams_risk_factor_scale_min_lt_max",
+            ),
+        ]
+
+
+class RiskScoringModel(TimeStampedModel):
+    """A named bundle of weighted factors + a formula.
+
+    Only one model per ``name`` can be ``is_active=True`` at a time
+    (DB-level partial-unique) so the auto-recompute signal has a
+    deterministic answer to "which scoring model applies?".
+    """
+
+    FORMULA_WEIGHTED_SUM = "weighted_sum"
+    FORMULA_WEIGHTED_AVG = "weighted_avg"
+    FORMULA_MULTIPLICATIVE = "multiplicative"
+    FORMULA_CHOICES = [
+        (FORMULA_WEIGHTED_SUM, "Weighted sum"),
+        (FORMULA_WEIGHTED_AVG, "Weighted average"),
+        (FORMULA_MULTIPLICATIVE, "Multiplicative (likelihood × impact)"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    name = models.CharField(max_length=100)
+    version = models.CharField(max_length=20, default="1.0")
+    description = models.TextField(blank=True)
+    formula = models.CharField(
+        max_length=30, choices=FORMULA_CHOICES, default=FORMULA_WEIGHTED_SUM,
+    )
+    factors = models.ManyToManyField(
+        RiskFactor, through="RiskFactorWeight", related_name="scoring_models",
+    )
+    # Score >= this → entity is auto-flagged as high-risk.
+    # Expressed in normalized 0..100 space (the engine normalizes).
+    high_risk_threshold = models.DecimalField(
+        max_digits=5, decimal_places=2, default=70,
+    )
+    is_active = models.BooleanField(default=False, db_index=True)
+
+    class Meta:
+        ordering = ["name", "-version"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["name", "version"],
+                name="iams_risk_model_name_version_unique",
+            ),
+            models.UniqueConstraint(
+                fields=["name"],
+                condition=models.Q(is_active=True),
+                name="iams_risk_model_one_active_per_name",
+            ),
+        ]
+
+
+class RiskFactorWeight(TimeStampedModel):
+    """Per-scoring-model weight on a factor.
+
+    The same ``RiskFactor`` can appear in many models with different
+    weights (e.g. SOX-focused model weights Financial Exposure higher).
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    scoring_model = models.ForeignKey(
+        RiskScoringModel, on_delete=models.CASCADE, related_name="factor_weights",
+    )
+    factor = models.ForeignKey(
+        RiskFactor, on_delete=models.PROTECT, related_name="weights",
+    )
+    weight = models.DecimalField(max_digits=6, decimal_places=2, default=1)
+
+    class Meta:
+        ordering = ["scoring_model_id", "factor__name"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["scoring_model", "factor"],
+                name="iams_risk_factor_weight_model_factor_unique",
+            ),
+        ]
+
+
+class EntityRiskScore(TimeStampedModel):
+    """One scoring instance for (entity, scoring_model) at a point in time.
+
+    Append-only by convention: every recompute creates a new row and
+    flips ``is_current=True`` on the new one, ``False`` on the previous.
+    The partial unique constraint enforces a single current row per
+    ``(entity, scoring_model)``.
+
+    The ``factor_values`` JSON keys are the ``RiskFactor.code`` strings;
+    values are integers in the factor's [scale_min, scale_max] range
+    (validated by the scoring service).
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    entity = models.ForeignKey(
+        AuditableEntity, on_delete=models.CASCADE, related_name="risk_scores",
+    )
+    scoring_model = models.ForeignKey(
+        RiskScoringModel, on_delete=models.PROTECT, related_name="entity_scores",
+    )
+    factor_values = models.JSONField(default=dict)
+    composite_score = models.DecimalField(max_digits=6, decimal_places=2, default=0)
+    rank = models.PositiveIntegerField(null=True, blank=True, db_index=True)
+    is_high_risk = models.BooleanField(default=False, db_index=True)
+    is_current = models.BooleanField(default=True, db_index=True)
+    snapshot_at = models.DateTimeField()
+    snapshot_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name="risk_snapshots_taken",
+    )
+    notes = models.TextField(blank=True)
+
+    class Meta:
+        ordering = ["-snapshot_at"]
+        indexes = [
+            models.Index(fields=["entity", "scoring_model", "-snapshot_at"]),
+            models.Index(fields=["scoring_model", "is_current", "-composite_score"]),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["entity", "scoring_model"],
+                condition=models.Q(is_current=True),
+                name="iams_entity_risk_score_one_current",
+            ),
+        ]
+
+
+# ═════════════════════════════════════════════════════════════════════
+# Phase 4 Track 2 — Report Generation Engine
+#
+# A unified async report job: the FE POSTs a kind + parameters, the
+# backend writes a ``ReportJob`` row in ``pending``, the Celery task
+# picks it up, renders via the matching ``iams.reports.*`` renderer
+# (PDF via WeasyPrint or Excel via openpyxl), stores the output as a
+# ``FileField`` (MinIO in prod, local in dev), and sets status to
+# ``completed``. Downloads are served via a signed-URL action that
+# refuses while ``status != completed``.
+#
+# FR-RPT-01..07, FR-PLAN-05, FR-DASH-08, FR-QAIP-04, FR-ICFR-05.
+# ═════════════════════════════════════════════════════════════════════
+
+
+class ReportJob(TimeStampedModel):
+    """One async report-generation request.
+
+    ``kind`` is the canonical name of an ``iams.reports.*`` renderer
+    (e.g. ``"audit_summary"``, ``"finding_trends"``). ``parameters`` is
+    free-form JSON that the renderer interprets (period, audit_id,
+    department, scoring_model_id, …).
+
+    The output file is stored at ``reports/YYYY/MM/DD/{uuid}.{ext}``,
+    served via the download action's signed URL when MinIO is wired
+    (Phase 0 storage config), or a Django-served absolute URL otherwise.
+    """
+
+    KIND_AUDIT_SUMMARY = "audit_summary"
+    KIND_FINDING_TRENDS = "finding_trends"
+    KIND_CAP_STATUS = "cap_status"
+    KIND_DEPARTMENT_RISK = "department_risk_profile"
+    KIND_OPEN_ISSUES = "open_issues"
+    KIND_ANNUAL_PLAN = "annual_audit_plan"
+    KIND_ICFR_SUMMARY = "icfr_summary"
+    KIND_QAIP_ANNUAL = "qaip_annual"
+    KIND_AUDIT_COMMITTEE = "audit_committee_pack"
+    KIND_FINDINGS_EXCEL = "findings_excel"
+    KIND_CAPS_EXCEL = "caps_excel"
+    KIND_TIME_ENTRIES_EXCEL = "time_entries_excel"
+    KIND_CHOICES = [
+        (KIND_AUDIT_SUMMARY, "Audit Summary"),
+        (KIND_FINDING_TRENDS, "Finding Trends"),
+        (KIND_CAP_STATUS, "CAP Status"),
+        (KIND_DEPARTMENT_RISK, "Department Risk Profile"),
+        (KIND_OPEN_ISSUES, "Open Issues"),
+        (KIND_ANNUAL_PLAN, "Annual Audit Plan"),
+        (KIND_ICFR_SUMMARY, "ICFR Summary"),
+        (KIND_QAIP_ANNUAL, "QAIP Annual"),
+        (KIND_AUDIT_COMMITTEE, "Audit Committee Pack"),
+        (KIND_FINDINGS_EXCEL, "Findings Export (Excel)"),
+        (KIND_CAPS_EXCEL, "CAPs Export (Excel)"),
+        (KIND_TIME_ENTRIES_EXCEL, "Time Entries Export (Excel)"),
+    ]
+
+    FORMAT_PDF = "pdf"
+    FORMAT_XLSX = "xlsx"
+    FORMAT_CHOICES = [(FORMAT_PDF, "PDF"), (FORMAT_XLSX, "Excel")]
+
+    STATUS_PENDING = "pending"
+    STATUS_RUNNING = "running"
+    STATUS_COMPLETED = "completed"
+    STATUS_FAILED = "failed"
+    STATUS_CHOICES = [
+        (STATUS_PENDING, "Pending"),
+        (STATUS_RUNNING, "Running"),
+        (STATUS_COMPLETED, "Completed"),
+        (STATUS_FAILED, "Failed"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    kind = models.CharField(max_length=40, choices=KIND_CHOICES, db_index=True)
+    output_format = models.CharField(max_length=10, choices=FORMAT_CHOICES, default=FORMAT_PDF)
+    title = models.CharField(max_length=255, blank=True)
+    parameters = models.JSONField(default=dict, blank=True)
+    requested_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name="report_jobs",
+    )
+    status = models.CharField(
+        max_length=20, choices=STATUS_CHOICES, default=STATUS_PENDING, db_index=True,
+    )
+    output_file = models.FileField(
+        upload_to="reports/%Y/%m/%d/", blank=True, null=True,
+    )
+    file_size_kb = models.PositiveIntegerField(default=0)
+    error = models.TextField(blank=True)
+    started_at = models.DateTimeField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["requested_by", "-created_at"]),
+            models.Index(fields=["kind", "status", "-created_at"]),
+        ]

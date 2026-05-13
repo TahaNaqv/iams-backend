@@ -1,0 +1,33 @@
+{% extends "iams/reports/_base.html" %}
+{% block body %}
+  <p class="meta">Department filter: <strong>{{ department_filter }}</strong> ·
+    Categories: {{ heatmap.categories|join:", " }}</p>
+
+  <h2>Departments × Risk Category</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Department</th>
+        {% for cat in heatmap.categories %}<th>{{ cat }}</th>{% endfor %}
+      </tr>
+    </thead>
+    <tbody>
+    {% for dept in heatmap.departments %}
+      <tr>
+        <td>{{ dept }}</td>
+        {% for cat in heatmap.categories %}
+          {% for c in heatmap.cells %}
+            {% if c.department == dept and c.category == cat %}
+              <td>{% if c.count %}<span class="pill {{ cat|lower }}">{{ c.count }}</span>{% else %}—{% endif %}</td>
+            {% endif %}
+          {% endfor %}
+        {% endfor %}
+      </tr>
+    {% empty %}
+      <tr><td colspan="5"><em>No current risk scores recorded.</em></td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+
+  <p class="footer">Buckets: Critical &ge; 80, High 60–79, Medium 40–59, Low &lt; 40.</p>
+{% endblock %}

@@ -1,0 +1,108 @@
+{% extends "iams/reports/_base.html" %}
+{% block body %}
+  <p class="meta">Period: <strong>{{ period }}</strong></p>
+
+  <h2>Executive KPIs</h2>
+  <div class="kpis">
+    <div class="kpi"><div class="label">Open Audits</div><div class="value">{{ kpis.openAudits }}</div></div>
+    <div class="kpi"><div class="label">Overdue Findings</div><div class="value">{{ kpis.overdueFindings }}</div></div>
+    <div class="kpi"><div class="label">Pending CAPs</div><div class="value">{{ kpis.pendingCAPs }}</div></div>
+    <div class="kpi"><div class="label">Completion %</div><div class="value">{{ kpis.completionRate }}%</div></div>
+  </div>
+
+  <h2>Trends ({{ trends.period }})</h2>
+  <table>
+    <thead>
+      <tr><th>Quarter</th><th>Findings</th><th>Audits Completed</th><th>CAPs Closed</th></tr>
+    </thead>
+    <tbody>
+    {% for row in trends.series %}
+      <tr>
+        <td>{{ row.period }}</td>
+        <td>{{ row.findings }}</td>
+        <td>{{ row.auditsCompleted }}</td>
+        <td>{{ row.capsClosed }}</td>
+      </tr>
+    {% empty %}
+      <tr><td colspan="4"><em>No trend data.</em></td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+
+  <h2>Risk Heat Map by Department</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Department</th>
+        {% for cat in heatmap.categories %}<th>{{ cat }}</th>{% endfor %}
+      </tr>
+    </thead>
+    <tbody>
+    {% for dept in heatmap.departments %}
+      <tr>
+        <td>{{ dept }}</td>
+        {% for cat in heatmap.categories %}
+          {% for c in heatmap.cells %}
+            {% if c.department == dept and c.category == cat %}
+              <td>{% if c.count %}<span class="pill {{ cat|lower }}">{{ c.count }}</span>{% else %}—{% endif %}</td>
+            {% endif %}
+          {% endfor %}
+        {% endfor %}
+      </tr>
+    {% empty %}
+      <tr><td colspan="5"><em>No risk scores recorded.</em></td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+
+  <h2>Rating Summary</h2>
+  <h3>QAIP Assessments</h3>
+  <table>
+    <thead><tr><th>Rating</th><th>Count</th></tr></thead>
+    <tbody>
+    {% for r in ratings.qaip %}
+      <tr><td><span class="pill {{ r.rating_overall|lower }}">{{ r.rating_overall }}</span></td><td>{{ r.count }}</td></tr>
+    {% empty %}
+      <tr><td colspan="2"><em>No QAIP assessments.</em></td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+
+  <h3>ICFR Conclusions</h3>
+  <table>
+    <thead><tr><th>Conclusion</th><th>Count</th></tr></thead>
+    <tbody>
+    {% for r in ratings.icfr %}
+      <tr><td><span class="pill {{ r.conclusion|lower }}">{{ r.conclusion }}</span></td><td>{{ r.count }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+
+  <h3>CSA Responses</h3>
+  <table>
+    <tr><th>Weak</th><td>{{ ratings.csa.weak }}</td>
+        <th>OK</th><td>{{ ratings.csa.ok }}</td>
+        <th>Avg Score</th><td>{{ ratings.csa.averageScore|floatformat:1 }}</td></tr>
+  </table>
+
+  <h2>Upcoming Audits</h2>
+  <table>
+    <thead>
+      <tr><th>Title</th><th>Department</th><th>Start</th><th>End</th><th>Status</th><th>Lead</th></tr>
+    </thead>
+    <tbody>
+    {% for a in upcoming %}
+      <tr>
+        <td>{{ a.title }}</td>
+        <td>{{ a.department }}</td>
+        <td>{{ a.startDate }}</td>
+        <td>{{ a.endDate|default:"—" }}</td>
+        <td><span class="pill {{ a.status|lower|cut:" " }}">{{ a.status }}</span></td>
+        <td>{{ a.leadAuditor|default:"—" }}</td>
+      </tr>
+    {% empty %}
+      <tr><td colspan="6"><em>No upcoming audits.</em></td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+{% endblock %}

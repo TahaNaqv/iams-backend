@@ -1,0 +1,82 @@
+{% extends "iams/reports/_base.html" %}
+{% block body %}
+  <p class="meta">Period: <strong>{{ period }}</strong></p>
+
+  <div class="kpis">
+    <div class="kpi"><div class="label">Controls</div><div class="value">{{ summary.totalControls }}</div></div>
+    <div class="kpi"><div class="label">Tests</div><div class="value">{{ summary.totalTests }}</div></div>
+    <div class="kpi"><div class="label">Exceptions</div><div class="value">{{ summary.totalExceptions }}</div></div>
+    <div class="kpi"><div class="label">Open Material Weak.</div><div class="value">{{ summary.openMaterialWeaknesses }}</div></div>
+  </div>
+
+  <h2>Controls by Framework</h2>
+  <table>
+    <thead><tr><th>Framework</th><th>Count</th></tr></thead>
+    <tbody>
+    {% for r in summary.controlsByFramework %}
+      <tr><td>{{ r.framework }}</td><td>{{ r.count }}</td></tr>
+    {% empty %}
+      <tr><td colspan="2"><em>No controls.</em></td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+
+  <h2>Controls by Status</h2>
+  <table>
+    <thead><tr><th>Status</th><th>Count</th></tr></thead>
+    <tbody>
+    {% for r in summary.controlsByStatus %}
+      <tr><td>{{ r.status }}</td><td>{{ r.count }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+
+  <h2>Test Conclusions</h2>
+  <table>
+    <thead><tr><th>Conclusion</th><th>Count</th></tr></thead>
+    <tbody>
+    {% for r in summary.testsByConclusion %}
+      <tr>
+        <td><span class="pill {{ r.conclusion|lower }}">{{ r.conclusion }}</span></td>
+        <td>{{ r.count }}</td>
+      </tr>
+    {% empty %}
+      <tr><td colspan="2"><em>No tests recorded in this period.</em></td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+
+  <h2>Exceptions by Severity</h2>
+  <table>
+    <thead><tr><th>Severity</th><th>Count</th></tr></thead>
+    <tbody>
+    {% for r in summary.exceptionsBySeverity %}
+      <tr><td><span class="pill {{ r.severity|lower }}">{{ r.severity }}</span></td><td>{{ r.count }}</td></tr>
+    {% empty %}
+      <tr><td colspan="2"><em>No exceptions.</em></td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+
+  <h2>Deficiency Classifications</h2>
+  <table>
+    <thead><tr><th>Classification</th><th>Count</th></tr></thead>
+    <tbody>
+    {% for r in summary.deficienciesByClassification %}
+      <tr><td>{{ r.classification }}</td><td>{{ r.count }}</td></tr>
+    {% empty %}
+      <tr><td colspan="2"><em>No deficiencies.</em></td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+
+  <h2>Deficiency Status</h2>
+  <table>
+    <thead><tr><th>Status</th><th>Count</th></tr></thead>
+    <tbody>
+    {% for r in summary.deficienciesByStatus %}
+      <tr><td><span class="pill {{ r.status|lower }}">{{ r.status }}</span></td><td>{{ r.count }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+{% endblock %}

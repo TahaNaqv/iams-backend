@@ -1,0 +1,46 @@
+{% extends "iams/reports/_base.html" %}
+{% block body %}
+  <p class="meta">Department: <strong>{{ department_filter }}</strong> · As of {{ as_of }}</p>
+
+  <div class="kpis">
+    <div class="kpi"><div class="label">Total CAPs</div><div class="value">{{ total }}</div></div>
+    <div class="kpi"><div class="label">Overdue</div><div class="value">{{ overdue_count }}</div></div>
+  </div>
+
+  <h2>By Status</h2>
+  <table>
+    <thead><tr><th>Status</th><th>Count</th></tr></thead>
+    <tbody>
+    {% for row in by_status %}
+      <tr><td><span class="pill {{ row.status|lower|cut:" " }}">{{ row.status }}</span></td><td>{{ row.count }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+
+  <h2>By Priority</h2>
+  <table>
+    <thead><tr><th>Priority</th><th>Count</th></tr></thead>
+    <tbody>
+    {% for row in by_priority %}
+      <tr><td>{{ row.priority }}</td><td>{{ row.count }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+
+  {% if overdue %}
+  <h2>Overdue Items</h2>
+  <table>
+    <thead><tr><th>Title</th><th>Owner</th><th>Department</th><th>Due</th><th>Days Late</th><th>Progress</th></tr></thead>
+    <tbody>
+    {% for c in overdue %}
+      <tr>
+        <td>{{ c.title }}</td><td>{{ c.owner }}</td>
+        <td>{{ c.department }}</td><td>{{ c.due_date }}</td>
+        <td><strong>{{ c.days_late }}</strong></td>
+        <td>{{ c.progress }}%</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+{% endblock %}

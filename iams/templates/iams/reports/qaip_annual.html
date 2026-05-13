@@ -1,0 +1,68 @@
+{% extends "iams/reports/_base.html" %}
+{% block body %}
+  <p class="meta">Period: <strong>{{ period }}</strong></p>
+
+  <div class="kpis">
+    <div class="kpi"><div class="label">Assessments</div><div class="value">{{ assessments|length }}</div></div>
+    <div class="kpi"><div class="label">Open Findings</div><div class="value">{{ findings_open }}</div></div>
+    <div class="kpi"><div class="label">Surveys</div><div class="value">{{ survey_count }}</div></div>
+    <div class="kpi"><div class="label">Avg Satisfaction</div><div class="value">{{ avg_satisfaction|floatformat:1 }}</div></div>
+  </div>
+
+  <h2>Assessments</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Title</th>
+        <th>Type</th>
+        <th>Rating Overall</th>
+        <th>Period</th>
+        <th>Assessor</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for a in assessments %}
+      <tr>
+        <td>{{ a.title }}</td>
+        <td>{{ a.assessment_type }}</td>
+        <td><span class="pill {{ a.rating_overall|lower }}">{{ a.rating_overall }}</span></td>
+        <td>{{ a.period }}</td>
+        <td>{{ a.assessor|default:"—" }}</td>
+      </tr>
+    {% empty %}
+      <tr><td colspan="5"><em>No QAIP assessments for this period.</em></td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+
+  <h2>Findings by Rating</h2>
+  <table>
+    <thead><tr><th>Rating</th><th>Count</th></tr></thead>
+    <tbody>
+    {% for r in findings_by_rating %}
+      <tr><td><span class="pill {{ r.rating|lower }}">{{ r.rating }}</span></td><td>{{ r.count }}</td></tr>
+    {% empty %}
+      <tr><td colspan="2"><em>No findings.</em></td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+
+  <h2>Audit KPIs</h2>
+  <table>
+    <thead>
+      <tr><th>KPI</th><th>Target</th><th>Actual</th><th>Variance</th></tr>
+    </thead>
+    <tbody>
+    {% for k in kpis %}
+      <tr>
+        <td>{{ k.kpi_type }}</td>
+        <td>{{ k.target_value }}</td>
+        <td>{{ k.actual_value }}</td>
+        <td>{{ k.variance_pct|floatformat:1 }}%</td>
+      </tr>
+    {% empty %}
+      <tr><td colspan="4"><em>No KPI rows recorded.</em></td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+{% endblock %}

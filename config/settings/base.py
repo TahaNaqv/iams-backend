@@ -334,6 +334,12 @@ CELERY_BEAT_SCHEDULE = {
         "task": "iams.workflows.escalate_overdue_steps",
         "schedule": crontab(hour=3, minute=0),
     },
+    # Every 5 minutes — drop dashboard cache keys so the next poll
+    # repopulates with fresh aggregates. Phase 4 Track 3.
+    "dashboard-cache-refresh": {
+        "task": "iams.dashboards.refresh_caches",
+        "schedule": crontab(minute="*/5"),
+    },
 }
 
 # ──────────────────────────────────────────────────────────────────────

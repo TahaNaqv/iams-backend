@@ -1,0 +1,52 @@
+{% extends "iams/reports/_base.html" %}
+{% block body %}
+  <p class="meta">Department filter: <strong>{{ department_filter }}</strong></p>
+
+  <div class="kpis">
+    <div class="kpi"><div class="label">Open Findings</div><div class="value">{{ total_findings }}</div></div>
+    <div class="kpi"><div class="label">Open CAPs</div><div class="value">{{ total_caps }}</div></div>
+  </div>
+
+  <h2>Open Findings &amp; Linked CAPs</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Finding</th>
+        <th>Severity</th>
+        <th>Status</th>
+        <th>Owner</th>
+        <th>Due</th>
+        <th>Open CAPs</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for row in rows %}
+      <tr>
+        <td>
+          <strong>{{ row.finding.title }}</strong>
+          <div style="color:#64748b;font-size:8pt;">{{ row.finding.id }}</div>
+        </td>
+        <td><span class="pill {{ row.finding.severity|lower }}">{{ row.finding.severity }}</span></td>
+        <td><span class="pill {{ row.finding.status|lower|cut:" " }}">{{ row.finding.status }}</span></td>
+        <td>{{ row.finding.owner|default:"—" }}</td>
+        <td>{{ row.finding.due_date|default:"—" }}</td>
+        <td>
+          {% if row.caps %}
+            <ul style="margin:0;padding-left:14pt;">
+            {% for cap in row.caps %}
+              <li>
+                {{ cap.title }} —
+                <span class="pill {{ cap.status|lower|cut:" " }}">{{ cap.status }}</span>
+                (due {{ cap.due_date|default:"—" }})
+              </li>
+            {% endfor %}
+            </ul>
+          {% else %}—{% endif %}
+        </td>
+      </tr>
+    {% empty %}
+      <tr><td colspan="6"><em>No open issues for this scope.</em></td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+{% endblock %}

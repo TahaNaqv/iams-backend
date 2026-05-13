@@ -12,7 +12,13 @@ from iams.views import (
     ChecklistItemViewSet,
     CommentViewSet,
     CorrectiveActionViewSet,
+    DashboardActivityView,
     DashboardKPIView,
+    DashboardRatingSummaryView,
+    DashboardRiskHeatmapByDepartmentView,
+    DashboardRoleView,
+    DashboardTrendsView,
+    DashboardUpcomingAuditsView,
     DepartmentViewSet,
     EvidenceByAuditView,
     EvidenceFileViewSet,
@@ -53,6 +59,14 @@ from iams.views import (
     ControlExceptionViewSet,
     DeficiencyReportViewSet,
     ICFRSummaryView,
+    RiskFactorViewSet,
+    RiskScoringModelViewSet,
+    RiskFactorWeightViewSet,
+    EntityRiskScoreViewSet,
+    RiskHeatMapView,
+    GenerateAuditPlanView,
+    ReportJobViewSet,
+    GenerateReportView,
     TimeEntryViewSet,
     TimelineByAuditView,
     UserViewSet,
@@ -108,6 +122,13 @@ router.register("icfr/controls", ControlViewSet, basename="icfr-control")
 router.register("icfr/tests", ControlTestViewSet, basename="icfr-test")
 router.register("icfr/exceptions", ControlExceptionViewSet, basename="icfr-exception")
 router.register("icfr/deficiencies", DeficiencyReportViewSet, basename="icfr-deficiency")
+# Phase 4 Track 1 — Risk Engine
+router.register("risk/factors", RiskFactorViewSet, basename="risk-factor")
+router.register("risk/models", RiskScoringModelViewSet, basename="risk-scoring-model")
+router.register("risk/factor-weights", RiskFactorWeightViewSet, basename="risk-factor-weight")
+router.register("risk/scores", EntityRiskScoreViewSet, basename="risk-score")
+# Phase 4 Track 2 — Report generation
+router.register("reports/jobs", ReportJobViewSet, basename="report-job")
 
 urlpatterns = [
     path("", include(router.urls)),
@@ -116,8 +137,25 @@ urlpatterns = [
     path("audits/<uuid:audit_id>/evidence/", EvidenceByAuditView.as_view(), name="audit-evidence"),
     path("audits/<uuid:audit_id>/timeline/", TimelineByAuditView.as_view(), name="audit-timeline"),
     path("dashboard/kpis/", DashboardKPIView.as_view(), name="dashboard-kpis"),
+    path("dashboard/trends/", DashboardTrendsView.as_view(), name="dashboard-trends"),
+    path(
+        "dashboard/risk-heatmap/",
+        DashboardRiskHeatmapByDepartmentView.as_view(),
+        name="dashboard-risk-heatmap",
+    ),
+    path("dashboard/ratings/", DashboardRatingSummaryView.as_view(), name="dashboard-ratings"),
+    path("dashboard/activity/", DashboardActivityView.as_view(), name="dashboard-activity"),
+    path(
+        "dashboard/upcoming-audits/",
+        DashboardUpcomingAuditsView.as_view(),
+        name="dashboard-upcoming-audits",
+    ),
+    path("dashboard/role/<str:role>/", DashboardRoleView.as_view(), name="dashboard-role"),
     path("qaip/dashboard/", QAIPDashboardView.as_view(), name="qaip-dashboard"),
     path("icfr/summary/", ICFRSummaryView.as_view(), name="icfr-summary"),
+    path("risk/heat-map/", RiskHeatMapView.as_view(), name="risk-heat-map"),
+    path("risk/generate-plan/", GenerateAuditPlanView.as_view(), name="risk-generate-plan"),
+    path("reports/generate/", GenerateReportView.as_view(), name="reports-generate"),
     path(
         "risk-assessment-import/issues/",
         RiskAssessmentImportIssuesViewSet.as_view({"get": "list"}),

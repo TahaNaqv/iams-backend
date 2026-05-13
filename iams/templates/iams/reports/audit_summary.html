@@ -1,0 +1,70 @@
+{% extends "iams/reports/_base.html" %}
+{% block body %}
+  <h2>Engagement Overview</h2>
+  <table>
+    <tr><th>Department</th><td>{{ audit.department }}</td>
+        <th>Lead Auditor</th><td>{{ audit.lead_auditor }}</td></tr>
+    <tr><th>Status</th><td>{{ audit.status }}</td>
+        <th>Priority</th><td>{{ audit.priority }}</td></tr>
+    <tr><th>Risk Rating</th><td>{{ audit.risk_rating }}</td>
+        <th>Completion</th><td>{{ audit.completion_percent }}%</td></tr>
+    <tr><th>Start</th><td>{{ audit.start_date }}</td>
+        <th>End</th><td>{{ audit.end_date }}</td></tr>
+    <tr><th>Scope</th><td colspan="3">{{ audit.scope }}</td></tr>
+    <tr><th>Objectives</th><td colspan="3">{{ audit.objectives }}</td></tr>
+  </table>
+
+  <h2>Findings by Severity</h2>
+  <div class="kpis">
+    {% for level in "Critical,High,Medium,Low"|stringformat:"s"|cut:" " %}{% endfor %}
+    <div class="kpi"><div class="label">Critical</div><div class="value">{{ severity_counts.Critical }}</div></div>
+    <div class="kpi"><div class="label">High</div><div class="value">{{ severity_counts.High }}</div></div>
+    <div class="kpi"><div class="label">Medium</div><div class="value">{{ severity_counts.Medium }}</div></div>
+    <div class="kpi"><div class="label">Low</div><div class="value">{{ severity_counts.Low }}</div></div>
+  </div>
+
+  <h2>Findings ({{ findings|length }})</h2>
+  {% if findings %}
+  <table>
+    <thead><tr><th>Title</th><th>Severity</th><th>Status</th><th>Owner</th><th>Due</th></tr></thead>
+    <tbody>
+    {% for f in findings %}
+      <tr>
+        <td>{{ f.title }}</td>
+        <td><span class="pill {{ f.severity|lower }}">{{ f.severity }}</span></td>
+        <td><span class="pill {{ f.status|lower|cut:" " }}">{{ f.status }}</span></td>
+        <td>{{ f.owner }}</td>
+        <td>{{ f.due_date }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+    <p><em>No findings on this audit.</em></p>
+  {% endif %}
+
+  <h2>Corrective Action Plans ({{ caps|length }})</h2>
+  <div class="kpis">
+    <div class="kpi"><div class="label">Open</div><div class="value">{{ cap_status_counts.Open }}</div></div>
+    <div class="kpi"><div class="label">In Progress</div><div class="value">{{ cap_status_counts.in_progress|default:cap_status_counts|dictsort:"In Progress"|default:0 }}</div></div>
+    <div class="kpi"><div class="label">Overdue</div><div class="value">{{ cap_status_counts.Overdue }}</div></div>
+    <div class="kpi"><div class="label">Closed</div><div class="value">{{ cap_status_counts.Closed }}</div></div>
+  </div>
+  {% if caps %}
+  <table>
+    <thead><tr><th>Title</th><th>Owner</th><th>Status</th><th>Priority</th><th>Progress</th><th>Due</th></tr></thead>
+    <tbody>
+    {% for c in caps %}
+      <tr>
+        <td>{{ c.title }}</td>
+        <td>{{ c.owner }}</td>
+        <td><span class="pill {{ c.status|lower|cut:" " }}">{{ c.status }}</span></td>
+        <td>{{ c.priority }}</td>
+        <td>{{ c.progress }}%</td>
+        <td>{{ c.due_date }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+{% endblock %}

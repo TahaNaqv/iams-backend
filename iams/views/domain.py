@@ -441,24 +441,28 @@ class CommentViewSet(
 
 
 class DashboardKPIView(APIView):
+    """Top-line KPI cards (FR-DASH-02).
+
+    Now period+department-filterable (FR-DASH-07) and Redis-cached
+    (Phase 4 Track 3). Routes through ``iams.dashboards.core_kpis`` so
+    the same numbers reach the role bundles below without duplication.
+
+    Query params:
+      ?period=YYYY | YYYY-Qn   filter by audit/finding/CAP year/quarter
+      ?department=Finance      filter by department name
+    """
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        today = timezone.now().date()
-        open_audits = Audit.objects.exclude(status="Completed").count()
-        overdue_findings = Finding.objects.filter(~Q(status="Closed"), due_date__lt=today).count()
-        pending_caps = CorrectiveAction.objects.exclude(status="Closed").count()
-        total_caps = CorrectiveAction.objects.count()
-        closed_caps = CorrectiveAction.objects.filter(status="Closed").count()
-        completion_rate = int((closed_caps / total_caps) * 100) if total_caps else 0
-        return Response(
-            {
-                "openAudits": open_audits,
-                "overdueFindings": overdue_findings,
-                "pendingCAPs": pending_caps,
-                "completionRate": completion_rate,
-            }
+        from iams.dashboards import _cache_key, cache_or_compute, core_kpis
+
+        period = request.query_params.get("period")
+        department = request.query_params.get("department")
+        key = _cache_key("kpis", period=period, department=department)
+        payload = cache_or_compute(
+            key, lambda: core_kpis(period=period, department=department)
         )
+        return Response(payload)
 
 
 class AuditorViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
@@ -1477,4 +1481,504 @@ class ICFRSummaryView(APIView):
     def get(self, request):
         from iams.icfr import build_icfr_summary
         payload = build_icfr_summary(period=request.query_params.get("period"))
+        return Response(payload)
+
+
+# ═════════════════════════════════════════════════════════════════════
+# Phase 4 Track 1 — Risk Engine viewsets
+# ═════════════════════════════════════════════════════════════════════
+from iams.models import (  # noqa: E402
+    EntityRiskScore,
+    RiskFactor,
+    RiskFactorWeight,
+    RiskScoringModel,
+)
+from iams.domain_serializers import (  # noqa: E402
+    EntityRiskScoreSerializer,
+    RiskFactorSerializer,
+    RiskFactorWeightSerializer,
+    RiskScoringModelSerializer,
+)
+
+
+class RiskFactorViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
+    queryset = RiskFactor.objects.all().order_by("name")
+    serializer_class = RiskFactorSerializer
+
+    def get_permissions(self):
+        if self.action in ("list", "retrieve"):
+            return [HasPermission("view_audits")]
+        return [HasPermission("manage_settings")]
+
+
+class RiskScoringModelViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
+    queryset = RiskScoringModel.objects.prefetch_related("factor_weights__factor").all().order_by("name", "-version")
+    serializer_class = RiskScoringModelSerializer
+
+    def get_permissions(self):
+        if self.action in ("list", "retrieve"):
+            return [HasPermission("view_audits")]
+        return [HasPermission("manage_settings")]
+
+    @action(detail=True, methods=["post"], url_path="recompute")
+    def recompute(self, request, pk=None):
+        """Re-snapshot every entity's current score for this model.
+
+        Useful after editing factor weights / formula. Returns the
+        number of rows re-snapshotted.
+        """
+        from iams.audit import record_audit_event
+        from iams.risk_engine import recompute_all_scores_for_model
+        model = self.get_object()
+        n = recompute_all_scores_for_model(model, by_user=request.user)
+        record_audit_event(
+            action=AuditLogEntry.ACTION_OTHER,
+            actor=request.user,
+            target=model,
+            details={"event": "risk_model_bulk_recompute", "rows": n},
+            request=request,
+        )
+        return Response({"recomputed": n})
+
+
+class RiskFactorWeightViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
+    """Per-model factor weights, attached via the through-model."""
+    queryset = RiskFactorWeight.objects.select_related("factor", "scoring_model").all()
+    serializer_class = RiskFactorWeightSerializer
+
+    def get_permissions(self):
+        if self.action in ("list", "retrieve"):
+            return [HasPermission("view_audits")]
+        return [HasPermission("manage_settings")]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        model_id = self.request.query_params.get("scoring_model_id")
+        if model_id:
+            qs = qs.filter(scoring_model_id=model_id)
+        return qs
+
+    def perform_create(self, serializer):
+        # ``scoring_model`` is path-supplied via the query param when nested,
+        # or in the body when called flat. We allow both.
+        scoring_model_id = self.request.data.get("scoring_model_id") or self.request.query_params.get("scoring_model_id")
+        if not scoring_model_id:
+            from rest_framework.exceptions import ValidationError
+            raise ValidationError({"scoring_model_id": "required"})
+        serializer.save(scoring_model_id=scoring_model_id)
+
+
+class EntityRiskScoreViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
+    """Read-mostly endpoint over the score history.
+
+    Writes go through the ``record`` custom action which routes
+    ``factor_values`` through the engine so the composite is always
+    consistent with the formula. Direct POSTs to this endpoint are
+    blocked.
+    """
+    queryset = (
+        EntityRiskScore.objects
+        .select_related("entity", "scoring_model", "snapshot_by")
+        .all()
+    )
+    serializer_class = EntityRiskScoreSerializer
+
+    def get_permissions(self):
+        if self.action in ("list", "retrieve"):
+            return [HasPermission("view_audits")]
+        return [HasPermission("manage_settings")]
+
+    def create(self, request, *args, **kwargs):
+        return Response(
+            {"detail": "Use POST /api/risk/scores/record/ instead."},
+            status=status.HTTP_405_METHOD_NOT_ALLOWED,
+        )
+
+    def update(self, request, *args, **kwargs):
+        return Response(
+            {"detail": "EntityRiskScore is append-only; create a new snapshot via /record/."},
+            status=status.HTTP_405_METHOD_NOT_ALLOWED,
+        )
+
+    def partial_update(self, request, *args, **kwargs):
+        return self.update(request, *args, **kwargs)
+
+    def destroy(self, request, *args, **kwargs):
+        return Response(
+            {"detail": "EntityRiskScore is append-only; cannot delete history."},
+            status=status.HTTP_405_METHOD_NOT_ALLOWED,
+        )
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        entity_id = self.request.query_params.get("entity_id")
+        if entity_id:
+            qs = qs.filter(entity_id=entity_id)
+        model_id = self.request.query_params.get("scoring_model_id")
+        if model_id:
+            qs = qs.filter(scoring_model_id=model_id)
+        if self.request.query_params.get("currentOnly") == "true":
+            qs = qs.filter(is_current=True)
+        if self.request.query_params.get("highRiskOnly") == "true":
+            qs = qs.filter(is_high_risk=True, is_current=True)
+        return qs.order_by("-snapshot_at")
+
+    @action(detail=False, methods=["post"], url_path="record")
+    def record(self, request):
+        """Record a new score snapshot for an entity.
+
+        Body::
+
+            {"entityId": "...", "scoringModelId": "...",
+             "factorValues": {"impact": 4, "likelihood": 3, ...},
+             "notes": "Quarterly refresh"}
+        """
+        from iams.audit import record_audit_event
+        from iams.risk_engine import RiskEngineError, record_score
+
+        entity_id = request.data.get("entityId")
+        model_id = request.data.get("scoringModelId")
+        factor_values = request.data.get("factorValues") or {}
+        notes = request.data.get("notes") or ""
+        if not entity_id or not model_id:
+            return Response(
+                {"detail": "entityId and scoringModelId are required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            entity = AuditableEntity.objects.get(pk=entity_id)
+            model = RiskScoringModel.objects.get(pk=model_id)
+        except (AuditableEntity.DoesNotExist, RiskScoringModel.DoesNotExist):
+            return Response({"detail": "entity or scoring model not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        try:
+            score = record_score(
+                entity, model=model, factor_values=factor_values,
+                by_user=request.user, notes=notes,
+            )
+        except RiskEngineError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        record_audit_event(
+            action=AuditLogEntry.ACTION_OTHER,
+            actor=request.user,
+            target=score,
+            details={
+                "event": "risk_score_recorded",
+                "entity_id": str(entity.id),
+                "model_id": str(model.id),
+                "composite_score": str(score.composite_score),
+                "is_high_risk": score.is_high_risk,
+            },
+            request=request,
+        )
+        return Response(EntityRiskScoreSerializer(score).data, status=status.HTTP_201_CREATED)
+
+
+class RiskHeatMapView(APIView):
+    """Returns the likelihood × impact bucket grid for a scoring model.
+
+    Query params:
+      ?scoring_model_id=...   (required)
+    """
+    permission_classes = [HasPermission("view_audits")]
+
+    def get(self, request):
+        from iams.risk_engine import RiskEngineError, heat_map
+        model_id = request.query_params.get("scoring_model_id")
+        if not model_id:
+            return Response(
+                {"detail": "scoring_model_id is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            model = RiskScoringModel.objects.get(pk=model_id)
+        except RiskScoringModel.DoesNotExist:
+            return Response({"detail": "scoring model not found."}, status=status.HTTP_404_NOT_FOUND)
+        try:
+            payload = heat_map(model)
+        except RiskEngineError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(payload)
+
+
+class GenerateAuditPlanView(APIView):
+    """Generate a draft Annual Audit Plan from the top-N entities by risk.
+
+    Body::
+
+        {"scoringModelId": "...", "year": 2026, "topN": 20}
+
+    Returns the created ``ApprovalRequest`` (chain auto-applied).
+    """
+    permission_classes = [HasPermission("create_audits")]
+
+    def post(self, request):
+        from iams.audit import record_audit_event
+        from iams.risk_engine import RiskEngineError, generate_audit_plan_draft
+
+        model_id = request.data.get("scoringModelId")
+        year = request.data.get("year")
+        top_n = int(request.data.get("topN") or 20)
+        if not model_id or not year:
+            return Response(
+                {"detail": "scoringModelId and year are required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            model = RiskScoringModel.objects.get(pk=model_id)
+        except RiskScoringModel.DoesNotExist:
+            return Response({"detail": "scoring model not found."}, status=status.HTTP_404_NOT_FOUND)
+        try:
+            req = generate_audit_plan_draft(
+                model=model, year=int(year), top_n=top_n,
+                requested_by=request.user,
+            )
+        except RiskEngineError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        record_audit_event(
+            action=AuditLogEntry.ACTION_OTHER,
+            actor=request.user,
+            target=req,
+            details={
+                "event": "audit_plan_generated_from_risk",
+                "year": int(year),
+                "top_n": top_n,
+                "scoring_model": model.name,
+            },
+            request=request,
+        )
+        return Response(ApprovalRequestSerializer(req).data, status=status.HTTP_201_CREATED)
+
+
+# ═════════════════════════════════════════════════════════════════════
+# Phase 4 Track 2 — Report Generation viewset
+# ═════════════════════════════════════════════════════════════════════
+from iams.models import ReportJob  # noqa: E402
+from iams.domain_serializers import ReportJobSerializer  # noqa: E402
+
+
+class ReportJobViewSet(viewsets.ReadOnlyModelViewSet):
+    """List / inspect / download report jobs.
+
+    Job creation goes through ``POST /api/reports/generate/`` so the
+    Celery dispatch logic lives in one place. The viewset is otherwise
+    read-only — jobs cannot be edited or deleted via the API (they
+    expire via a retention task in Phase 5).
+    """
+    serializer_class = ReportJobSerializer
+    permission_classes = [HasPermission("view_reports")]
+
+    def get_queryset(self):
+        qs = ReportJob.objects.select_related("requested_by").all().order_by("-created_at")
+        # Users see their own jobs by default. ``manage_settings`` users
+        # see the whole org.
+        user = self.request.user
+        profile = getattr(user, "profile", None)
+        role = profile.role if profile else None
+        is_admin = bool(role and (role.is_super_admin or role.permissions.filter(key="manage_settings").exists()))
+        if not is_admin:
+            qs = qs.filter(requested_by=user)
+        # Filters
+        kind = self.request.query_params.get("kind")
+        if kind:
+            qs = qs.filter(kind=kind)
+        status_filter = self.request.query_params.get("status")
+        if status_filter:
+            qs = qs.filter(status=status_filter)
+        return qs
+
+    @action(detail=True, methods=["get"], url_path="download")
+    def download(self, request, pk=None):
+        """Return a download URL for the rendered file.
+
+        Refuses with 409 while the job is still pending/running,
+        with 404 when the job failed (no file), and otherwise issues
+        a signed URL (MinIO) or absolute media URL (dev).
+        """
+        job = self.get_object()
+        if job.status == ReportJob.STATUS_PENDING or job.status == ReportJob.STATUS_RUNNING:
+            return Response(
+                {"detail": "Report is still being generated.", "status": job.status},
+                status=status.HTTP_409_CONFLICT,
+            )
+        if job.status != ReportJob.STATUS_COMPLETED or not job.output_file:
+            return Response(
+                {"detail": "Report file unavailable.", "status": job.status, "error": job.error},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        url = job.output_file.url
+        if not url.startswith(("http://", "https://")):
+            url = request.build_absolute_uri(url)
+        return Response({"url": url, "fileSizeKb": job.file_size_kb})
+
+
+class GenerateReportView(APIView):
+    """Create a ReportJob + enqueue the Celery task.
+
+    Body::
+
+        {"kind": "audit_summary"|...,
+         "title": "Optional human label",
+         "parameters": {"audit_id": "..."}}
+
+    Returns the created ReportJob (status='pending'). The FE then polls
+    ``GET /api/reports/jobs/{id}/`` for status, or relies on the
+    in-app notification dispatched when the task finishes.
+    """
+    permission_classes = [HasPermission("view_reports")]
+
+    def post(self, request):
+        from iams.audit import record_audit_event
+        from iams.reports import RENDERERS
+
+        kind = request.data.get("kind")
+        title = request.data.get("title") or ""
+        parameters = request.data.get("parameters") or {}
+        if not kind:
+            return Response({"detail": "kind is required."}, status=status.HTTP_400_BAD_REQUEST)
+        renderer_cls = RENDERERS.get(kind)
+        if renderer_cls is None:
+            return Response(
+                {"detail": f"Unknown report kind '{kind}'.",
+                 "supportedKinds": sorted(RENDERERS.keys())},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # ``export_reports`` permission required for Excel exports
+        # (organizationally these tend to leave the system); PDFs only
+        # need ``view_reports``.
+        output_format = renderer_cls.output_format
+        if output_format == ReportJob.FORMAT_XLSX:
+            if not HasPermission("export_reports").has_permission(request, self):
+                return Response(
+                    {"detail": "export_reports permission required for Excel exports."},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+
+        job = ReportJob.objects.create(
+            kind=kind, title=title or renderer_cls().kind,
+            parameters=parameters,
+            output_format=output_format,
+            requested_by=request.user,
+            status=ReportJob.STATUS_PENDING,
+        )
+        # Enqueue. Test settings run eagerly; prod is async via Celery.
+        from iams.tasks import generate_report
+        generate_report.delay(str(job.pk))
+
+        record_audit_event(
+            action=AuditLogEntry.ACTION_EXPORT,
+            actor=request.user,
+            target=job,
+            details={"event": "report_job_created", "kind": kind, "params": parameters},
+            request=request,
+        )
+        job.refresh_from_db()
+        return Response(ReportJobSerializer(job).data, status=status.HTTP_201_CREATED)
+
+
+# ═════════════════════════════════════════════════════════════════════
+# Phase 4 Track 3 — Dashboard endpoints
+# ═════════════════════════════════════════════════════════════════════
+from iams.dashboards import (  # noqa: E402
+    VALID_ROLES,
+    _cache_key,
+    cache_or_compute,
+    core_kpis,
+    rating_summary,
+    recent_activity,
+    risk_heatmap_by_department,
+    role_bundle,
+    trends,
+    upcoming_audits,
+)
+
+
+class DashboardTrendsView(APIView):
+    """Year-over-year quarterly trends (FR-DASH-10).
+
+    Query params: ?period=YoY|FY2026 (default YoY) &department=Finance
+    """
+    permission_classes = [HasPermission("view_reports")]
+
+    def get(self, request):
+        period = request.query_params.get("period") or "YoY"
+        department = request.query_params.get("department")
+        key = _cache_key("trends", period=period, department=department)
+        payload = cache_or_compute(
+            key, lambda: trends(period=period, department=department)
+        )
+        return Response(payload)
+
+
+class DashboardRiskHeatmapByDepartmentView(APIView):
+    """Department × risk-category aggregate of current EntityRiskScore rows."""
+    permission_classes = [HasPermission("view_reports")]
+
+    def get(self, request):
+        key = _cache_key("risk-heatmap")
+        payload = cache_or_compute(key, risk_heatmap_by_department)
+        return Response(payload)
+
+
+class DashboardRatingSummaryView(APIView):
+    """Rating rollups across QAIP / ICFR / CSA (FR-DASH-09)."""
+    permission_classes = [HasPermission("view_reports")]
+
+    def get(self, request):
+        period = request.query_params.get("period")
+        key = _cache_key("ratings", period=period)
+        payload = cache_or_compute(key, lambda: rating_summary(period=period))
+        return Response(payload)
+
+
+class DashboardActivityView(APIView):
+    """Recent activity feed (FR-DASH-05)."""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        limit = min(int(request.query_params.get("limit", 20)), 100)
+        # Don't cache — should be live
+        return Response(recent_activity(limit=limit))
+
+
+class DashboardUpcomingAuditsView(APIView):
+    """Upcoming audits (FR-DASH-06)."""
+    permission_classes = [HasPermission("view_audits")]
+
+    def get(self, request):
+        limit = min(int(request.query_params.get("limit", 10)), 50)
+        department = request.query_params.get("department")
+        key = _cache_key("upcoming", limit=limit, department=department)
+        payload = cache_or_compute(
+            key, lambda: upcoming_audits(limit=limit, department=department)
+        )
+        return Response(payload)
+
+
+class DashboardRoleView(APIView):
+    """Role-specific pre-composed dashboard bundles.
+
+    Path: /api/dashboard/role/<role>/
+    Roles: executive / manager / auditor / auditee
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, role):
+        role = (role or "").lower()
+        if role not in VALID_ROLES:
+            return Response(
+                {"detail": f"role must be one of {sorted(VALID_ROLES)}",
+                 "supported": sorted(VALID_ROLES)},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        user_email = getattr(request.user, "email", None)
+        # Cache key includes user_email for auditor / auditee bundles
+        # because those slice by ownership.
+        key = _cache_key("role", role=role, user_email=user_email)
+        payload = cache_or_compute(
+            key, lambda: role_bundle(role=role, user_email=user_email)
+        )
         return Response(payload)

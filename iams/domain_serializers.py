@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 from rest_framework import serializers
 
 from iams.models import (
@@ -1144,3 +1146,118 @@ class ControlTestSerializer(serializers.ModelSerializer):
 
     def get_conclusion(self, obj) -> str:
         return obj.conclusion
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Phase 4 Track 1 — Risk Engine serializers
+# ──────────────────────────────────────────────────────────────────────
+from iams.models import (  # noqa: E402
+    EntityRiskScore,
+    RiskFactor,
+    RiskFactorWeight,
+    RiskScoringModel,
+)
+
+
+class RiskFactorSerializer(serializers.ModelSerializer):
+    scaleMin = serializers.IntegerField(source="scale_min", min_value=0)
+    scaleMax = serializers.IntegerField(source="scale_max", min_value=1)
+    isActive = serializers.BooleanField(source="is_active")
+
+    class Meta:
+        model = RiskFactor
+        fields = ["id", "code", "name", "description", "scaleMin", "scaleMax", "isActive"]
+
+
+class RiskFactorWeightSerializer(serializers.ModelSerializer):
+    factorId = serializers.PrimaryKeyRelatedField(source="factor", queryset=RiskFactor.objects.all())
+    factorCode = serializers.CharField(source="factor.code", read_only=True)
+    factorName = serializers.CharField(source="factor.name", read_only=True)
+
+    class Meta:
+        model = RiskFactorWeight
+        fields = ["id", "factorId", "factorCode", "factorName", "weight"]
+        read_only_fields = ["factorCode", "factorName"]
+
+
+class RiskScoringModelSerializer(serializers.ModelSerializer):
+    highRiskThreshold = serializers.DecimalField(
+        source="high_risk_threshold", max_digits=5, decimal_places=2, min_value=Decimal("0"), max_value=Decimal("100"),
+    )
+    isActive = serializers.BooleanField(source="is_active")
+    factorWeights = RiskFactorWeightSerializer(source="factor_weights", many=True, read_only=True)
+
+    class Meta:
+        model = RiskScoringModel
+        fields = [
+            "id", "name", "version", "description", "formula",
+            "highRiskThreshold", "isActive", "factorWeights",
+        ]
+        read_only_fields = ["factorWeights"]
+
+
+class EntityRiskScoreSerializer(serializers.ModelSerializer):
+    entityId = serializers.PrimaryKeyRelatedField(source="entity", queryset=AuditableEntity.objects.all())
+    entityName = serializers.CharField(source="entity.name", read_only=True)
+    scoringModelId = serializers.PrimaryKeyRelatedField(
+        source="scoring_model", queryset=RiskScoringModel.objects.all(),
+    )
+    scoringModelName = serializers.CharField(source="scoring_model.name", read_only=True)
+    factorValues = serializers.JSONField(source="factor_values")
+    compositeScore = serializers.DecimalField(
+        source="composite_score", max_digits=6, decimal_places=2, read_only=True,
+    )
+    isHighRisk = serializers.BooleanField(source="is_high_risk", read_only=True)
+    isCurrent = serializers.BooleanField(source="is_current", read_only=True)
+    snapshotAt = serializers.DateTimeField(source="snapshot_at", read_only=True)
+    snapshotById = serializers.UUIDField(source="snapshot_by_id", read_only=True, allow_null=True)
+
+    class Meta:
+        model = EntityRiskScore
+        fields = [
+            "id", "entityId", "entityName",
+            "scoringModelId", "scoringModelName",
+            "factorValues", "compositeScore",
+            "rank", "isHighRisk", "isCurrent",
+            "snapshotAt", "snapshotById", "notes",
+        ]
+        read_only_fields = [
+            "entityName", "scoringModelName",
+            "compositeScore", "rank", "isHighRisk", "isCurrent",
+            "snapshotAt", "snapshotById",
+        ]
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Phase 4 Track 2 — Report Generation
+# ──────────────────────────────────────────────────────────────────────
+from iams.models import ReportJob  # noqa: E402
+
+
+class ReportJobSerializer(serializers.ModelSerializer):
+    requestedById = serializers.UUIDField(source="requested_by_id", read_only=True, allow_null=True)
+    outputFormat = serializers.CharField(source="output_format", read_only=True)
+    outputFile = serializers.SerializerMethodField()
+    fileSizeKb = serializers.IntegerField(source="file_size_kb", read_only=True)
+    startedAt = serializers.DateTimeField(source="started_at", read_only=True, allow_null=True)
+    completedAt = serializers.DateTimeField(source="completed_at", read_only=True, allow_null=True)
+
+    class Meta:
+        model = ReportJob
+        fields = [
+            "id", "kind", "title", "outputFormat",
+            "parameters", "status", "error",
+            "requestedById",
+            "outputFile", "fileSizeKb",
+            "startedAt", "completedAt",
+        ]
+        read_only_fields = [
+            "status", "error", "requestedById",
+            "outputFile", "fileSizeKb",
+            "startedAt", "completedAt", "outputFormat",
+        ]
+
+    def get_outputFile(self, obj) -> str | None:
+        if not obj.output_file or obj.status != ReportJob.STATUS_COMPLETED:
+            return None
+        return obj.output_file.name  # the download endpoint resolves to a URL

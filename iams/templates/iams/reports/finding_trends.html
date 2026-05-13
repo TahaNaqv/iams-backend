@@ -1,0 +1,40 @@
+{% extends "iams/reports/_base.html" %}
+{% block body %}
+  <p class="meta">Period: <strong>{{ period }}</strong> · Department: <strong>{{ department_filter }}</strong></p>
+
+  <div class="kpis">
+    <div class="kpi"><div class="label">Total Findings</div><div class="value">{{ total }}</div></div>
+  </div>
+
+  <h2>By Severity</h2>
+  <table>
+    <thead><tr><th>Severity</th><th>Count</th></tr></thead>
+    <tbody>
+    {% for row in by_severity %}
+      <tr><td><span class="pill {{ row.severity|lower }}">{{ row.severity }}</span></td><td>{{ row.count }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+
+  <h2>By Status</h2>
+  <table>
+    <thead><tr><th>Status</th><th>Count</th></tr></thead>
+    <tbody>
+    {% for row in by_status %}
+      <tr><td><span class="pill {{ row.status|lower|cut:" " }}">{{ row.status }}</span></td><td>{{ row.count }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+
+  <h2>Top Departments</h2>
+  <table>
+    <thead><tr><th>Department</th><th>Findings</th></tr></thead>
+    <tbody>
+    {% for row in by_department %}
+      <tr><td>{{ row.department|default:"—" }}</td><td>{{ row.count }}</td></tr>
+    {% empty %}
+      <tr><td colspan="2"><em>No findings matched the filter.</em></td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+{% endblock %}

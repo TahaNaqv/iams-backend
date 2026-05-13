@@ -181,10 +181,13 @@ class MeSerializer(serializers.ModelSerializer):
     role = serializers.SerializerMethodField()
     department = serializers.CharField(source="profile.department", read_only=True)
     status = serializers.CharField(source="profile.status", read_only=True)
+    # Phase 6 Track 3 — UI language preference; FE bootstrap reads this
+    # to set the initial locale + document direction.
+    language = serializers.CharField(source="profile.language", read_only=True)
 
     class Meta:
         model = User
-        fields = ["id", "email", "name", "role", "department", "status"]
+        fields = ["id", "email", "name", "role", "department", "status", "language"]
 
     def get_name(self, obj):
         parts = [obj.first_name, obj.last_name]
@@ -216,14 +219,23 @@ class MeSerializer(serializers.ModelSerializer):
 class MeUpdateSerializer(serializers.ModelSerializer):
     """PATCH /auth/me/ payload — users editing their own profile.
 
-    Users can update their name and email, but **never** their role or status
-    (those require manage_users). Email change does not currently re-verify;
-    re-verification is a Phase 5 enhancement (alongside MFA setup).
+    Users can update their name, email, and UI language preference,
+    but **never** their role or status (those require manage_users).
+    Email change does not currently re-verify; re-verification is
+    queued behind the SSO work in Phase 6.
     """
+
+    # Phase 6 Track 3 — surface language on update too. Not a model
+    # field on User itself; we apply it to ``user.profile.language``
+    # in ``update()`` below.
+    language = serializers.ChoiceField(
+        choices=UserProfile.LANGUAGE_CHOICES,
+        required=False, allow_blank=False, write_only=True,
+    )
 
     class Meta:
         model = User
-        fields = ["first_name", "last_name", "email"]
+        fields = ["first_name", "last_name", "email", "language"]
 
     def validate_email(self, value: str) -> str:
         if not value:
@@ -235,6 +247,13 @@ class MeUpdateSerializer(serializers.ModelSerializer):
         if qs.exists():
             raise serializers.ValidationError("A user with this email already exists.")
         return value
+
+    def update(self, instance, validated_data):
+        language = validated_data.pop("language", None)
+        user = super().update(instance, validated_data)
+        if language is not None:
+            UserProfile.objects.filter(user=user).update(language=language)
+        return user
 
 
 class PasswordChangeSerializer(serializers.Serializer):

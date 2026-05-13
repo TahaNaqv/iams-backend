@@ -69,6 +69,17 @@ class UserProfile(models.Model):
     # timeout policy and the admin "stale account" report.
     last_login_at = models.DateTimeField(null=True, blank=True)
     last_activity_at = models.DateTimeField(null=True, blank=True)
+    # Phase 6 Track 3 — user-selected UI language. RTL is implicit from
+    # the locale ("ar" is RTL); the FE flips the document direction.
+    LANGUAGE_CHOICES = [
+        ("en", "English"),
+        ("ar", "العربية"),
+        ("fr", "Français"),
+    ]
+    language = models.CharField(
+        max_length=8, choices=LANGUAGE_CHOICES, default="en",
+        help_text="Preferred UI language; restored on next login.",
+    )
 
     def __str__(self):
         return f"{self.user.email} - {self.role.name if self.role else 'No role'}"

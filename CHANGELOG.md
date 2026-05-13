@@ -2,6 +2,17 @@
 
 All notable changes to the IAMS Django REST API backend.
 
+## [0.22.0] — Phase 6 Track 3: i18n preference (2026-05-13)
+
+### Added
+- **`UserProfile.language`** field ([migration 0022](iams/migrations/0022_i18n_phase6.py)) with choices `en | ar | fr`, default `en`. The FE reads this on bootstrap to restore the user's preferred locale across browsers / devices.
+- `MeSerializer` now surfaces `language`; `MeUpdateSerializer` accepts a `language` write-only field and applies it to `user.profile.language` in `update()`. RBAC unchanged — language is a self-edit, not a privilege.
+- **6 new tests** in `iams/tests/test_i18n.py` — default value, GET /me/ shape, PATCH happy-path for both `ar` and `fr`, unsupported language rejection (400), persistence across an unrelated field update.
+
+### Notes
+- **Backend tests: 637 passing** (was 631; added 6).
+- Server-side message translation (Django gettext) is deliberately deferred — every error string the FE renders is keyed by a stable `code` (e.g. `signature_invalid`, `mfa_required`) and the FE translates locally. That keeps the backend lean and avoids the deploy churn that comes with each new locale.
+
 ## [0.21.0] — Phase 6 Track 2: ERP / HR Integrations (2026-05-13)
 
 ### Added

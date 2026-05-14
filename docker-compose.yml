@@ -134,8 +134,10 @@ services:
       DJANGO_SETTINGS_MODULE: ${DJANGO_SETTINGS_MODULE:-config.settings.dev}
       DJANGO_AUTO_MIGRATE: "1"
       DJANGO_COLLECTSTATIC: "0"  # served by Django in dev
+    # The image already contains the source + venv (multi-stage build).
+    # ``docker-compose.override.yml`` adds the dev-only ``.:/app`` bind
+    # mount for live editing; production keeps the immutable image.
     volumes:
-      - .:/app
       - backend_static:/app/staticfiles
       - backend_media:/app/media
     depends_on:
@@ -164,8 +166,7 @@ services:
       # to bypass when running compose without the clamav service.
       CLAMD_HOST: ${CLAMD_HOST:-clamav}
       CLAMD_PORT: ${CLAMD_PORT:-3310}
-    volumes:
-      - .:/app
+    # Bind mount for live edits lives in docker-compose.override.yml (dev only).
     depends_on:
       db:
         condition: service_healthy
@@ -180,8 +181,7 @@ services:
       - .env
     environment:
       DJANGO_SETTINGS_MODULE: ${DJANGO_SETTINGS_MODULE:-config.settings.dev}
-    volumes:
-      - .:/app
+    # Bind mount for live edits lives in docker-compose.override.yml (dev only).
     depends_on:
       db:
         condition: service_healthy

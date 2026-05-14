@@ -23,7 +23,11 @@ ssh "$SERVER_USER@$SERVER_HOST" bash << 'ENDSSH'
   git pull origin master
 
   echo "  -> Rebuilding and restarting containers..."
-  docker-compose up -d --build
+  # ``-f docker-compose.yml`` explicitly skips any docker-compose.override.yml.
+  # The override exists for local-dev only (bind-mounts the host source onto
+  # /app for live editing); on the server we want the immutable image with
+  # its baked-in venv, otherwise Django imports fail.
+  docker-compose -f docker-compose.yml up -d --build
 
   # Migrations run automatically inside the backend container entrypoint
   # (DJANGO_AUTO_MIGRATE=1 in compose). Don't ``docker exec`` another
@@ -41,7 +45,7 @@ ssh "$SERVER_USER@$SERVER_HOST" bash << 'ENDSSH'
     sleep 3
   done
   echo "  -> Backend did not reach healthy in 90s. Recent logs:"
-  docker-compose logs --tail=80 backend
+  docker-compose -f docker-compose.yml logs --tail=80 backend
   exit 1
 ENDSSH
 

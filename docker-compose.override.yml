@@ -1,0 +1,31 @@
+# Local-dev override — auto-loaded by ``docker compose up`` when this
+# file sits next to ``docker-compose.yml``. Production deploys pass
+# ``-f docker-compose.yml`` explicitly so this override is skipped.
+#
+# What this adds:
+#   - bind-mounts the host's source onto /app for live editing
+#     (restart the service to pick up changes; gunicorn doesn't reload)
+#   - bind-mounts the venv path so we don't shadow the image's .venv
+#     (``/app/.venv`` is a named-volume-overlay, *not* a host mount)
+#
+# Local dev: ``docker compose up`` picks this up automatically.
+# Production: ``docker compose -f docker-compose.yml up -d --build``.
+
+services:
+  backend:
+    volumes:
+      - .:/app
+      # The image's ``/app/.venv`` is shielded by an anonymous volume so
+      # the bind mount above can't shadow it. Otherwise ``python``
+      # resolves to the system interpreter and Django imports fail.
+      - /app/.venv
+
+  worker:
+    volumes:
+      - .:/app
+      - /app/.venv
+
+  beat:
+    volumes:
+      - .:/app
+      - /app/.venv

@@ -93,17 +93,171 @@ class TimeStampedModel(models.Model):
         abstract = True
 
 
+# ═════════════════════════════════════════════════════════════════════
+# Audit Universe — shared enums (Phase 7 Track 1)
+#
+# Module-level TextChoices for values shared between AuditableEntity,
+# Department, BusinessUnit, and the revision history. Locking these
+# down at the model level replaces the previous free-text CharField
+# pattern that allowed values like "Extreme" to slip in.
+# ═════════════════════════════════════════════════════════════════════
+
+
+class RiskRatingChoices(models.TextChoices):
+    LOW = "Low", "Low"
+    MEDIUM = "Medium", "Medium"
+    HIGH = "High", "High"
+    CRITICAL = "Critical", "Critical"
+
+
+class EntityStatusChoices(models.TextChoices):
+    ACTIVE = "Active", "Active"
+    INACTIVE = "Inactive", "Inactive"
+    ARCHIVED = "Archived", "Archived"
+
+
+class EntityTypeChoices(models.TextChoices):
+    PROCESS = "Process", "Process"
+    SYSTEM = "System", "System"
+    FUNCTION = "Function", "Function"
+    PROJECT = "Project", "Project"
+    COMPLIANCE_AREA = "ComplianceArea", "Compliance Area"
+
+
+class AuditFrequencyChoices(models.TextChoices):
+    ANNUAL = "Annual", "Annual"
+    SEMI_ANNUAL = "SemiAnnual", "Semi-annual"
+    QUARTERLY = "Quarterly", "Quarterly"
+    AD_HOC = "AdHoc", "Ad hoc"
+    CONTINUOUS = "Continuous", "Continuous"
+
+
+class LastAuditRatingChoices(models.TextChoices):
+    SATISFACTORY = "Satisfactory", "Satisfactory"
+    NEEDS_IMPROVEMENT = "NeedsImprovement", "Needs improvement"
+    UNSATISFACTORY = "Unsatisfactory", "Unsatisfactory"
+    NOT_APPLICABLE = "NA", "Not applicable"
+
+
+class ComplianceStatusChoices(models.TextChoices):
+    COMPLIANT = "Compliant", "Compliant"
+    NON_COMPLIANT = "NonCompliant", "Non-compliant"
+    IN_REVIEW = "InReview", "In review"
+    NOT_ASSESSED = "NotAssessed", "Not assessed"
+
+
+class TagCategoryChoices(models.TextChoices):
+    COMPLIANCE = "Compliance", "Compliance"
+    REGULATORY = "Regulatory", "Regulatory"
+    FUNCTIONAL = "Functional", "Functional"
+    RISK = "Risk", "Risk"
+    CUSTOM = "Custom", "Custom"
+
+
+class AuditableEntityActiveManager(models.Manager):
+    """Default manager that excludes Archived rows.
+
+    Use ``AuditableEntity.objects`` for the active set, and
+    ``AuditableEntity.all_objects`` when archived rows are required
+    (admin views, restore flow, ERP reconciliation).
+    """
+
+    def get_queryset(self):  # noqa: D401 - Django manager API
+        return super().get_queryset().exclude(status=EntityStatusChoices.ARCHIVED)
+
+
 class Department(TimeStampedModel):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     name = models.CharField(max_length=200, unique=True)
     head = models.CharField(max_length=200, blank=True)
-    risk_rating = models.CharField(max_length=20, default="Medium")
+    risk_rating = models.CharField(
+        max_length=20,
+        choices=RiskRatingChoices.choices,
+        default=RiskRatingChoices.MEDIUM,
+    )
     last_audit_date = models.DateField(null=True, blank=True)
     next_audit_date = models.DateField(null=True, blank=True)
     entity_count = models.PositiveIntegerField(default=0)
+    # Phase 7 Track 1 — link Departments under a BusinessUnit umbrella.
+    # Nullable for backfill compatibility; populated by the migration's
+    # seed step or by manual mapping in admin.
+    business_unit = models.ForeignKey(
+        "BusinessUnit",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="departments",
+    )
 
     class Meta:
         ordering = ["name"]
+
+    def __str__(self):
+        return self.name
+
+
+class BusinessUnit(TimeStampedModel):
+    """A top-level organizational grouping above Departments.
+
+    The reference design groups Departments under Business Units
+    (e.g. "Finance & Treasury" → Accounts Payable, General Ledger).
+    Self-referential ``parent`` supports multi-level BU hierarchies
+    (Group → Region → BU) without forcing a fixed depth.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    name = models.CharField(max_length=200, unique=True)
+    code = models.CharField(max_length=32, blank=True, db_index=True)
+    head = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="led_business_units",
+    )
+    parent = models.ForeignKey(
+        "self",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="children",
+    )
+    risk_appetite = models.CharField(
+        max_length=20,
+        choices=RiskRatingChoices.choices,
+        default=RiskRatingChoices.MEDIUM,
+    )
+    description = models.TextField(blank=True)
+
+    class Meta:
+        ordering = ["name"]
+
+    def __str__(self):
+        return self.name
+
+
+class Tag(TimeStampedModel):
+    """Reusable classification labels for AuditableEntity and related rows.
+
+    Tags themselves are first-class records (for autocomplete, governance,
+    colour assignment). The link to ``AuditableEntity`` stays a JSONField
+    of string names — matching the existing convention on ``ManagedDocument``
+    — so wire payloads stay simple.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    name = models.CharField(max_length=100, unique=True)
+    slug = models.SlugField(max_length=120, unique=True)
+    color = models.CharField(max_length=16, blank=True)
+    category = models.CharField(
+        max_length=20,
+        choices=TagCategoryChoices.choices,
+        default=TagCategoryChoices.CUSTOM,
+    )
+    description = models.CharField(max_length=255, blank=True)
+
+    class Meta:
+        ordering = ["category", "name"]
 
     def __str__(self):
         return self.name
@@ -348,20 +502,107 @@ class TimelineEvent(TimeStampedModel):
 class AuditableEntity(TimeStampedModel):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     name = models.CharField(max_length=255)
-    department = models.CharField(max_length=200)
+    # Legacy free-text columns retained for backward compatibility with
+    # API consumers built against pre-Phase-7 schema. New writes must
+    # populate department_ref / primary_owner; these fields are dropped
+    # in a follow-up migration once all callers have cut over.
+    department = models.CharField(max_length=200, blank=True)
     department_ref = models.ForeignKey(
         Department, on_delete=models.SET_NULL, null=True, blank=True, related_name="auditable_entities"
     )
     owner = models.CharField(max_length=200, blank=True)
-    risk_rating = models.CharField(max_length=20, default="Medium")
+
+    # ── Phase 7 Track 1: enterprise audit-universe fields ──────────────
+    parent = models.ForeignKey(
+        "self",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="children",
+        help_text="Optional parent entity for hierarchy "
+        "(e.g. Financial Operations → Accounts Payable Oversight).",
+    )
+    business_unit = models.ForeignKey(
+        BusinessUnit,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="auditable_entities",
+    )
+    entity_type = models.CharField(
+        max_length=32,
+        choices=EntityTypeChoices.choices,
+        default=EntityTypeChoices.PROCESS,
+    )
+    primary_owner = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="primary_owned_entities",
+    )
+    secondary_owner = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="secondary_owned_entities",
+    )
+    location = models.CharField(max_length=120, blank=True)
+    audit_frequency = models.CharField(
+        max_length=20,
+        choices=AuditFrequencyChoices.choices,
+        default=AuditFrequencyChoices.ANNUAL,
+    )
+    last_audit_rating = models.CharField(
+        max_length=24,
+        choices=LastAuditRatingChoices.choices,
+        blank=True,
+    )
+    last_audit_period = models.CharField(max_length=32, blank=True)
+    primary_language = models.CharField(max_length=8, blank=True, default="en")
+    headcount = models.PositiveIntegerField(null=True, blank=True)
+    operating_budget = models.DecimalField(
+        max_digits=18, decimal_places=2, null=True, blank=True
+    )
+    is_mandatory_to_audit = models.BooleanField(default=False)
+    cost_center_id = models.CharField(max_length=64, blank=True, db_index=True)
+    tags = models.JSONField(default=list, blank=True)
+    compliance_status = models.CharField(
+        max_length=20,
+        choices=ComplianceStatusChoices.choices,
+        default=ComplianceStatusChoices.NOT_ASSESSED,
+    )
+    inherent_likelihood = models.PositiveSmallIntegerField(null=True, blank=True)
+    inherent_impact = models.PositiveSmallIntegerField(null=True, blank=True)
+    description = models.TextField(blank=True)
+    # Optimistic locking. Bumped on every save by the API serializer;
+    # PATCH requests must include the current value or receive 409.
+    version = models.PositiveIntegerField(default=1)
+
+    # ── Locked-down enums (replacing free-text defaults) ───────────────
+    risk_rating = models.CharField(
+        max_length=20,
+        choices=RiskRatingChoices.choices,
+        default=RiskRatingChoices.MEDIUM,
+    )
     last_audit_date = models.DateField(null=True, blank=True)
     next_audit_date = models.DateField(null=True, blank=True)
-    status = models.CharField(max_length=50, default="Active")
+    status = models.CharField(
+        max_length=20,
+        choices=EntityStatusChoices.choices,
+        default=EntityStatusChoices.ACTIVE,
+    )
+
     # Phase 6 Track 2 — external system provenance. Identifies the
     # row when it was created (or last updated) from an inbound ERP
     # feed; idempotent upserts key off (external_source, external_id).
     external_source = models.CharField(max_length=64, blank=True, db_index=True)
     external_id = models.CharField(max_length=128, blank=True, db_index=True)
+
+    # Default manager hides Archived rows; use ``all_objects`` to include them.
+    objects = AuditableEntityActiveManager()
+    all_objects = models.Manager()
 
     class Meta:
         constraints = [
@@ -371,6 +612,76 @@ class AuditableEntity(TimeStampedModel):
                 name="iams_auditable_entity_external_unique",
             ),
         ]
+        indexes = [
+            models.Index(fields=["parent"], name="ae_parent_idx"),
+            models.Index(fields=["business_unit", "status"], name="ae_bu_status_idx"),
+            models.Index(fields=["department_ref", "status"], name="ae_dept_status_idx"),
+            models.Index(fields=["risk_rating", "status"], name="ae_risk_status_idx"),
+            models.Index(fields=["next_audit_date"], name="ae_next_audit_idx"),
+            models.Index(fields=["primary_owner"], name="ae_primary_owner_idx"),
+            models.Index(fields=["compliance_status"], name="ae_compliance_idx"),
+        ]
+
+    def __str__(self):
+        return self.name
+
+
+class AuditableEntityRevision(TimeStampedModel):
+    """Append-only field-level change history for AuditableEntity.
+
+    Distinct from the global ``AuditLogEntry`` (which captures CRUD
+    metadata for any audited viewset): this table stores a structured
+    diff per save so the Revisions tab on the entity detail page can
+    render "Maria changed Risk Rating from Medium → High on 2026-04-12
+    (Q1 review)". Save / delete are rejected after insert to preserve
+    audit-trail integrity.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    entity = models.ForeignKey(
+        AuditableEntity,
+        on_delete=models.CASCADE,
+        related_name="revisions",
+    )
+    version = models.PositiveIntegerField()
+    changed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="audit_entity_revisions",
+    )
+    changes = models.JSONField(
+        default=dict,
+        help_text='Field-level diff: {"field": {"from": <old>, "to": <new>}}.',
+    )
+    comment = models.CharField(max_length=255, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["entity", "version"],
+                name="iams_ae_revision_unique_version",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["entity", "-version"], name="ae_rev_entity_ver_idx"),
+        ]
+
+    def save(self, *args, **kwargs):
+        # UUID PKs are populated by `default=` before save, so guard on
+        # ``_state.adding`` rather than ``pk is not None``.
+        if not self._state.adding:
+            raise PermissionError(
+                "AuditableEntityRevision is append-only; updates are not permitted."
+            )
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise PermissionError(
+            "AuditableEntityRevision is append-only; deletes are not permitted."
+        )
 
 
 class RiskHistoryEntry(TimeStampedModel):

@@ -6,8 +6,10 @@ from iams.views import (
     AssignmentViewSet,
     AuditLogViewSet,
     AuditViewSet,
+    AuditableEntityRevisionViewSet,
     AuditableEntityViewSet,
     AuditorViewSet,
+    BusinessUnitViewSet,
     ChecklistByAuditView,
     ChecklistItemViewSet,
     CommentViewSet,
@@ -34,6 +36,7 @@ from iams.views import (
     RiskAssessmentSummaryViewSet,
     RiskAssessmentViewSet,
     RiskHistoryViewSet,
+    TagViewSet,
     IntegrationEventViewSet,
     IntegrationSourceViewSet,
     IntegrationWebhookView,
@@ -94,6 +97,13 @@ router.register("activities", ActivityViewSet, basename="activity")
 router.register("checklist-items", ChecklistItemViewSet, basename="checklist-item")
 router.register("evidence-files", EvidenceFileViewSet, basename="evidence-file")
 router.register("auditable-entities", AuditableEntityViewSet, basename="auditable-entity")
+router.register(
+    "audit-universe-revisions",
+    AuditableEntityRevisionViewSet,
+    basename="audit-universe-revision",
+)
+router.register("business-units", BusinessUnitViewSet, basename="business-unit")
+router.register("tags", TagViewSet, basename="tag")
 router.register("risk-history", RiskHistoryViewSet, basename="risk-history")
 router.register("notifications", NotificationViewSet, basename="notification")
 router.register("notification-preferences", NotificationPreferenceViewSet, basename="notification-preference")

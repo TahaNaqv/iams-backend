@@ -14,8 +14,11 @@ from iams.domain_serializers import (
     AuditAssignmentWriteSerializer,
     AuditLogEntrySerializer,
     AuditSerializer,
+    AuditableEntityListSerializer,
+    AuditableEntityRevisionSerializer,
     AuditableEntitySerializer,
     AuditorSerializer,
+    BusinessUnitSerializer,
     ChecklistItemSerializer,
     ChecklistItemWriteSerializer,
     CommentSerializer,
@@ -37,6 +40,7 @@ from iams.domain_serializers import (
     RiskAssessmentSheetSerializer,
     RiskAssessmentSummaryItemSerializer,
     RiskHistoryEntrySerializer,
+    TagSerializer,
     ApprovalRequestSerializer,
     WorkProgramSerializer,
     WorkProgramWriteSerializer,
@@ -61,11 +65,14 @@ from iams.models import (
     AuditAssignment,
     AuditLogEntry,
     AuditableEntity,
+    AuditableEntityRevision,
     Auditor,
+    BusinessUnit,
     ChecklistItem,
     Comment,
     CorrectiveAction,
     Department,
+    EntityStatusChoices,
     EvidenceFile,
     Finding,
     FollowUpItem,
@@ -79,6 +86,7 @@ from iams.models import (
     RiskAssessmentSheet,
     RiskAssessmentSummaryItem,
     RiskHistoryEntry,
+    Tag,
     ApprovalRequest,
     WorkProgram,
     WorkProcedure,
@@ -91,6 +99,12 @@ from iams.models import (
     TimelineEvent,
 )
 from iams.audit import AuditedViewSetMixin
+from iams.filters import (
+    AuditableEntityFilter,
+    BusinessUnitFilter,
+    DepartmentFilter,
+    TagFilter,
+)
 from iams.permissions import HasPermission
 
 
@@ -150,10 +164,17 @@ class CorrectiveActionViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
         return CorrectiveActionSerializer
 
 
-class DepartmentViewSet(viewsets.ReadOnlyModelViewSet):
-    queryset = Department.objects.all()
+class DepartmentViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
+    queryset = Department.objects.all().select_related("business_unit").order_by("name", "id")
     serializer_class = DepartmentSerializer
-    permission_classes = [HasPermission("view_audits")]
+    filterset_class = DepartmentFilter
+    search_fields = ["name", "head"]
+    ordering_fields = ["name", "risk_rating", "last_audit_date", "next_audit_date", "entity_count"]
+
+    def get_permissions(self):
+        if self.action in ("list", "retrieve"):
+            return [IsAuthenticated(), HasPermission("view_audits")()]
+        return [IsAuthenticated(), HasPermission("edit_audits")()]
 
 
 class ActivityViewSet(viewsets.ReadOnlyModelViewSet):
@@ -295,10 +316,413 @@ class TimelineByAuditView(APIView):
         return Response(TimelineEventSerializer(item).data, status=status.HTTP_201_CREATED)
 
 
-class AuditableEntityViewSet(viewsets.ReadOnlyModelViewSet):
-    queryset = AuditableEntity.objects.all().order_by("name", "id")
+class AuditableEntityViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
+    """Writable audit-universe API.
+
+    Defaults to the active set (``status != Archived``); use
+    ``?status=Archived`` or ``?includeArchived=true`` to see archived
+    rows. Soft-delete via the dedicated ``archive`` action — DELETE
+    against this resource also performs a soft-delete to preserve the
+    audit trail downstream.
+    """
+
     serializer_class = AuditableEntitySerializer
+    filterset_class = AuditableEntityFilter
+    search_fields = [
+        "name",
+        "description",
+        "cost_center_id",
+        "department",
+        "department_ref__name",
+        "business_unit__name",
+    ]
+    ordering_fields = [
+        "name",
+        "risk_rating",
+        "compliance_status",
+        "last_audit_date",
+        "next_audit_date",
+        "headcount",
+        "operating_budget",
+        "created_at",
+        "updated_at",
+    ]
+    ordering = ["name", "id"]
+
+    # Map every action to a permission code so the role matrix is auditable.
+    _ACTION_PERMISSIONS: dict[str, str] = {
+        "list": "view_audits",
+        "retrieve": "view_audits",
+        "tree": "view_audits",
+        "lineage": "view_audits",
+        "revisions": "view_audits",
+        "coverage": "view_audits",
+        "kpis": "view_audits",
+        "export": "view_audits",
+        "create": "create_audits",
+        "bulk_import": "create_audits",
+        "clone": "create_audits",
+        "update": "edit_audits",
+        "partial_update": "edit_audits",
+        "bulk_update": "edit_audits",
+        "archive": "edit_audits",
+        "restore": "edit_audits",
+        "recompute": "edit_audits",
+        "destroy": "edit_audits",
+    }
+
+    def get_permissions(self):
+        perm = self._ACTION_PERMISSIONS.get(self.action, "view_audits")
+        return [IsAuthenticated(), HasPermission(perm)()]
+
+    def get_queryset(self):
+        include_archived = self.request.query_params.get("includeArchived", "").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        explicit_status = self.request.query_params.get("status")
+        manager = AuditableEntity.all_objects if (include_archived or explicit_status) else AuditableEntity.objects
+        qs = manager.all().select_related(
+            "department_ref",
+            "business_unit",
+            "primary_owner",
+            "secondary_owner",
+            "parent",
+        )
+        # Annotate child count for tree-aware list views.
+        qs = qs.annotate(
+            _child_count=Count(
+                "children",
+                filter=~Q(children__status=EntityStatusChoices.ARCHIVED),
+            )
+        )
+        return qs
+
+    def get_serializer_class(self):
+        if self.action in ("list", "tree"):
+            # Lighter projection for list/tree to reduce payload size.
+            requested = self.request.query_params.get("fields")
+            if requested != "full":
+                return AuditableEntityListSerializer
+        return AuditableEntitySerializer
+
+    # ─── Revision capture ─────────────────────────────────────────────
+    # Tracked fields whose changes appear in the immutable
+    # AuditableEntityRevision diff. Excludes timestamps, version, and
+    # mirror columns derived from FKs.
+    _REVISION_TRACKED_FIELDS = (
+        "name",
+        "description",
+        "entity_type",
+        "status",
+        "risk_rating",
+        "compliance_status",
+        "audit_frequency",
+        "last_audit_rating",
+        "last_audit_date",
+        "next_audit_date",
+        "last_audit_period",
+        "primary_language",
+        "location",
+        "headcount",
+        "operating_budget",
+        "is_mandatory_to_audit",
+        "cost_center_id",
+        "tags",
+        "inherent_likelihood",
+        "inherent_impact",
+        "department_ref_id",
+        "business_unit_id",
+        "primary_owner_id",
+        "secondary_owner_id",
+        "parent_id",
+    )
+
+    @staticmethod
+    def _capture_field_values(instance):
+        snapshot = {}
+        for f in AuditableEntityViewSet._REVISION_TRACKED_FIELDS:
+            value = getattr(instance, f, None)
+            # Stringify UUID/Date/Decimal for JSON-safe storage.
+            if value is None or isinstance(value, (str, int, float, bool, list, dict)):
+                snapshot[f] = value
+            else:
+                snapshot[f] = str(value)
+        return snapshot
+
+    def _record_revision(self, instance, before, comment=""):
+        after = self._capture_field_values(instance)
+        diff = {}
+        for key, new_val in after.items():
+            old_val = before.get(key) if before is not None else None
+            if old_val != new_val:
+                diff[key] = {"from": old_val, "to": new_val}
+        if not diff and before is not None:
+            # No-op save (e.g. an idempotent PATCH); skip a noisy revision.
+            return
+        AuditableEntityRevision.objects.create(
+            entity=instance,
+            version=instance.version or 1,
+            changed_by=self.request.user if self.request.user.is_authenticated else None,
+            changes=diff if before is not None else {"_initial": after},
+            comment=comment,
+        )
+
+    def perform_create(self, serializer):
+        instance = serializer.save()
+        self._record_revision(instance, before=None, comment="Created.")
+
+    def perform_update(self, serializer):
+        before = self._capture_field_values(serializer.instance)
+        instance = serializer.save()
+        self._record_revision(instance, before=before)
+
+    # ─── Soft-delete semantics ────────────────────────────────────────
+    def perform_destroy(self, instance):
+        before = self._capture_field_values(instance)
+        instance.status = EntityStatusChoices.ARCHIVED
+        instance.version = (instance.version or 0) + 1
+        instance.save(update_fields=["status", "version", "updated_at"])
+        self._record_revision(instance, before=before, comment="Archived (DELETE).")
+
+    @action(detail=True, methods=["post"], url_path="archive")
+    def archive(self, request, pk=None):
+        instance = self.get_object()
+        if instance.status == EntityStatusChoices.ARCHIVED:
+            return Response(
+                {"detail": "Entity is already archived."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        before = self._capture_field_values(instance)
+        instance.status = EntityStatusChoices.ARCHIVED
+        instance.version = (instance.version or 0) + 1
+        instance.save(update_fields=["status", "version", "updated_at"])
+        self._record_revision(instance, before=before, comment="Archived.")
+        return Response(self.get_serializer(instance).data)
+
+    @action(detail=True, methods=["post"], url_path="restore")
+    def restore(self, request, pk=None):
+        try:
+            instance = AuditableEntity.all_objects.get(pk=pk)
+        except AuditableEntity.DoesNotExist:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        if instance.status != EntityStatusChoices.ARCHIVED:
+            return Response(
+                {"detail": "Entity is not archived."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        before = self._capture_field_values(instance)
+        instance.status = EntityStatusChoices.ACTIVE
+        instance.version = (instance.version or 0) + 1
+        instance.save(update_fields=["status", "version", "updated_at"])
+        self._record_revision(instance, before=before, comment="Restored.")
+        return Response(self.get_serializer(instance).data)
+
+    # ─── Hierarchy ────────────────────────────────────────────────────
+    @action(detail=False, methods=["get"], url_path="tree")
+    def tree(self, request):
+        """Returns a nested-tree projection.
+
+        Query params:
+          ``root`` (uuid)  — start the tree at a specific entity (default: top-level)
+          ``depth`` (int)  — max depth, default 5 (capped at 10)
+          standard filters from ``AuditableEntityFilter`` also apply.
+        """
+        try:
+            depth = min(int(request.query_params.get("depth", 5)), 10)
+        except (TypeError, ValueError):
+            depth = 5
+        root_id = request.query_params.get("root")
+
+        qs = self.filter_queryset(self.get_queryset())
+        all_rows = list(qs)
+        by_parent: dict = {}
+        for row in all_rows:
+            by_parent.setdefault(row.parent_id, []).append(row)
+
+        def build(node, level):
+            data = AuditableEntityListSerializer(node).data
+            if level >= depth:
+                data["children"] = []
+            else:
+                data["children"] = [build(c, level + 1) for c in by_parent.get(node.id, [])]
+            return data
+
+        if root_id:
+            root = get_object_or_404(AuditableEntity.all_objects, pk=root_id)
+            return Response([build(root, 0)])
+        roots = by_parent.get(None, [])
+        return Response([build(r, 0) for r in roots])
+
+    @action(detail=True, methods=["get"], url_path="lineage")
+    def lineage(self, request, pk=None):
+        """Returns the ancestor chain for breadcrumb rendering."""
+        instance = self.get_object()
+        chain: list = []
+        node = instance.parent
+        seen = set()
+        while node is not None and node.id not in seen:
+            chain.append({"id": str(node.id), "name": node.name})
+            seen.add(node.id)
+            node = node.parent
+        chain.reverse()
+        return Response(chain)
+
+    # ─── Revisions ────────────────────────────────────────────────────
+    @action(detail=True, methods=["get"], url_path="revisions")
+    def revisions(self, request, pk=None):
+        instance = self.get_object()
+        page = self.paginate_queryset(instance.revisions.all())
+        ser = AuditableEntityRevisionSerializer(page or instance.revisions.all(), many=True)
+        if page is not None:
+            return self.get_paginated_response(ser.data)
+        return Response(ser.data)
+
+    # ─── Operations ───────────────────────────────────────────────────
+    @action(detail=True, methods=["post"], url_path="clone")
+    def clone(self, request, pk=None):
+        src = self.get_object()
+        new_name = request.data.get("name") or f"{src.name} (Copy)"
+        clone = AuditableEntity.objects.create(
+            name=new_name,
+            department=src.department,
+            department_ref=src.department_ref,
+            business_unit=src.business_unit,
+            entity_type=src.entity_type,
+            primary_owner=src.primary_owner,
+            secondary_owner=src.secondary_owner,
+            location=src.location,
+            audit_frequency=src.audit_frequency,
+            primary_language=src.primary_language,
+            headcount=src.headcount,
+            operating_budget=src.operating_budget,
+            is_mandatory_to_audit=src.is_mandatory_to_audit,
+            cost_center_id="",  # cost centers should not collide
+            tags=list(src.tags or []),
+            description=src.description,
+            inherent_likelihood=src.inherent_likelihood,
+            inherent_impact=src.inherent_impact,
+            parent=src.parent,
+        )
+        return Response(
+            self.get_serializer(clone).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+    @action(detail=False, methods=["get"], url_path="kpis")
+    def kpis(self, request):
+        """Single-shot KPI strip for the universe dashboard.
+
+        Cached for 60s in Redis to absorb dashboard polling.
+        """
+        from django.core.cache import cache
+        from iams.models import Audit
+        cache_key = "audit_universe:kpis:v1"
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return Response(cached)
+
+        active = AuditableEntity.objects.all()
+        total = active.count()
+        critical = active.filter(risk_rating="Critical").count()
+        compliant = active.filter(compliance_status="Compliant").count()
+        compliance_rate = round((compliant / total) * 100, 1) if total else 0.0
+        open_audits = Audit.objects.exclude(status="Completed").count()
+        mandatory = active.filter(is_mandatory_to_audit=True).count()
+        mandatory_with_plan = active.filter(
+            is_mandatory_to_audit=True, next_audit_date__isnull=False
+        ).count()
+        plan_progress = (
+            round((mandatory_with_plan / mandatory) * 100, 1) if mandatory else 0.0
+        )
+        payload = {
+            "totalEntities": total,
+            "criticalRisks": critical,
+            "complianceRate": compliance_rate,
+            "openAudits": open_audits,
+            "planProgress": plan_progress,
+            "asOf": timezone.now(),
+        }
+        cache.set(cache_key, payload, timeout=60)
+        return Response(payload)
+
+    @action(detail=False, methods=["get"], url_path="coverage")
+    def coverage(self, request):
+        """Data-quality report for the audit universe."""
+        from datetime import timedelta
+        three_years_ago = timezone.now().date() - timedelta(days=365 * 3)
+        qs = AuditableEntity.objects.all()
+        return Response({
+            "withoutOwner": qs.filter(primary_owner__isnull=True).count(),
+            "withoutDepartment": qs.filter(department_ref__isnull=True).count(),
+            "withoutNextAudit": qs.filter(next_audit_date__isnull=True).count(),
+            "neverAudited": qs.filter(last_audit_date__isnull=True).count(),
+            "staleOver3Years": qs.filter(last_audit_date__lt=three_years_ago).count(),
+            "mandatoryWithoutPlan": qs.filter(
+                is_mandatory_to_audit=True, next_audit_date__isnull=True
+            ).count(),
+        })
+
+    @action(detail=False, methods=["post"], url_path="recompute-risk-scores")
+    def recompute(self, request):
+        """Convenience action that delegates to the risk engine.
+
+        Re-snapshots every entity scored against the active risk model.
+        Heavy work happens synchronously here; a future task migrates
+        this to a Celery job with a poll-able job id.
+        """
+        from iams.models import RiskScoringModel
+        from iams.risk_engine import recompute_all_scores_for_model
+
+        model = RiskScoringModel.objects.filter(is_active=True).first()
+        if model is None:
+            return Response(
+                {"detail": "No active risk-scoring model is configured."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        count = recompute_all_scores_for_model(model, by_user=request.user)
+        return Response({"recomputed": count, "modelId": str(model.id)})
+
+
+class BusinessUnitViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
+    queryset = BusinessUnit.objects.all().select_related("parent", "head").order_by("name", "id")
+    serializer_class = BusinessUnitSerializer
+    filterset_class = BusinessUnitFilter
+    search_fields = ["name", "code", "description"]
+    ordering_fields = ["name", "code", "created_at"]
+
+    def get_permissions(self):
+        if self.action in ("list", "retrieve"):
+            return [IsAuthenticated(), HasPermission("view_audits")()]
+        return [IsAuthenticated(), HasPermission("edit_audits")()]
+
+
+class TagViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
+    queryset = Tag.objects.all().order_by("category", "name")
+    serializer_class = TagSerializer
+    filterset_class = TagFilter
+    search_fields = ["name", "description"]
+    ordering_fields = ["name", "category", "created_at"]
+
+    def get_permissions(self):
+        if self.action in ("list", "retrieve"):
+            return [IsAuthenticated(), HasPermission("view_audits")()]
+        return [IsAuthenticated(), HasPermission("edit_audits")()]
+
+
+class AuditableEntityRevisionViewSet(viewsets.ReadOnlyModelViewSet):
+    """Read-only listing of every revision across all entities.
+
+    Per-entity revisions are also exposed via
+    ``GET /api/auditable-entities/{id}/revisions/``; this resource
+    powers the admin "Audit Universe activity" page.
+    """
+
+    queryset = AuditableEntityRevision.objects.all().select_related("entity", "changed_by")
+    serializer_class = AuditableEntityRevisionSerializer
     permission_classes = [HasPermission("view_audits")]
+    ordering = ["-created_at"]
 
 
 class RiskHistoryViewSet(viewsets.ReadOnlyModelViewSet):

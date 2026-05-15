@@ -1,6 +1,9 @@
 from decimal import Decimal
 
+from django.contrib.auth import get_user_model
 from rest_framework import serializers
+
+User = get_user_model()
 
 from iams.models import (
     ActivityItem,
@@ -8,12 +11,15 @@ from iams.models import (
     Audit,
     AuditAssignment,
     AuditableEntity,
+    AuditableEntityRevision,
     AuditLogEntry,
     Auditor,
+    BusinessUnit,
     ChecklistItem,
     Comment,
     CorrectiveAction,
     Department,
+    EntityStatusChoices,
     EvidenceFile,
     Finding,
     FollowUpItem,
@@ -27,6 +33,7 @@ from iams.models import (
     RiskAssessmentSheet,
     RiskAssessmentSummaryItem,
     RiskHistoryEntry,
+    Tag,
     TimeEntry,
     TimelineEvent,
     ApprovalRequest,
@@ -40,15 +47,109 @@ from iams.models import (
 )
 
 
+class BusinessUnitSummarySerializer(serializers.ModelSerializer):
+    """Compact representation embedded inside other resources."""
+
+    class Meta:
+        model = BusinessUnit
+        fields = ["id", "name", "code"]
+        read_only_fields = fields
+
+
+class BusinessUnitSerializer(serializers.ModelSerializer):
+    riskAppetite = serializers.CharField(source="risk_appetite")
+    parentId = serializers.PrimaryKeyRelatedField(
+        source="parent",
+        queryset=BusinessUnit.objects.all(),
+        required=False,
+        allow_null=True,
+    )
+    headId = serializers.PrimaryKeyRelatedField(
+        source="head",
+        queryset=User.objects.all(),
+        required=False,
+        allow_null=True,
+    )
+    departmentCount = serializers.SerializerMethodField()
+    childCount = serializers.SerializerMethodField()
+
+    class Meta:
+        model = BusinessUnit
+        fields = [
+            "id",
+            "name",
+            "code",
+            "headId",
+            "parentId",
+            "riskAppetite",
+            "description",
+            "departmentCount",
+            "childCount",
+        ]
+
+    def get_departmentCount(self, obj):
+        return obj.departments.count() if obj.pk else 0
+
+    def get_childCount(self, obj):
+        return obj.children.count() if obj.pk else 0
+
+    def validate_parentId(self, value):
+        if value and self.instance and value.pk == self.instance.pk:
+            raise serializers.ValidationError("A business unit cannot be its own parent.")
+        # Cycle check
+        seen = set()
+        node = value
+        while node is not None:
+            if node.pk in seen:
+                raise serializers.ValidationError("Cycle detected in business-unit hierarchy.")
+            if self.instance and node.pk == self.instance.pk:
+                raise serializers.ValidationError(
+                    "Setting this parent would create a cycle."
+                )
+            seen.add(node.pk)
+            node = node.parent
+        return value
+
+
+class TagSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Tag
+        fields = ["id", "name", "slug", "color", "category", "description"]
+        read_only_fields = ["id", "slug"]
+
+    def create(self, validated_data):
+        from django.utils.text import slugify
+        validated_data.setdefault("slug", slugify(validated_data["name"]))
+        return super().create(validated_data)
+
+
 class DepartmentSerializer(serializers.ModelSerializer):
-    riskRating = serializers.CharField(source="risk_rating")
-    lastAuditDate = serializers.DateField(source="last_audit_date", allow_null=True)
-    nextAuditDate = serializers.DateField(source="next_audit_date", allow_null=True)
-    entityCount = serializers.IntegerField(source="entity_count")
+    riskRating = serializers.CharField(source="risk_rating", required=False)
+    lastAuditDate = serializers.DateField(source="last_audit_date", allow_null=True, required=False)
+    nextAuditDate = serializers.DateField(source="next_audit_date", allow_null=True, required=False)
+    entityCount = serializers.IntegerField(source="entity_count", read_only=True)
+    businessUnit = BusinessUnitSummarySerializer(source="business_unit", read_only=True)
+    businessUnitId = serializers.PrimaryKeyRelatedField(
+        source="business_unit",
+        queryset=BusinessUnit.objects.all(),
+        required=False,
+        allow_null=True,
+        write_only=True,
+    )
 
     class Meta:
         model = Department
-        fields = ["id", "name", "head", "riskRating", "lastAuditDate", "nextAuditDate", "entityCount"]
+        fields = [
+            "id",
+            "name",
+            "head",
+            "riskRating",
+            "lastAuditDate",
+            "nextAuditDate",
+            "entityCount",
+            "businessUnit",
+            "businessUnitId",
+        ]
 
 
 class AuditSerializer(serializers.ModelSerializer):
@@ -176,14 +277,383 @@ class TimelineEventWriteSerializer(serializers.ModelSerializer):
         fields = ["id", "auditId", "title", "description", "timestamp"]
 
 
+class UserSummarySerializer(serializers.Serializer):
+    """Minimal user representation embedded in entity responses.
+
+    Avoids leaking permission/role data; uses fields available on every
+    auth backend (id, email, display name).
+    """
+
+    id = serializers.UUIDField(read_only=True)
+    email = serializers.EmailField(read_only=True)
+    displayName = serializers.SerializerMethodField()
+
+    def get_displayName(self, obj):
+        full = (
+            f"{getattr(obj, 'first_name', '')} {getattr(obj, 'last_name', '')}".strip()
+        )
+        return full or getattr(obj, "email", "") or str(obj)
+
+
+class CurrentRiskScoreSummarySerializer(serializers.Serializer):
+    """Lightweight nested representation of the entity's current EntityRiskScore."""
+
+    compositeScore = serializers.FloatField(source="composite_score", read_only=True)
+    rank = serializers.IntegerField(read_only=True)
+    isHighRisk = serializers.SerializerMethodField()
+    snapshotAt = serializers.DateTimeField(source="snapshot_at", read_only=True)
+
+    def get_isHighRisk(self, obj):
+        model = getattr(obj, "model", None)
+        threshold = getattr(model, "high_risk_threshold", None) if model else None
+        if threshold is None or obj.composite_score is None:
+            return None
+        try:
+            return float(obj.composite_score) >= float(threshold)
+        except (TypeError, ValueError):
+            return None
+
+
 class AuditableEntitySerializer(serializers.ModelSerializer):
-    riskRating = serializers.CharField(source="risk_rating")
-    lastAuditDate = serializers.DateField(source="last_audit_date", allow_null=True)
-    nextAuditDate = serializers.DateField(source="next_audit_date", allow_null=True)
+    """Full read/write serializer for the audit universe.
+
+    Read side embeds compact summaries for FK relationships so the FE
+    can render badges without follow-up requests. Write side accepts
+    ``*Id`` aliases for every FK and validates parent cycles,
+    likelihood / impact ranges, and optimistic-locking ``version``.
+    """
+
+    # ── Identity & legacy compatibility ──
+    riskRating = serializers.ChoiceField(
+        source="risk_rating",
+        choices=AuditableEntity._meta.get_field("risk_rating").choices,
+    )
+    entityType = serializers.ChoiceField(
+        source="entity_type",
+        choices=AuditableEntity._meta.get_field("entity_type").choices,
+        required=False,
+    )
+    complianceStatus = serializers.ChoiceField(
+        source="compliance_status",
+        choices=AuditableEntity._meta.get_field("compliance_status").choices,
+        required=False,
+    )
+    auditFrequency = serializers.ChoiceField(
+        source="audit_frequency",
+        choices=AuditableEntity._meta.get_field("audit_frequency").choices,
+        required=False,
+    )
+    lastAuditRating = serializers.ChoiceField(
+        source="last_audit_rating",
+        choices=AuditableEntity._meta.get_field("last_audit_rating").choices,
+        required=False,
+        allow_blank=True,
+    )
+    lastAuditDate = serializers.DateField(source="last_audit_date", allow_null=True, required=False)
+    nextAuditDate = serializers.DateField(source="next_audit_date", allow_null=True, required=False)
+    lastAuditPeriod = serializers.CharField(source="last_audit_period", required=False, allow_blank=True)
+    primaryLanguage = serializers.CharField(source="primary_language", required=False, allow_blank=True)
+    operatingBudget = serializers.DecimalField(
+        source="operating_budget",
+        max_digits=18,
+        decimal_places=2,
+        required=False,
+        allow_null=True,
+    )
+    isMandatoryToAudit = serializers.BooleanField(source="is_mandatory_to_audit", required=False)
+    costCenterId = serializers.CharField(source="cost_center_id", required=False, allow_blank=True)
+    inherentLikelihood = serializers.IntegerField(
+        source="inherent_likelihood",
+        required=False,
+        allow_null=True,
+        min_value=1,
+        max_value=5,
+    )
+    inherentImpact = serializers.IntegerField(
+        source="inherent_impact",
+        required=False,
+        allow_null=True,
+        min_value=1,
+        max_value=5,
+    )
+
+    # ── FK relations: nested read, *Id write ──
+    department = serializers.CharField(read_only=False, required=False, allow_blank=True)
+    departmentId = serializers.PrimaryKeyRelatedField(
+        source="department_ref",
+        queryset=Department.objects.all(),
+        required=False,
+        allow_null=True,
+    )
+    departmentRef = serializers.SerializerMethodField()
+    businessUnitId = serializers.PrimaryKeyRelatedField(
+        source="business_unit",
+        queryset=BusinessUnit.objects.all(),
+        required=False,
+        allow_null=True,
+    )
+    businessUnit = BusinessUnitSummarySerializer(source="business_unit", read_only=True)
+    parentId = serializers.PrimaryKeyRelatedField(
+        source="parent",
+        queryset=AuditableEntity.all_objects.all(),
+        required=False,
+        allow_null=True,
+    )
+    parent = serializers.SerializerMethodField()
+    primaryOwnerId = serializers.PrimaryKeyRelatedField(
+        source="primary_owner",
+        queryset=User.objects.all(),
+        required=False,
+        allow_null=True,
+    )
+    primaryOwner = UserSummarySerializer(source="primary_owner", read_only=True)
+    secondaryOwnerId = serializers.PrimaryKeyRelatedField(
+        source="secondary_owner",
+        queryset=User.objects.all(),
+        required=False,
+        allow_null=True,
+    )
+    secondaryOwner = UserSummarySerializer(source="secondary_owner", read_only=True)
+
+    # ── Computed read fields ──
+    childCount = serializers.SerializerMethodField()
+    openAuditCount = serializers.SerializerMethodField()
+    currentRiskScore = serializers.SerializerMethodField()
+    lastRevisionAt = serializers.SerializerMethodField()
+    inherentScore = serializers.SerializerMethodField()
+
+    # ── Optimistic locking ──
+    version = serializers.IntegerField(required=False)
 
     class Meta:
         model = AuditableEntity
-        fields = ["id", "name", "department", "owner", "riskRating", "lastAuditDate", "nextAuditDate", "status"]
+        fields = [
+            "id",
+            "name",
+            "description",
+            "entityType",
+            "status",
+            "riskRating",
+            "complianceStatus",
+            "auditFrequency",
+            "lastAuditRating",
+            "lastAuditDate",
+            "nextAuditDate",
+            "lastAuditPeriod",
+            "primaryLanguage",
+            "location",
+            "headcount",
+            "operatingBudget",
+            "isMandatoryToAudit",
+            "costCenterId",
+            "tags",
+            "inherentLikelihood",
+            "inherentImpact",
+            "inherentScore",
+            # legacy free-text
+            "department",
+            "owner",
+            # FKs (read)
+            "departmentRef",
+            "businessUnit",
+            "primaryOwner",
+            "secondaryOwner",
+            "parent",
+            # FKs (write)
+            "departmentId",
+            "businessUnitId",
+            "primaryOwnerId",
+            "secondaryOwnerId",
+            "parentId",
+            # external provenance
+            "external_source",
+            "external_id",
+            # computed
+            "childCount",
+            "openAuditCount",
+            "currentRiskScore",
+            "lastRevisionAt",
+            "version",
+        ]
+        read_only_fields = ["id", "external_source", "external_id"]
+
+    # ── Computed read fields ──
+    def get_departmentRef(self, obj):
+        ref = obj.department_ref
+        if ref is None:
+            return None
+        return {"id": str(ref.id), "name": ref.name}
+
+    def get_parent(self, obj):
+        if obj.parent_id is None:
+            return None
+        return {"id": str(obj.parent_id), "name": obj.parent.name}
+
+    def get_childCount(self, obj):
+        if not obj.pk:
+            return 0
+        return obj.children.exclude(status=EntityStatusChoices.ARCHIVED).count()
+
+    def get_openAuditCount(self, obj):
+        if not obj.pk:
+            return 0
+        # Imported lazily to avoid circular imports
+        from iams.models import Audit
+        return Audit.objects.filter(
+            department=obj.department or obj.department_ref.name if obj.department_ref else obj.department,
+        ).exclude(status="Completed").count()
+
+    def get_currentRiskScore(self, obj):
+        if not obj.pk:
+            return None
+        current = obj.risk_scores.filter(is_current=True).first() if hasattr(obj, "risk_scores") else None
+        if current is None:
+            return None
+        return CurrentRiskScoreSummarySerializer(current).data
+
+    def get_lastRevisionAt(self, obj):
+        if not obj.pk:
+            return None
+        rev = obj.revisions.order_by("-created_at").first()
+        return rev.created_at if rev else None
+
+    def get_inherentScore(self, obj):
+        if obj.inherent_likelihood and obj.inherent_impact:
+            return obj.inherent_likelihood * obj.inherent_impact
+        return None
+
+    # ── Validation ──
+    def validate_tags(self, value):
+        if not isinstance(value, list) or not all(isinstance(t, str) for t in value):
+            raise serializers.ValidationError("Tags must be a list of strings.")
+        if len(value) > 50:
+            raise serializers.ValidationError("At most 50 tags are allowed.")
+        return value
+
+    def validate_parentId(self, value):
+        if value is None:
+            return value
+        if self.instance and value.pk == self.instance.pk:
+            raise serializers.ValidationError("An entity cannot be its own parent.")
+        seen = set()
+        node = value
+        while node is not None:
+            if node.pk in seen:
+                raise serializers.ValidationError("Cycle detected in entity hierarchy.")
+            if self.instance and node.pk == self.instance.pk:
+                raise serializers.ValidationError(
+                    "Setting this parent would create a cycle."
+                )
+            seen.add(node.pk)
+            node = node.parent
+        return value
+
+    def validate(self, attrs):
+        last = attrs.get("last_audit_date") or (
+            self.instance.last_audit_date if self.instance else None
+        )
+        nxt = attrs.get("next_audit_date") or (
+            self.instance.next_audit_date if self.instance else None
+        )
+        if last and nxt and nxt < last:
+            raise serializers.ValidationError({
+                "nextAuditDate": "Next audit date cannot precede last audit date.",
+            })
+
+        # Optimistic locking: if `version` supplied on update, it must match.
+        if self.instance is not None and "version" in attrs:
+            supplied = attrs.pop("version")
+            if supplied != self.instance.version:
+                raise serializers.ValidationError({
+                    "version": (
+                        f"Stale version: server has {self.instance.version}, "
+                        f"client sent {supplied}. Reload and re-apply your changes."
+                    ),
+                })
+        elif "version" in attrs:
+            # Ignore client-provided version on create.
+            attrs.pop("version")
+        return attrs
+
+    def create(self, validated_data):
+        # If FK is provided but legacy free-text isn't, populate it from the FK
+        # for backward compatibility with consumers reading the old shape.
+        dept_ref = validated_data.get("department_ref")
+        if dept_ref and not validated_data.get("department"):
+            validated_data["department"] = dept_ref.name
+        instance = super().create(validated_data)
+        return instance
+
+    def update(self, instance, validated_data):
+        dept_ref = validated_data.get("department_ref", instance.department_ref)
+        if dept_ref and not validated_data.get("department") and not instance.department:
+            validated_data["department"] = dept_ref.name
+        # Bump version on every successful write
+        validated_data["version"] = (instance.version or 0) + 1
+        return super().update(instance, validated_data)
+
+
+class AuditableEntityListSerializer(serializers.ModelSerializer):
+    """Lighter projection for list / tree endpoints — skips heavy nested data."""
+
+    riskRating = serializers.CharField(source="risk_rating")
+    entityType = serializers.CharField(source="entity_type")
+    complianceStatus = serializers.CharField(source="compliance_status")
+    auditFrequency = serializers.CharField(source="audit_frequency")
+    lastAuditDate = serializers.DateField(source="last_audit_date", allow_null=True)
+    nextAuditDate = serializers.DateField(source="next_audit_date", allow_null=True)
+    isMandatoryToAudit = serializers.BooleanField(source="is_mandatory_to_audit")
+    parentId = serializers.UUIDField(source="parent_id", allow_null=True)
+    departmentId = serializers.UUIDField(source="department_ref_id", allow_null=True)
+    businessUnitId = serializers.UUIDField(source="business_unit_id", allow_null=True)
+    primaryOwnerId = serializers.UUIDField(source="primary_owner_id", allow_null=True)
+    inherentScore = serializers.SerializerMethodField()
+    childCount = serializers.IntegerField(read_only=True, default=0)
+
+    class Meta:
+        model = AuditableEntity
+        fields = [
+            "id",
+            "name",
+            # Legacy fields — retained on the wire until the drop migration
+            # ships, so pre-Phase-7 clients (FE, contract tests, scripts)
+            # continue to read the shape they expect.
+            "department",
+            "owner",
+            "entityType",
+            "status",
+            "riskRating",
+            "complianceStatus",
+            "auditFrequency",
+            "lastAuditDate",
+            "nextAuditDate",
+            "isMandatoryToAudit",
+            "parentId",
+            "departmentId",
+            "businessUnitId",
+            "primaryOwnerId",
+            "tags",
+            "inherentScore",
+            "childCount",
+            "version",
+        ]
+        read_only_fields = fields
+
+    def get_inherentScore(self, obj):
+        if obj.inherent_likelihood and obj.inherent_impact:
+            return obj.inherent_likelihood * obj.inherent_impact
+        return None
+
+
+class AuditableEntityRevisionSerializer(serializers.ModelSerializer):
+    entityId = serializers.UUIDField(source="entity_id", read_only=True)
+    changedBy = UserSummarySerializer(source="changed_by", read_only=True)
+    changedAt = serializers.DateTimeField(source="created_at", read_only=True)
+
+    class Meta:
+        model = AuditableEntityRevision
+        fields = ["id", "entityId", "version", "changedBy", "changedAt", "changes", "comment"]
+        read_only_fields = fields
 
 
 class RiskHistoryEntrySerializer(serializers.ModelSerializer):

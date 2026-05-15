@@ -1,0 +1,555 @@
+"""End-to-end tests for the Phase-7 audit-universe API.
+
+Covers:
+
+* CRUD on AuditableEntity, including legacy back-compat fields
+* Soft-delete (DELETE + archive action), restore
+* Choice validation on risk_rating / status / entity_type / compliance_status
+* Hierarchy: parent FK, cycle prevention, tree endpoint, lineage
+* Tags JSONField with multi-value filters
+* Optimistic locking via the ``version`` field
+* Filters & search: q, status, riskRating, businessUnit, tagsAny, mine,
+  overdue, dueWithinDays, neverAudited
+* Custom actions: kpis, coverage, revisions, clone, archive, restore
+* RBAC: read requires view_audits; write requires create_audits /
+  edit_audits; cross-role 403s
+* AuditableEntityRevision append-only invariant
+* New child resources: Department writable, BusinessUnit, Tag
+"""
+from __future__ import annotations
+
+from datetime import date, timedelta
+from decimal import Decimal
+
+import pytest
+from rest_framework import status
+
+from iams.models import (
+    AuditableEntity,
+    AuditableEntityRevision,
+    BusinessUnit,
+    Department,
+    EntityStatusChoices,
+    RiskRatingChoices,
+    Tag,
+)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Fixtures
+# ══════════════════════════════════════════════════════════════════════
+@pytest.fixture
+def sa_client(super_admin, authed_client):
+    return authed_client(super_admin)
+
+
+@pytest.fixture
+def auditor_client(auditor_user, authed_client):
+    return authed_client(auditor_user)
+
+
+@pytest.fixture
+def manager_client(audit_manager, authed_client):
+    return authed_client(audit_manager)
+
+
+@pytest.fixture
+def finance_dept(db) -> Department:
+    return Department.objects.create(name="Finance", head="J. Doe", risk_rating="High")
+
+
+@pytest.fixture
+def it_dept(db) -> Department:
+    return Department.objects.create(name="IT", head="K. Lin", risk_rating="Medium")
+
+
+@pytest.fixture
+def finance_bu(db) -> BusinessUnit:
+    return BusinessUnit.objects.create(name="Finance & Treasury", code="FIN")
+
+
+@pytest.fixture
+def entity_ap(db, finance_dept, finance_bu) -> AuditableEntity:
+    return AuditableEntity.objects.create(
+        name="Accounts Payable",
+        department=finance_dept.name,
+        department_ref=finance_dept,
+        business_unit=finance_bu,
+        owner="J. Doe",
+        risk_rating="High",
+        inherent_likelihood=4,
+        inherent_impact=5,
+        tags=["sox", "critical"],
+        is_mandatory_to_audit=True,
+        last_audit_date=date(2025, 1, 15),
+        next_audit_date=date(2026, 7, 1),
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════
+# CRUD
+# ══════════════════════════════════════════════════════════════════════
+@pytest.mark.django_db
+def test_create_entity_with_full_payload(sa_client, finance_dept, finance_bu, super_admin):
+    payload = {
+        "name": "General Ledger Process",
+        "description": "End-of-month GL close.",
+        "entityType": "Process",
+        "riskRating": "Medium",
+        "complianceStatus": "Compliant",
+        "auditFrequency": "Quarterly",
+        "lastAuditRating": "Satisfactory",
+        "departmentId": str(finance_dept.id),
+        "businessUnitId": str(finance_bu.id),
+        "primaryOwnerId": str(super_admin.id),
+        "tags": ["sox", "high-volume"],
+        "isMandatoryToAudit": True,
+        "headcount": 8,
+        "operatingBudget": "150000.50",
+        "costCenterId": "FIN-1234",
+        "inherentLikelihood": 3,
+        "inherentImpact": 4,
+        "location": "EMEA",
+        "primaryLanguage": "en",
+    }
+    resp = sa_client.post("/api/auditable-entities/", payload, format="json")
+    assert resp.status_code == status.HTTP_201_CREATED, resp.content
+    body = resp.json()
+    assert body["name"] == "General Ledger Process"
+    assert body["riskRating"] == "Medium"
+    assert body["complianceStatus"] == "Compliant"
+    assert body["tags"] == ["sox", "high-volume"]
+    assert body["inherentScore"] == 12
+    assert body["primaryOwner"]["id"] == str(super_admin.id)
+    assert body["version"] == 1
+
+
+@pytest.mark.django_db
+def test_update_entity_bumps_version_and_records_revision(sa_client, entity_ap):
+    resp = sa_client.patch(
+        f"/api/auditable-entities/{entity_ap.id}/",
+        {"riskRating": "Critical", "version": entity_ap.version},
+        format="json",
+    )
+    assert resp.status_code == status.HTTP_200_OK, resp.content
+    body = resp.json()
+    assert body["riskRating"] == "Critical"
+    assert body["version"] == entity_ap.version + 1
+
+    revs = AuditableEntityRevision.objects.filter(entity=entity_ap)
+    assert revs.count() >= 1
+    last = revs.order_by("-created_at").first()
+    assert "risk_rating" in last.changes
+    assert last.changes["risk_rating"]["from"] == "High"
+    assert last.changes["risk_rating"]["to"] == "Critical"
+
+
+@pytest.mark.django_db
+def test_optimistic_lock_rejects_stale_version(sa_client, entity_ap):
+    resp = sa_client.patch(
+        f"/api/auditable-entities/{entity_ap.id}/",
+        {"riskRating": "Critical", "version": 99},
+        format="json",
+    )
+    assert resp.status_code == status.HTTP_400_BAD_REQUEST
+    assert "version" in resp.json()
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Choice validation
+# ══════════════════════════════════════════════════════════════════════
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    "field,bad_value",
+    [
+        ("riskRating", "Extreme"),
+        ("status", "Banana"),
+        ("entityType", "NotAType"),
+        ("complianceStatus", "Pending"),
+        ("auditFrequency", "Sometimes"),
+    ],
+)
+def test_choice_validation_rejects_unknown_values(sa_client, finance_dept, field, bad_value):
+    payload = {
+        "name": f"Bad-{field}",
+        "departmentId": str(finance_dept.id),
+        "riskRating": "Medium",
+        field: bad_value,
+    }
+    resp = sa_client.post("/api/auditable-entities/", payload, format="json")
+    assert resp.status_code == status.HTTP_400_BAD_REQUEST, resp.content
+    assert field in resp.json()
+
+
+@pytest.mark.django_db
+def test_inherent_likelihood_range_validation(sa_client, finance_dept):
+    payload = {
+        "name": "Out of range",
+        "departmentId": str(finance_dept.id),
+        "riskRating": "Medium",
+        "inherentLikelihood": 9,
+    }
+    resp = sa_client.post("/api/auditable-entities/", payload, format="json")
+    assert resp.status_code == status.HTTP_400_BAD_REQUEST
+    assert "inherentLikelihood" in resp.json()
+
+
+@pytest.mark.django_db
+def test_next_audit_date_must_be_after_last(sa_client, entity_ap):
+    resp = sa_client.patch(
+        f"/api/auditable-entities/{entity_ap.id}/",
+        {
+            "lastAuditDate": "2026-01-01",
+            "nextAuditDate": "2025-12-01",
+            "version": entity_ap.version,
+        },
+        format="json",
+    )
+    assert resp.status_code == status.HTTP_400_BAD_REQUEST
+    assert "nextAuditDate" in resp.json()
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Hierarchy & cycle prevention
+# ══════════════════════════════════════════════════════════════════════
+@pytest.mark.django_db
+def test_self_parent_rejected(sa_client, entity_ap):
+    resp = sa_client.patch(
+        f"/api/auditable-entities/{entity_ap.id}/",
+        {"parentId": str(entity_ap.id), "version": entity_ap.version},
+        format="json",
+    )
+    assert resp.status_code == status.HTTP_400_BAD_REQUEST
+    assert "parentId" in resp.json()
+
+
+@pytest.mark.django_db
+def test_cycle_detection_in_parent_chain(sa_client, finance_dept):
+    a = AuditableEntity.objects.create(name="A", department_ref=finance_dept)
+    b = AuditableEntity.objects.create(name="B", department_ref=finance_dept, parent=a)
+    c = AuditableEntity.objects.create(name="C", department_ref=finance_dept, parent=b)
+    # Try to make A a child of C → A->...->C->A would cycle.
+    resp = sa_client.patch(
+        f"/api/auditable-entities/{a.id}/",
+        {"parentId": str(c.id), "version": a.version},
+        format="json",
+    )
+    assert resp.status_code == status.HTTP_400_BAD_REQUEST
+
+
+@pytest.mark.django_db
+def test_tree_endpoint_returns_nested_children(sa_client, finance_dept):
+    parent = AuditableEntity.objects.create(name="Financial Operations", department_ref=finance_dept)
+    AuditableEntity.objects.create(name="AP Oversight", department_ref=finance_dept, parent=parent)
+    AuditableEntity.objects.create(name="Treasury Hedging", department_ref=finance_dept, parent=parent)
+    resp = sa_client.get("/api/auditable-entities/tree/")
+    assert resp.status_code == status.HTTP_200_OK
+    body = resp.json()
+    roots = [n for n in body if n["name"] == "Financial Operations"]
+    assert roots, body
+    assert len(roots[0]["children"]) == 2
+
+
+@pytest.mark.django_db
+def test_lineage_returns_ancestor_chain(sa_client, finance_dept):
+    a = AuditableEntity.objects.create(name="A", department_ref=finance_dept)
+    b = AuditableEntity.objects.create(name="B", department_ref=finance_dept, parent=a)
+    c = AuditableEntity.objects.create(name="C", department_ref=finance_dept, parent=b)
+    resp = sa_client.get(f"/api/auditable-entities/{c.id}/lineage/")
+    assert resp.status_code == status.HTTP_200_OK
+    names = [n["name"] for n in resp.json()]
+    assert names == ["A", "B"]
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Soft-delete: archive / restore / DELETE
+# ══════════════════════════════════════════════════════════════════════
+@pytest.mark.django_db
+def test_archive_action_marks_status_archived(sa_client, entity_ap):
+    resp = sa_client.post(f"/api/auditable-entities/{entity_ap.id}/archive/")
+    assert resp.status_code == status.HTTP_200_OK
+    entity_ap.refresh_from_db()
+    assert entity_ap.status == "Archived"
+
+
+@pytest.mark.django_db
+def test_default_list_hides_archived(sa_client, entity_ap):
+    entity_ap.status = "Archived"
+    entity_ap.save()
+    resp = sa_client.get("/api/auditable-entities/")
+    ids = {r["id"] for r in resp.json()["results"]}
+    assert str(entity_ap.id) not in ids
+
+
+@pytest.mark.django_db
+def test_include_archived_returns_archived_rows(sa_client, entity_ap):
+    entity_ap.status = "Archived"
+    entity_ap.save()
+    resp = sa_client.get("/api/auditable-entities/?includeArchived=true")
+    ids = {r["id"] for r in resp.json()["results"]}
+    assert str(entity_ap.id) in ids
+
+
+@pytest.mark.django_db
+def test_delete_performs_soft_delete(sa_client, entity_ap):
+    resp = sa_client.delete(f"/api/auditable-entities/{entity_ap.id}/")
+    assert resp.status_code in (200, 204)
+    entity_ap.refresh_from_db()
+    assert entity_ap.status == EntityStatusChoices.ARCHIVED
+
+
+@pytest.mark.django_db
+def test_restore_action_reactivates(sa_client, entity_ap):
+    entity_ap.status = "Archived"
+    entity_ap.save()
+    resp = sa_client.post(f"/api/auditable-entities/{entity_ap.id}/restore/")
+    assert resp.status_code == status.HTTP_200_OK
+    entity_ap.refresh_from_db()
+    assert entity_ap.status == EntityStatusChoices.ACTIVE
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Filters & search
+# ══════════════════════════════════════════════════════════════════════
+@pytest.mark.django_db
+def test_filter_by_risk_rating_multi_value(sa_client, finance_dept):
+    AuditableEntity.objects.create(name="Low one", department_ref=finance_dept, risk_rating="Low")
+    AuditableEntity.objects.create(name="High one", department_ref=finance_dept, risk_rating="High")
+    AuditableEntity.objects.create(name="Med one", department_ref=finance_dept, risk_rating="Medium")
+    resp = sa_client.get("/api/auditable-entities/?riskRating=High,Low")
+    names = {r["name"] for r in resp.json()["results"]}
+    assert "Low one" in names and "High one" in names
+    assert "Med one" not in names
+
+
+@pytest.mark.django_db
+def test_search_q_matches_name_or_costcenter(sa_client, finance_dept):
+    AuditableEntity.objects.create(
+        name="Procurement", department_ref=finance_dept, cost_center_id="PRC-9001"
+    )
+    resp = sa_client.get("/api/auditable-entities/?q=PRC-9001")
+    assert any(r["name"] == "Procurement" for r in resp.json()["results"])
+
+
+@pytest.mark.django_db
+def test_tags_any_filter(sa_client, finance_dept):
+    AuditableEntity.objects.create(name="A", department_ref=finance_dept, tags=["sox"])
+    AuditableEntity.objects.create(name="B", department_ref=finance_dept, tags=["gdpr"])
+    AuditableEntity.objects.create(name="C", department_ref=finance_dept, tags=["other"])
+    resp = sa_client.get("/api/auditable-entities/?tagsAny=sox,gdpr")
+    names = {r["name"] for r in resp.json()["results"]}
+    assert names == {"A", "B"}
+
+
+@pytest.mark.django_db
+def test_mine_filter_scopes_to_request_user(sa_client, super_admin, finance_dept):
+    AuditableEntity.objects.create(
+        name="Mine", department_ref=finance_dept, primary_owner=super_admin
+    )
+    AuditableEntity.objects.create(name="Not mine", department_ref=finance_dept)
+    resp = sa_client.get("/api/auditable-entities/?mine=true")
+    names = {r["name"] for r in resp.json()["results"]}
+    assert names == {"Mine"}
+
+
+@pytest.mark.django_db
+def test_overdue_and_never_audited_filters(sa_client, finance_dept):
+    AuditableEntity.objects.create(
+        name="Overdue", department_ref=finance_dept,
+        next_audit_date=date.today() - timedelta(days=10),
+    )
+    AuditableEntity.objects.create(name="Never", department_ref=finance_dept)
+    AuditableEntity.objects.create(
+        name="Recent", department_ref=finance_dept,
+        last_audit_date=date.today() - timedelta(days=30),
+    )
+    overdue = sa_client.get("/api/auditable-entities/?overdue=true").json()["results"]
+    assert {r["name"] for r in overdue} == {"Overdue"}
+    never = sa_client.get("/api/auditable-entities/?neverAudited=true").json()["results"]
+    assert {"Overdue", "Never"} <= {r["name"] for r in never}
+
+
+# ══════════════════════════════════════════════════════════════════════
+# KPI / coverage actions
+# ══════════════════════════════════════════════════════════════════════
+@pytest.mark.django_db
+def test_kpis_endpoint_returns_strip(sa_client, finance_dept):
+    AuditableEntity.objects.create(name="A", department_ref=finance_dept, risk_rating="Critical")
+    AuditableEntity.objects.create(name="B", department_ref=finance_dept, risk_rating="High")
+    resp = sa_client.get("/api/auditable-entities/kpis/")
+    assert resp.status_code == status.HTTP_200_OK
+    body = resp.json()
+    assert {"totalEntities", "criticalRisks", "complianceRate", "openAudits", "planProgress"} <= set(body)
+    assert body["criticalRisks"] >= 1
+
+
+@pytest.mark.django_db
+def test_coverage_endpoint(sa_client, finance_dept):
+    AuditableEntity.objects.create(name="No owner", department_ref=finance_dept)
+    resp = sa_client.get("/api/auditable-entities/coverage/")
+    assert resp.status_code == status.HTTP_200_OK
+    body = resp.json()
+    assert {"withoutOwner", "withoutNextAudit", "neverAudited", "staleOver3Years"} <= set(body)
+    assert body["withoutOwner"] >= 1
+
+
+@pytest.mark.django_db
+def test_clone_creates_copy_with_new_name(sa_client, entity_ap):
+    resp = sa_client.post(
+        f"/api/auditable-entities/{entity_ap.id}/clone/",
+        {"name": "AP Oversight Copy"}, format="json",
+    )
+    assert resp.status_code == status.HTTP_201_CREATED
+    assert resp.json()["name"] == "AP Oversight Copy"
+    # Source remains untouched
+    entity_ap.refresh_from_db()
+    assert entity_ap.name == "Accounts Payable"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Revisions
+# ══════════════════════════════════════════════════════════════════════
+@pytest.mark.django_db
+def test_revision_appended_on_create(sa_client, finance_dept):
+    resp = sa_client.post(
+        "/api/auditable-entities/",
+        {"name": "Test create", "departmentId": str(finance_dept.id), "riskRating": "Low"},
+        format="json",
+    )
+    entity_id = resp.json()["id"]
+    revs = AuditableEntityRevision.objects.filter(entity_id=entity_id)
+    assert revs.count() == 1
+    assert revs.first().comment == "Created."
+
+
+@pytest.mark.django_db
+def test_revisions_endpoint_lists_per_entity(sa_client, entity_ap):
+    sa_client.patch(
+        f"/api/auditable-entities/{entity_ap.id}/",
+        {"riskRating": "Critical", "version": entity_ap.version}, format="json",
+    )
+    resp = sa_client.get(f"/api/auditable-entities/{entity_ap.id}/revisions/")
+    assert resp.status_code == status.HTTP_200_OK
+    body = resp.json()
+    items = body.get("results", body)
+    assert any("risk_rating" in (r["changes"] or {}) for r in items)
+
+
+@pytest.mark.django_db
+def test_revision_is_append_only(db, entity_ap):
+    rev = AuditableEntityRevision.objects.create(
+        entity=entity_ap, version=1, changes={"_initial": {}},
+    )
+    with pytest.raises(PermissionError):
+        rev.comment = "Tampering"
+        rev.save()
+    with pytest.raises(PermissionError):
+        rev.delete()
+
+
+# ══════════════════════════════════════════════════════════════════════
+# RBAC
+# ══════════════════════════════════════════════════════════════════════
+@pytest.mark.django_db
+def test_anonymous_cannot_read_entities(api_client):
+    resp = api_client.get("/api/auditable-entities/")
+    assert resp.status_code in (401, 403)
+
+
+@pytest.mark.django_db
+def test_auditor_can_read_but_not_create(auditor_client, finance_dept):
+    list_resp = auditor_client.get("/api/auditable-entities/")
+    assert list_resp.status_code == status.HTTP_200_OK
+    create_resp = auditor_client.post(
+        "/api/auditable-entities/",
+        {"name": "Forbidden", "departmentId": str(finance_dept.id), "riskRating": "Low"},
+        format="json",
+    )
+    assert create_resp.status_code == status.HTTP_403_FORBIDDEN
+
+
+@pytest.mark.django_db
+def test_manager_can_create_and_edit(manager_client, finance_dept):
+    create_resp = manager_client.post(
+        "/api/auditable-entities/",
+        {"name": "Mgr-created", "departmentId": str(finance_dept.id), "riskRating": "Medium"},
+        format="json",
+    )
+    assert create_resp.status_code == status.HTTP_201_CREATED
+    eid = create_resp.json()["id"]
+    upd_resp = manager_client.patch(
+        f"/api/auditable-entities/{eid}/",
+        {"riskRating": "High", "version": 1},
+        format="json",
+    )
+    assert upd_resp.status_code == status.HTTP_200_OK
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Business Units & Tags
+# ══════════════════════════════════════════════════════════════════════
+@pytest.mark.django_db
+def test_business_unit_crud(sa_client, super_admin):
+    resp = sa_client.post(
+        "/api/business-units/",
+        {"name": "Treasury", "code": "TRS", "riskAppetite": "Medium", "headId": str(super_admin.id)},
+        format="json",
+    )
+    assert resp.status_code == status.HTTP_201_CREATED, resp.content
+    bu_id = resp.json()["id"]
+    list_resp = sa_client.get("/api/business-units/")
+    assert any(b["id"] == bu_id for b in list_resp.json()["results"])
+
+
+@pytest.mark.django_db
+def test_business_unit_cycle_rejected(sa_client):
+    a = BusinessUnit.objects.create(name="A")
+    b = BusinessUnit.objects.create(name="B", parent=a)
+    resp = sa_client.patch(
+        f"/api/business-units/{a.id}/",
+        {"parentId": str(b.id)}, format="json",
+    )
+    assert resp.status_code == status.HTTP_400_BAD_REQUEST
+
+
+@pytest.mark.django_db
+def test_tag_create_auto_slug(sa_client):
+    resp = sa_client.post(
+        "/api/tags/",
+        {"name": "SOX Compliant", "category": "Compliance"},
+        format="json",
+    )
+    assert resp.status_code == status.HTTP_201_CREATED
+    body = resp.json()
+    assert body["slug"] == "sox-compliant"
+
+
+@pytest.mark.django_db
+def test_department_now_writable(sa_client, finance_bu):
+    resp = sa_client.post(
+        "/api/departments/",
+        {"name": "Logistics", "head": "M. Patel", "riskRating": "Medium",
+         "businessUnitId": str(finance_bu.id)},
+        format="json",
+    )
+    assert resp.status_code == status.HTTP_201_CREATED
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Backward compatibility
+# ══════════════════════════════════════════════════════════════════════
+@pytest.mark.django_db
+def test_legacy_fields_still_returned_on_list(sa_client, entity_ap):
+    resp = sa_client.get("/api/auditable-entities/")
+    item = resp.json()["results"][0]
+    assert "department" in item  # legacy free-text
+    assert "owner" in item       # legacy free-text
+    assert "riskRating" in item
+
+
+@pytest.mark.django_db
+def test_recompute_action_with_no_active_model(sa_client):
+    resp = sa_client.post("/api/auditable-entities/recompute-risk-scores/")
+    # No RiskScoringModel seeded → 400 with explanatory body
+    assert resp.status_code == status.HTTP_400_BAD_REQUEST
+    assert "detail" in resp.json()

@@ -502,15 +502,28 @@ class TimelineEvent(TimeStampedModel):
 class AuditableEntity(TimeStampedModel):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     name = models.CharField(max_length=255)
-    # Legacy free-text columns retained for backward compatibility with
-    # API consumers built against pre-Phase-7 schema. New writes must
-    # populate department_ref / primary_owner; these fields are dropped
-    # in a follow-up migration once all callers have cut over.
-    department = models.CharField(max_length=200, blank=True)
+    # ── DEPRECATED legacy free-text columns ──────────────────────────
+    # ``department`` and ``owner`` are retained for backward compatibility
+    # with pre-Phase-7 API consumers (the AuditableEntityListSerializer
+    # still emits both on the wire, and the contract test asserts their
+    # presence). New writes must populate ``department_ref`` /
+    # ``primary_owner`` — these scalar columns will be removed in a
+    # future migration once telemetry shows zero callers depend on them.
+    #
+    # Deprecation: 2026-05-15. Removal target: next major release.
+    department = models.CharField(
+        max_length=200,
+        blank=True,
+        help_text="DEPRECATED — use ``department_ref`` (FK). Removed in next major release.",
+    )
     department_ref = models.ForeignKey(
         Department, on_delete=models.SET_NULL, null=True, blank=True, related_name="auditable_entities"
     )
-    owner = models.CharField(max_length=200, blank=True)
+    owner = models.CharField(
+        max_length=200,
+        blank=True,
+        help_text="DEPRECATED — use ``primary_owner`` (FK to User). Removed in next major release.",
+    )
 
     # ── Phase 7 Track 1: enterprise audit-universe fields ──────────────
     parent = models.ForeignKey(

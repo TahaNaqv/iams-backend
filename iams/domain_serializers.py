@@ -379,7 +379,17 @@ class AuditableEntitySerializer(serializers.ModelSerializer):
     )
 
     # ── FK relations: nested read, *Id write ──
-    department = serializers.CharField(read_only=False, required=False, allow_blank=True)
+    # ``department`` (free-text) and ``owner`` (free-text, defined further
+    # down via Meta.fields) are DEPRECATED — pre-Phase-7 wire fields kept
+    # for backward compatibility. New consumers should bind to
+    # ``departmentId`` / ``departmentRef`` and ``primaryOwnerId`` /
+    # ``primaryOwner`` instead.
+    department = serializers.CharField(
+        read_only=False,
+        required=False,
+        allow_blank=True,
+        help_text="Deprecated. Use departmentId / departmentRef.",
+    )
     departmentId = serializers.PrimaryKeyRelatedField(
         source="department_ref",
         queryset=Department.objects.all(),

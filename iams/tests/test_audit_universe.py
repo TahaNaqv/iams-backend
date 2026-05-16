@@ -625,6 +625,24 @@ def test_without_risk_score_filter(sa_client, finance_dept):
 
 
 @pytest.mark.django_db
+def test_legacy_fields_carry_deprecation_header(sa_client, entity_ap):
+    """Read responses must surface the Deprecation header (RFC 8594-ish).
+
+    The legacy ``owner`` and ``department`` CharFields are still emitted
+    on the wire for backward compatibility. Operators rely on this
+    header to find clients that haven't migrated to the typed FK
+    fields yet — without it, the deprecation is invisible.
+    """
+    list_resp = sa_client.get("/api/auditable-entities/")
+    assert "Deprecation" in list_resp.headers
+    assert "owner" in list_resp["Deprecation"]
+    assert "department" in list_resp["Deprecation"]
+
+    detail_resp = sa_client.get(f"/api/auditable-entities/{entity_ap.id}/")
+    assert "Deprecation" in detail_resp.headers
+
+
+@pytest.mark.django_db
 def test_create_bumps_prometheus_counter(sa_client, finance_dept):
     """Phase-7 counter increments must fire on the happy path.
 

@@ -326,6 +326,12 @@ class AuditableEntityViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
     rows. Soft-delete via the dedicated ``archive`` action — DELETE
     against this resource also performs a soft-delete to preserve the
     audit trail downstream.
+
+    Deprecation note: the response body still includes the pre-Phase-7
+    free-text ``owner`` and ``department`` fields for backward compat.
+    Both will be removed in a future major release; new consumers
+    should bind to ``primaryOwnerId`` / ``primaryOwner`` and
+    ``departmentId`` / ``departmentRef`` respectively.
     """
 
     serializer_class = AuditableEntitySerializer
@@ -376,6 +382,18 @@ class AuditableEntityViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
     def get_permissions(self):
         perm = self._ACTION_PERMISSIONS.get(self.action, "view_audits")
         return [IsAuthenticated(), HasPermission(perm)()]
+
+    def finalize_response(self, request, response, *args, **kwargs):
+        # Surface a RFC-8594-style ``Deprecation`` header on every read
+        # response. Consumers (and external monitors) can spot which
+        # clients still pull the legacy ``owner`` / ``department``
+        # CharFields by alerting on this header in their logs.
+        response = super().finalize_response(request, response, *args, **kwargs)
+        if self.action in ("list", "retrieve", "tree", "lineage", "revisions"):
+            response["Deprecation"] = (
+                'fields="owner,department"; sunset="next-major"'
+            )
+        return response
 
     def get_queryset(self):
         include_archived = self.request.query_params.get("includeArchived", "").lower() in (

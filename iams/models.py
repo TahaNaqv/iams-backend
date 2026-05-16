@@ -626,6 +626,84 @@ class AuditableEntity(TimeStampedModel):
         return self.name
 
 
+class BulkImportJob(TimeStampedModel):
+    """One async ``AuditableEntity`` bulk-import request.
+
+    A multipart upload to ``POST /api/auditable-entities/bulk-import/``
+    creates a row in ``Pending`` and dispatches the Celery task. The
+    worker parses CSV / XLSX, validates each row through the same
+    serializer that backs single-entity writes, and updates the
+    counters (``processed``, ``created``, ``updated``, ``skipped``).
+    Per-row errors are stored in ``errors`` (first 200) so the UI can
+    show actionable feedback.
+
+    The job lifecycle is deliberately simple — no retries on the row
+    level; a failed file is fixed and re-uploaded as a new job. The
+    ``mode`` field controls transactional behaviour:
+
+      - ``strict``  → all-or-nothing; one bad row fails the whole import
+      - ``lenient`` → per-row savepoint; bad rows are skipped with an
+                      error and the rest commit independently
+    """
+
+    STATUS_PENDING = "Pending"
+    STATUS_VALIDATING = "Validating"
+    STATUS_IMPORTING = "Importing"
+    STATUS_COMPLETED = "Completed"
+    STATUS_PARTIAL = "PartialSuccess"
+    STATUS_FAILED = "Failed"
+    STATUS_CHOICES = [
+        (STATUS_PENDING, "Pending"),
+        (STATUS_VALIDATING, "Validating"),
+        (STATUS_IMPORTING, "Importing"),
+        (STATUS_COMPLETED, "Completed"),
+        (STATUS_PARTIAL, "Partial success"),
+        (STATUS_FAILED, "Failed"),
+    ]
+
+    MODE_STRICT = "strict"
+    MODE_LENIENT = "lenient"
+    MODE_CHOICES = [(MODE_STRICT, "Strict"), (MODE_LENIENT, "Lenient")]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    file = models.FileField(upload_to="audit_universe/imports/%Y/%m/%d/")
+    file_name = models.CharField(max_length=255, blank=True)
+    mode = models.CharField(max_length=12, choices=MODE_CHOICES, default=MODE_LENIENT)
+    status = models.CharField(
+        max_length=20,
+        choices=STATUS_CHOICES,
+        default=STATUS_PENDING,
+        db_index=True,
+    )
+    requested_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="audit_universe_imports",
+    )
+    total_rows = models.PositiveIntegerField(default=0)
+    processed = models.PositiveIntegerField(default=0)
+    created = models.PositiveIntegerField(default=0)
+    updated = models.PositiveIntegerField(default=0)
+    skipped = models.PositiveIntegerField(default=0)
+    errors = models.JSONField(
+        default=list,
+        help_text="Per-row error report. Each entry: "
+        '{"row": int, "field": str, "message": str}.',
+    )
+    finished_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["status", "-created_at"], name="bij_status_created_idx"),
+        ]
+
+    def __str__(self):
+        return f"BulkImportJob {self.id} ({self.status})"
+
+
 class AuditableEntityRevision(TimeStampedModel):
     """Append-only field-level change history for AuditableEntity.
 

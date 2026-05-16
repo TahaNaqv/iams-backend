@@ -9,6 +9,7 @@ from iams.views import (
     AuditableEntityRevisionViewSet,
     AuditableEntityViewSet,
     AuditorViewSet,
+    BulkImportJobViewSet,
     BusinessUnitViewSet,
     ChecklistByAuditView,
     ChecklistItemViewSet,
@@ -104,6 +105,11 @@ router.register(
 )
 router.register("business-units", BusinessUnitViewSet, basename="business-unit")
 router.register("tags", TagViewSet, basename="tag")
+router.register(
+    "audit-universe-import-jobs",
+    BulkImportJobViewSet,
+    basename="audit-universe-import-job",
+)
 router.register("risk-history", RiskHistoryViewSet, basename="risk-history")
 router.register("notifications", NotificationViewSet, basename="notification")
 router.register("notification-preferences", NotificationPreferenceViewSet, basename="notification-preference")

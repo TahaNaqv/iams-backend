@@ -18,6 +18,7 @@ from iams.domain_serializers import (
     AuditableEntityRevisionSerializer,
     AuditableEntitySerializer,
     AuditorSerializer,
+    BulkImportJobSerializer,
     BusinessUnitSerializer,
     ChecklistItemSerializer,
     ChecklistItemWriteSerializer,
@@ -67,6 +68,7 @@ from iams.models import (
     AuditableEntity,
     AuditableEntityRevision,
     Auditor,
+    BulkImportJob,
     BusinessUnit,
     ChecklistItem,
     Comment,
@@ -664,6 +666,162 @@ class AuditableEntityViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
             ).count(),
         })
 
+    # ─── Bulk import / export ─────────────────────────────────────────
+    @action(
+        detail=False,
+        methods=["post"],
+        url_path="bulk-import",
+        parser_classes=[MultiPartParser, FormParser],
+    )
+    def bulk_import(self, request):
+        """Kick off an async CSV / XLSX import.
+
+        Required form fields:
+          ``file``  — the upload (≤25 MB, CSV or XLSX MIME types)
+          ``mode``  — ``strict`` or ``lenient`` (default ``lenient``)
+
+        Returns the ``BulkImportJob`` id; poll
+        ``/api/audit-universe-import-jobs/{id}/`` for status + per-row errors.
+        """
+        uploaded = request.FILES.get("file")
+        if not uploaded:
+            return Response(
+                {"detail": "Missing required `file` upload."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        # Size guard: 25 MB is plenty for ~50k rows of CSV.
+        if uploaded.size > 25 * 1024 * 1024:
+            return Response(
+                {"detail": "Upload exceeds the 25 MB limit."},
+                status=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            )
+        name_lower = (uploaded.name or "").lower()
+        allowed = name_lower.endswith(".csv") or name_lower.endswith(".xlsx") or name_lower.endswith(".xlsm")
+        if not allowed:
+            return Response(
+                {"detail": "Only .csv and .xlsx uploads are accepted."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        mode = request.data.get("mode") or BulkImportJob.MODE_LENIENT
+        if mode not in (BulkImportJob.MODE_STRICT, BulkImportJob.MODE_LENIENT):
+            return Response(
+                {"detail": "Invalid mode; expected 'strict' or 'lenient'."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        job = BulkImportJob.objects.create(
+            file=uploaded,
+            file_name=uploaded.name or "",
+            mode=mode,
+            requested_by=request.user if request.user.is_authenticated else None,
+            status=BulkImportJob.STATUS_PENDING,
+        )
+
+        # Dispatch async; tests run with CELERY_TASK_ALWAYS_EAGER so the
+        # job completes inline. In production this hands off to a worker.
+        from iams.tasks import process_bulk_import
+        process_bulk_import.delay(str(job.id))
+
+        return Response(
+            BulkImportJobSerializer(job).data,
+            status=status.HTTP_202_ACCEPTED,
+        )
+
+    @action(detail=False, methods=["get"], url_path="export")
+    def export(self, request):
+        """Stream the filtered entity list as CSV or XLSX.
+
+        ``?as=csv`` (default) or ``?as=xlsx``. ``as`` is used instead of
+        ``format`` because DRF reserves the latter for content
+        negotiation and would 404 a value it can't satisfy.
+        All standard filters (``status``, ``riskRating``, ``q``, …) apply.
+        """
+        fmt = (request.query_params.get("as") or "csv").lower()
+        qs = self.filter_queryset(self.get_queryset())
+        columns = [
+            ("id", "id"),
+            ("name", "name"),
+            ("entity_type", "entityType"),
+            ("status", "status"),
+            ("risk_rating", "riskRating"),
+            ("compliance_status", "complianceStatus"),
+            ("audit_frequency", "auditFrequency"),
+            ("last_audit_date", "lastAuditDate"),
+            ("next_audit_date", "nextAuditDate"),
+            ("department", "department"),
+            ("cost_center_id", "costCenterId"),
+            ("headcount", "headcount"),
+            ("operating_budget", "operatingBudget"),
+            ("is_mandatory_to_audit", "isMandatoryToAudit"),
+            ("external_source", "external_source"),
+            ("external_id", "external_id"),
+        ]
+
+        if fmt == "xlsx":
+            from openpyxl import Workbook
+            from django.http import HttpResponse
+            wb = Workbook(write_only=True)
+            ws = wb.create_sheet("Audit Universe")
+            ws.append([col[1] for col in columns])
+            for row in qs.iterator(chunk_size=500):
+                ws.append([self._cell(getattr(row, col[0])) for col in columns])
+            from io import BytesIO
+            buf = BytesIO()
+            wb.save(buf)
+            buf.seek(0)
+            resp = HttpResponse(
+                buf.read(),
+                content_type=(
+                    "application/vnd.openxmlformats-officedocument."
+                    "spreadsheetml.sheet"
+                ),
+            )
+            resp["Content-Disposition"] = (
+                'attachment; filename="audit-universe.xlsx"'
+            )
+            return resp
+
+        # Default: CSV streamed.
+        import csv
+        from django.http import StreamingHttpResponse
+
+        class Echo:
+            def write(self, value):
+                return value
+
+        writer = csv.writer(Echo())
+
+        def rows():
+            yield writer.writerow([col[1] for col in columns])
+            for row in qs.iterator(chunk_size=500):
+                yield writer.writerow([self._cell(getattr(row, col[0])) for col in columns])
+
+        resp = StreamingHttpResponse(rows(), content_type="text/csv")
+        resp["Content-Disposition"] = 'attachment; filename="audit-universe.csv"'
+        return resp
+
+    @staticmethod
+    def _cell(value):
+        """Coerce a model value into a CSV / XLSX-safe scalar.
+
+        openpyxl's write-only mode only accepts primitive scalars
+        (str / int / float / bool / datetime / None) so non-primitives
+        like UUID and Decimal get stringified here.
+        """
+        if value is None:
+            return ""
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, (int, float, str)):
+            return value
+        if hasattr(value, "isoformat"):
+            return value.isoformat()
+        if isinstance(value, (list, dict)):
+            import json
+            return json.dumps(value)
+        return str(value)
+
     @action(detail=False, methods=["post"], url_path="recompute-risk-scores")
     def recompute(self, request):
         """Convenience action that delegates to the risk engine.
@@ -709,6 +867,34 @@ class TagViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
         if self.action in ("list", "retrieve"):
             return [IsAuthenticated(), HasPermission("view_audits")()]
         return [IsAuthenticated(), HasPermission("edit_audits")()]
+
+
+class BulkImportJobViewSet(viewsets.ReadOnlyModelViewSet):
+    """Poll-only viewset for bulk-import progress.
+
+    Job rows are created by ``POST /api/auditable-entities/bulk-import/``
+    and updated by the Celery worker. The FE polls ``retrieve`` while
+    ``status`` is in (Pending, Validating, Importing) and stops once it
+    transitions to Completed / PartialSuccess / Failed.
+
+    Users only see their own jobs; staff/super-admin see all.
+    """
+
+    serializer_class = BulkImportJobSerializer
+    permission_classes = [HasPermission("view_audits")]
+
+    def get_queryset(self):
+        qs = BulkImportJob.objects.all().select_related("requested_by")
+        u = self.request.user
+        if getattr(u, "is_superuser", False) or getattr(u, "is_staff", False):
+            return qs
+        # IAMS uses an in-app super-admin flag on Role (distinct from
+        # Django's is_superuser) — surface that here so the global
+        # "Audit Universe activity" view stays visible to admins.
+        profile = getattr(u, "profile", None)
+        if profile and profile.role and profile.role.is_super_admin:
+            return qs
+        return qs.filter(requested_by=u)
 
 
 class AuditableEntityRevisionViewSet(viewsets.ReadOnlyModelViewSet):

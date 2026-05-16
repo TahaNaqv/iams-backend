@@ -12,6 +12,7 @@ from iams.models import (
     AuditAssignment,
     AuditableEntity,
     AuditableEntityRevision,
+    BulkImportJob,
     AuditLogEntry,
     Auditor,
     BusinessUnit,
@@ -653,6 +654,31 @@ class AuditableEntityRevisionSerializer(serializers.ModelSerializer):
     class Meta:
         model = AuditableEntityRevision
         fields = ["id", "entityId", "version", "changedBy", "changedAt", "changes", "comment"]
+        read_only_fields = fields
+
+
+class BulkImportJobSerializer(serializers.ModelSerializer):
+    fileName = serializers.CharField(source="file_name", read_only=True)
+    totalRows = serializers.IntegerField(source="total_rows", read_only=True)
+    finishedAt = serializers.DateTimeField(source="finished_at", read_only=True)
+    requestedBy = UserSummarySerializer(source="requested_by", read_only=True)
+
+    class Meta:
+        model = BulkImportJob
+        fields = [
+            "id",
+            "fileName",
+            "mode",
+            "status",
+            "requestedBy",
+            "totalRows",
+            "processed",
+            "created",
+            "updated",
+            "skipped",
+            "errors",
+            "finishedAt",
+        ]
         read_only_fields = fields
 
 

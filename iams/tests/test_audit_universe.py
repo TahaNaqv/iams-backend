@@ -553,3 +553,91 @@ def test_recompute_action_with_no_active_model(sa_client):
     # No RiskScoringModel seeded → 400 with explanatory body
     assert resp.status_code == status.HTTP_400_BAD_REQUEST
     assert "detail" in resp.json()
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Data-quality filters (Phase-7 Track S6 — Coverage page)
+# ══════════════════════════════════════════════════════════════════════
+@pytest.mark.django_db
+def test_without_owner_filter(sa_client, super_admin, finance_dept):
+    AuditableEntity.objects.create(name="No owner", department_ref=finance_dept)
+    AuditableEntity.objects.create(
+        name="Has owner", department_ref=finance_dept, primary_owner=super_admin,
+    )
+    resp = sa_client.get("/api/auditable-entities/?withoutOwner=true")
+    names = {r["name"] for r in resp.json()["results"]}
+    assert names == {"No owner"}
+
+
+@pytest.mark.django_db
+def test_without_next_audit_filter(sa_client, finance_dept):
+    from datetime import date as _date
+    AuditableEntity.objects.create(name="No plan", department_ref=finance_dept)
+    AuditableEntity.objects.create(
+        name="Planned", department_ref=finance_dept, next_audit_date=_date(2027, 1, 1),
+    )
+    resp = sa_client.get("/api/auditable-entities/?withoutNextAudit=true")
+    names = {r["name"] for r in resp.json()["results"]}
+    assert names == {"No plan"}
+
+
+@pytest.mark.django_db
+def test_stale_over_years_filter(sa_client, finance_dept):
+    from datetime import date as _date, timedelta as _td
+    AuditableEntity.objects.create(
+        name="Stale", department_ref=finance_dept,
+        last_audit_date=_date.today() - _td(days=365 * 4),
+    )
+    AuditableEntity.objects.create(
+        name="Recent", department_ref=finance_dept,
+        last_audit_date=_date.today() - _td(days=30),
+    )
+    resp = sa_client.get("/api/auditable-entities/?staleOverYears=3")
+    names = {r["name"] for r in resp.json()["results"]}
+    assert names == {"Stale"}
+
+
+@pytest.mark.django_db
+def test_mandatory_without_plan_filter(sa_client, finance_dept):
+    AuditableEntity.objects.create(
+        name="Compulsory orphan", department_ref=finance_dept,
+        is_mandatory_to_audit=True,
+    )
+    AuditableEntity.objects.create(
+        name="Optional", department_ref=finance_dept,
+        is_mandatory_to_audit=False,
+    )
+    resp = sa_client.get("/api/auditable-entities/?mandatoryWithoutPlan=true")
+    names = {r["name"] for r in resp.json()["results"]}
+    assert names == {"Compulsory orphan"}
+
+
+@pytest.mark.django_db
+def test_without_risk_score_filter(sa_client, finance_dept):
+    AuditableEntity.objects.create(
+        name="Scored", department_ref=finance_dept,
+        inherent_likelihood=3, inherent_impact=4,
+    )
+    AuditableEntity.objects.create(name="Unscored", department_ref=finance_dept)
+    resp = sa_client.get("/api/auditable-entities/?withoutRiskScore=true")
+    names = {r["name"] for r in resp.json()["results"]}
+    assert names == {"Unscored"}
+
+
+@pytest.mark.django_db
+def test_coverage_endpoint_returns_full_breakdown(sa_client, super_admin, finance_dept):
+    from datetime import date as _date, timedelta as _td
+    AuditableEntity.objects.create(
+        name="Good", department_ref=finance_dept,
+        primary_owner=super_admin,
+        last_audit_date=_date.today() - _td(days=30),
+        next_audit_date=_date.today() + _td(days=180),
+        inherent_likelihood=3, inherent_impact=4,
+    )
+    AuditableEntity.objects.create(name="No owner", department_ref=finance_dept)
+    resp = sa_client.get("/api/auditable-entities/coverage/")
+    assert resp.status_code == status.HTTP_200_OK
+    body = resp.json()
+    assert body["total"] >= 2
+    assert body["withoutOwner"] >= 1
+    assert "withoutRiskScore" in body

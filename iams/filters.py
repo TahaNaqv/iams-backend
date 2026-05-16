@@ -78,6 +78,18 @@ class AuditableEntityFilter(django_filters.FilterSet):
     overdue = django_filters.BooleanFilter(method="filter_overdue")
     neverAudited = django_filters.BooleanFilter(method="filter_never_audited")
 
+    # ── Data-quality predicates ───────────────────────────────────────
+    # These back the Coverage page's drill-downs: each tile links to the
+    # entity list with one of these query params, so users can act on
+    # the specific rows that fail a quality rule rather than wading
+    # through the whole universe.
+    withoutOwner = django_filters.BooleanFilter(method="filter_without_owner")
+    withoutDepartment = django_filters.BooleanFilter(method="filter_without_department")
+    withoutNextAudit = django_filters.BooleanFilter(method="filter_without_next_audit")
+    staleOverYears = django_filters.NumberFilter(method="filter_stale_over_years")
+    mandatoryWithoutPlan = django_filters.BooleanFilter(method="filter_mandatory_without_plan")
+    withoutRiskScore = django_filters.BooleanFilter(method="filter_without_risk_score")
+
     q = django_filters.CharFilter(method="filter_q")
 
     class Meta:
@@ -130,6 +142,46 @@ class AuditableEntityFilter(django_filters.FilterSet):
         if not value:
             return queryset
         return queryset.filter(last_audit_date__isnull=True)
+
+    def filter_without_owner(self, queryset, name, value):
+        if not value:
+            return queryset
+        return queryset.filter(primary_owner__isnull=True)
+
+    def filter_without_department(self, queryset, name, value):
+        if not value:
+            return queryset
+        return queryset.filter(department_ref__isnull=True)
+
+    def filter_without_next_audit(self, queryset, name, value):
+        if not value:
+            return queryset
+        return queryset.filter(next_audit_date__isnull=True)
+
+    def filter_stale_over_years(self, queryset, name, value):
+        try:
+            years = int(value)
+        except (TypeError, ValueError):
+            return queryset
+        cutoff = date.today() - timedelta(days=365 * max(years, 0))
+        return queryset.filter(last_audit_date__lt=cutoff)
+
+    def filter_mandatory_without_plan(self, queryset, name, value):
+        if not value:
+            return queryset
+        return queryset.filter(
+            is_mandatory_to_audit=True, next_audit_date__isnull=True
+        )
+
+    def filter_without_risk_score(self, queryset, name, value):
+        if not value:
+            return queryset
+        # An entity has a "risk score" when both inherent axes are set;
+        # the risk-engine snapshot is opt-in and not required for this
+        # data-quality definition.
+        return queryset.filter(
+            Q(inherent_likelihood__isnull=True) | Q(inherent_impact__isnull=True)
+        )
 
     def filter_q(self, queryset, name, value):
         if not value:

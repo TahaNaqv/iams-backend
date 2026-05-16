@@ -651,11 +651,19 @@ class AuditableEntityViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
 
     @action(detail=False, methods=["get"], url_path="coverage")
     def coverage(self, request):
-        """Data-quality report for the audit universe."""
+        """Data-quality report for the audit universe.
+
+        Returns the count for each rule plus the totals needed by the
+        Coverage page to render percentages. The matching list endpoints
+        live at /api/auditable-entities/ with the corresponding boolean
+        filter, so the FE can deep-link from a tile to the offending rows.
+        """
         from datetime import timedelta
         three_years_ago = timezone.now().date() - timedelta(days=365 * 3)
         qs = AuditableEntity.objects.all()
+        total = qs.count()
         return Response({
+            "total": total,
             "withoutOwner": qs.filter(primary_owner__isnull=True).count(),
             "withoutDepartment": qs.filter(department_ref__isnull=True).count(),
             "withoutNextAudit": qs.filter(next_audit_date__isnull=True).count(),
@@ -663,6 +671,9 @@ class AuditableEntityViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
             "staleOver3Years": qs.filter(last_audit_date__lt=three_years_ago).count(),
             "mandatoryWithoutPlan": qs.filter(
                 is_mandatory_to_audit=True, next_audit_date__isnull=True
+            ).count(),
+            "withoutRiskScore": qs.filter(
+                Q(inherent_likelihood__isnull=True) | Q(inherent_impact__isnull=True)
             ).count(),
         })
 

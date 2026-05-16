@@ -474,11 +474,34 @@ class AuditableEntityViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
     def perform_create(self, serializer):
         instance = serializer.save()
         self._record_revision(instance, before=None, comment="Created.")
+        self._bump_metric("created")
 
     def perform_update(self, serializer):
         before = self._capture_field_values(serializer.instance)
         instance = serializer.save()
         self._record_revision(instance, before=before)
+        self._bump_metric("updated")
+
+    @staticmethod
+    def _bump_metric(action_name: str) -> None:
+        """Increment a Phase-7 counter, tolerating import / metrics failures.
+
+        The metrics module is imported lazily so that a partial test
+        environment without prometheus_client (or with a misconfigured
+        registry) doesn't break the write path. The same defensive
+        pattern is used elsewhere in the codebase (see views that touch
+        ``report_jobs_*`` counters).
+        """
+        try:
+            from iams import metrics as m
+            if action_name == "created":
+                m.audit_universe_entities_created_total.inc()
+            elif action_name == "updated":
+                m.audit_universe_entities_updated_total.inc()
+            elif action_name == "archived":
+                m.audit_universe_entities_archived_total.inc()
+        except Exception:  # noqa: BLE001 - metrics must never break a write
+            pass
 
     # ─── Soft-delete semantics ────────────────────────────────────────
     def perform_destroy(self, instance):
@@ -487,6 +510,7 @@ class AuditableEntityViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
         instance.version = (instance.version or 0) + 1
         instance.save(update_fields=["status", "version", "updated_at"])
         self._record_revision(instance, before=before, comment="Archived (DELETE).")
+        self._bump_metric("archived")
 
     @action(detail=True, methods=["post"], url_path="archive")
     def archive(self, request, pk=None):
@@ -501,6 +525,7 @@ class AuditableEntityViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
         instance.version = (instance.version or 0) + 1
         instance.save(update_fields=["status", "version", "updated_at"])
         self._record_revision(instance, before=before, comment="Archived.")
+        self._bump_metric("archived")
         return Response(self.get_serializer(instance).data)
 
     @action(detail=True, methods=["post"], url_path="restore")

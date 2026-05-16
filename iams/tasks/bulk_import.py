@@ -312,6 +312,11 @@ def process_bulk_import(job_id: str) -> dict:
         job.errors = errors
         job.finished_at = timezone.now()
         job.save()
+        try:
+            from iams import metrics as m
+            m.audit_universe_bulk_imports_total.labels(status=job.status).inc()
+        except Exception:  # noqa: BLE001
+            pass
         return {"status": job.status, "errors": len(errors)}
     except Exception as exc:  # noqa: BLE001
         logger.exception("audit-universe-import: job %s crashed", job_id)
@@ -319,6 +324,11 @@ def process_bulk_import(job_id: str) -> dict:
         job.errors = errors + [{"row": 0, "field": "_task", "message": str(exc)[:240]}]
         job.finished_at = timezone.now()
         job.save()
+        try:
+            from iams import metrics as m
+            m.audit_universe_bulk_imports_total.labels(status=job.status).inc()
+        except Exception:  # noqa: BLE001
+            pass
         return {"status": job.status, "errors": len(job.errors)}
 
     job.status = (
@@ -332,6 +342,17 @@ def process_bulk_import(job_id: str) -> dict:
     job.errors = errors
     job.finished_at = timezone.now()
     job.save()
+
+    # Emit Phase-7 Prometheus counters. We tolerate failures here so a
+    # broken metrics registry never poisons a successful import.
+    try:
+        from iams import metrics as m
+        m.audit_universe_bulk_imports_total.labels(status=job.status).inc()
+        m.audit_universe_bulk_import_rows_total.labels(outcome="created").inc(created)
+        m.audit_universe_bulk_import_rows_total.labels(outcome="updated").inc(updated)
+        m.audit_universe_bulk_import_rows_total.labels(outcome="skipped").inc(skipped)
+    except Exception:  # noqa: BLE001
+        logger.exception("metrics: failed to bump audit-universe import counters")
 
     logger.info(
         "audit-universe-import: job %s finished status=%s created=%d updated=%d skipped=%d",

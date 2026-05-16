@@ -131,6 +131,37 @@ report_jobs_failed_total = Counter(
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Audit universe (Phase 7)
+# ──────────────────────────────────────────────────────────────────────
+audit_universe_entities_created_total = Counter(
+    "iams_audit_universe_entities_created_total",
+    "AuditableEntity rows created (any path: API, clone, bulk import).",
+)
+
+audit_universe_entities_updated_total = Counter(
+    "iams_audit_universe_entities_updated_total",
+    "AuditableEntity rows updated via the API.",
+)
+
+audit_universe_entities_archived_total = Counter(
+    "iams_audit_universe_entities_archived_total",
+    "AuditableEntity rows soft-deleted (archived).",
+)
+
+audit_universe_bulk_imports_total = Counter(
+    "iams_audit_universe_bulk_imports_total",
+    "Bulk-import jobs that reached a terminal status (status label).",
+    ["status"],
+)
+
+audit_universe_bulk_import_rows_total = Counter(
+    "iams_audit_universe_bulk_import_rows_total",
+    "Rows processed by bulk-import (outcome label: created/updated/skipped).",
+    ["outcome"],
+)
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Gauge refreshers — called by the dashboard cache-refresh beat task.
 # ──────────────────────────────────────────────────────────────────────
 def refresh_business_gauges() -> dict[str, int]:

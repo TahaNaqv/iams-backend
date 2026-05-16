@@ -625,6 +625,31 @@ def test_without_risk_score_filter(sa_client, finance_dept):
 
 
 @pytest.mark.django_db
+def test_create_bumps_prometheus_counter(sa_client, finance_dept):
+    """Phase-7 counter increments must fire on the happy path.
+
+    We exercise the counter via ``inc()`` and check the resulting sample
+    rather than scraping ``/metrics`` — the lower-level assertion keeps
+    the test independent of django-prometheus' URL wiring.
+    """
+    from iams import metrics as m
+
+    before = m.audit_universe_entities_created_total._value.get()
+    resp = sa_client.post(
+        "/api/auditable-entities/",
+        {
+            "name": "Counter target",
+            "departmentId": str(finance_dept.id),
+            "riskRating": "Medium",
+        },
+        format="json",
+    )
+    assert resp.status_code == status.HTTP_201_CREATED
+    after = m.audit_universe_entities_created_total._value.get()
+    assert after == before + 1
+
+
+@pytest.mark.django_db
 def test_coverage_endpoint_returns_full_breakdown(sa_client, super_admin, finance_dept):
     from datetime import date as _date, timedelta as _td
     AuditableEntity.objects.create(

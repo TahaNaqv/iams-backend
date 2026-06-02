@@ -1,5 +1,7 @@
 import uuid
+from decimal import Decimal
 from django.conf import settings
+from django.core.validators import MinValueValidator
 from django.db import models
 from django.contrib.contenttypes.fields import GenericForeignKey
 from django.contrib.contenttypes.models import ContentType
@@ -118,6 +120,9 @@ class EntityStatusChoices(models.TextChoices):
 
 class EntityTypeChoices(models.TextChoices):
     PROCESS = "Process", "Process"
+    DEPARTMENT = "Department", "Department"
+    DIVISION = "Division", "Division"
+    AREA = "Area", "Area"
     SYSTEM = "System", "System"
     FUNCTION = "Function", "Function"
     PROJECT = "Project", "Project"
@@ -583,6 +588,7 @@ class AuditableEntity(TimeStampedModel):
         decimal_places=2,
         null=True,
         blank=True,
+        validators=[MinValueValidator(Decimal("0"))],
         help_text="Estimated audit effort in man-days.",
     )
     is_mandatory_to_audit = models.BooleanField(default=False)

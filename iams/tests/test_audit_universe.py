@@ -184,6 +184,20 @@ def test_choice_validation_rejects_unknown_values(sa_client, finance_dept, field
 
 
 @pytest.mark.django_db
+@pytest.mark.parametrize("entity_type", ["Process", "Department", "Division", "Area"])
+def test_entity_type_accepts_org_scopes(sa_client, finance_dept, entity_type):
+    payload = {
+        "name": f"Scoped-{entity_type}",
+        "departmentId": str(finance_dept.id),
+        "riskRating": "Medium",
+        "entityType": entity_type,
+    }
+    resp = sa_client.post("/api/auditable-entities/", payload, format="json")
+    assert resp.status_code == status.HTTP_201_CREATED, resp.content
+    assert resp.json()["entityType"] == entity_type
+
+
+@pytest.mark.django_db
 def test_estimated_man_days_round_trips_and_records_revision(sa_client, entity_ap):
     resp = sa_client.patch(
         f"/api/auditable-entities/{entity_ap.id}/",
@@ -209,6 +223,19 @@ def test_estimated_man_days_rejects_overflow(sa_client, finance_dept):
         "departmentId": str(finance_dept.id),
         "riskRating": "Medium",
         "estimatedManDays": "1000000.00",  # exceeds max_digits=6
+    }
+    resp = sa_client.post("/api/auditable-entities/", payload, format="json")
+    assert resp.status_code == status.HTTP_400_BAD_REQUEST
+    assert "estimatedManDays" in resp.json()
+
+
+@pytest.mark.django_db
+def test_estimated_man_days_rejects_negative(sa_client, finance_dept):
+    payload = {
+        "name": "Negative effort",
+        "departmentId": str(finance_dept.id),
+        "riskRating": "Medium",
+        "estimatedManDays": "-1.00",
     }
     resp = sa_client.post("/api/auditable-entities/", payload, format="json")
     assert resp.status_code == status.HTTP_400_BAD_REQUEST

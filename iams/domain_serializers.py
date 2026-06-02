@@ -365,6 +365,7 @@ class AuditableEntitySerializer(serializers.ModelSerializer):
         source="estimated_man_days",
         max_digits=6,
         decimal_places=2,
+        min_value=0,
         required=False,
         allow_null=True,
     )

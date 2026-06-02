@@ -12,3 +12,20 @@ db.sqlite3
 
 # Environment
 .env
+
+# Test / coverage artifacts
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Django media (user uploads)
+/media/
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/

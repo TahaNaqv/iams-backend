@@ -505,6 +505,12 @@ class AuditableEntityViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
         before = self._capture_field_values(serializer.instance)
         instance = serializer.save()
         self._record_revision(instance, before=before)
+        # Re-roll after the write so that clearing an override flag (Manual →
+        # Auto) immediately recomputes the affected field from the entity's
+        # risks. Respects any still-set overrides, and is a no-op when nothing
+        # changes.
+        from iams.risk_rollup import recompute_entity_risk_position
+        recompute_entity_risk_position(instance)
         self._bump_metric("updated")
 
     @staticmethod
@@ -602,7 +608,9 @@ class AuditableEntityViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
             return data
 
         if root_id:
-            root = get_object_or_404(AuditableEntity.all_objects, pk=root_id)
+            # Use the annotated queryset so the root carries _risk_count /
+            # _child_count (get_object_or_404 on all_objects would not).
+            root = get_object_or_404(self.get_queryset(), pk=root_id)
             return Response([build(root, 0)])
         roots = by_parent.get(None, [])
         return Response([build(r, 0) for r in roots])
@@ -967,7 +975,11 @@ class EntityRiskViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
         self._reroll(risk.entity)
 
     def perform_update(self, serializer):
+        old_entity = serializer.instance.entity
         risk = serializer.save()
+        # If the risk was moved to a different engagement, re-roll both.
+        if old_entity.id != risk.entity_id:
+            self._reroll(old_entity)
         self._reroll(risk.entity)
 
     def perform_destroy(self, instance):

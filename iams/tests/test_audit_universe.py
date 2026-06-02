@@ -863,3 +863,46 @@ def test_auditor_cannot_add_risk(auditor_client, finance_dept):
     e = AuditableEntity.objects.create(name="ReadOnly", department_ref=finance_dept)
     resp = _add_risk(auditor_client, e.id, inherentLikelihood=3, inherentImpact=3)
     assert resp.status_code == status.HTTP_403_FORBIDDEN
+
+
+@pytest.mark.django_db
+def test_clearing_override_via_entity_patch_recomputes(sa_client, finance_dept):
+    e = AuditableEntity.objects.create(name="Override clear", department_ref=finance_dept)
+    _add_risk(sa_client, e.id, inherentLikelihood=2, inherentImpact=2)  # auto → Low
+    e.refresh_from_db()
+    # Pin rating manually.
+    r = sa_client.patch(
+        f"/api/auditable-entities/{e.id}/",
+        {"riskRating": "Critical", "riskRatingIsOverridden": True, "version": e.version},
+        format="json",
+    )
+    assert r.status_code == status.HTTP_200_OK, r.content
+    e.refresh_from_db()
+    assert e.risk_rating == "Critical"
+    # Flip back to Auto via the entity PATCH — must recompute, not stay stale.
+    r = sa_client.patch(
+        f"/api/auditable-entities/{e.id}/",
+        {"riskRatingIsOverridden": False, "version": e.version},
+        format="json",
+    )
+    assert r.status_code == status.HTTP_200_OK, r.content
+    e.refresh_from_db()
+    assert e.risk_rating == "Low"
+
+
+@pytest.mark.django_db
+def test_entity_risk_residual_requires_both_or_neither(sa_client, finance_dept):
+    e = AuditableEntity.objects.create(name="Residual half", department_ref=finance_dept)
+    resp = sa_client.post(
+        "/api/entity-risks/",
+        {
+            "entityId": str(e.id),
+            "title": "Half residual",
+            "inherentLikelihood": 4,
+            "inherentImpact": 4,
+            "residualLikelihood": 2,  # impact omitted
+        },
+        format="json",
+    )
+    assert resp.status_code == status.HTTP_400_BAD_REQUEST
+    assert "residualImpact" in resp.json()

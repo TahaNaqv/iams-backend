@@ -371,6 +371,19 @@ class EntityRiskSerializer(serializers.ModelSerializer):
     def get_residualScore(self, obj):
         return obj.residual_score
 
+    def validate(self, attrs):
+        # Residual likelihood/impact must be supplied together (or neither),
+        # so the residual coordinate stays coherent. Account for partial
+        # updates by falling back to the existing instance values.
+        inst = self.instance
+        rl = attrs.get("residual_likelihood", getattr(inst, "residual_likelihood", None))
+        ri = attrs.get("residual_impact", getattr(inst, "residual_impact", None))
+        if (rl is None) != (ri is None):
+            raise serializers.ValidationError(
+                {"residualImpact": "Set residual likelihood and impact together, or leave both blank."}
+            )
+        return attrs
+
 
 class AuditableEntitySerializer(serializers.ModelSerializer):
     """Full read/write serializer for the audit universe.
@@ -747,6 +760,7 @@ class AuditableEntityListSerializer(serializers.ModelSerializer):
         fields = [
             "id",
             "name",
+            "description",
             # Legacy fields — retained on the wire until the drop migration
             # ships, so pre-Phase-7 clients (FE, contract tests, scripts)
             # continue to read the shape they expect.

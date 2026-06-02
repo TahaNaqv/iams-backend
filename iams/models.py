@@ -578,6 +578,13 @@ class AuditableEntity(TimeStampedModel):
     operating_budget = models.DecimalField(
         max_digits=18, decimal_places=2, null=True, blank=True
     )
+    estimated_man_days = models.DecimalField(
+        max_digits=6,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        help_text="Estimated audit effort in man-days.",
+    )
     is_mandatory_to_audit = models.BooleanField(default=False)
     cost_center_id = models.CharField(max_length=64, blank=True, db_index=True)
     tags = models.JSONField(default=list, blank=True)

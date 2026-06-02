@@ -361,6 +361,13 @@ class AuditableEntitySerializer(serializers.ModelSerializer):
         required=False,
         allow_null=True,
     )
+    estimatedManDays = serializers.DecimalField(
+        source="estimated_man_days",
+        max_digits=6,
+        decimal_places=2,
+        required=False,
+        allow_null=True,
+    )
     isMandatoryToAudit = serializers.BooleanField(source="is_mandatory_to_audit", required=False)
     costCenterId = serializers.CharField(source="cost_center_id", required=False, allow_blank=True)
     inherentLikelihood = serializers.IntegerField(
@@ -455,6 +462,7 @@ class AuditableEntitySerializer(serializers.ModelSerializer):
             "location",
             "headcount",
             "operatingBudget",
+            "estimatedManDays",
             "isMandatoryToAudit",
             "costCenterId",
             "tags",
@@ -618,6 +626,9 @@ class AuditableEntityListSerializer(serializers.ModelSerializer):
     departmentId = serializers.UUIDField(source="department_ref_id", allow_null=True)
     businessUnitId = serializers.UUIDField(source="business_unit_id", allow_null=True)
     primaryOwnerId = serializers.UUIDField(source="primary_owner_id", allow_null=True)
+    estimatedManDays = serializers.DecimalField(
+        source="estimated_man_days", max_digits=6, decimal_places=2, allow_null=True
+    )
     inherentScore = serializers.SerializerMethodField()
     childCount = serializers.IntegerField(read_only=True, default=0)
 
@@ -643,6 +654,7 @@ class AuditableEntityListSerializer(serializers.ModelSerializer):
             "departmentId",
             "businessUnitId",
             "primaryOwnerId",
+            "estimatedManDays",
             "tags",
             "inherentScore",
             "childCount",

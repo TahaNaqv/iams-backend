@@ -106,6 +106,7 @@ def test_create_entity_with_full_payload(sa_client, finance_dept, finance_bu, su
         "isMandatoryToAudit": True,
         "headcount": 8,
         "operatingBudget": "150000.50",
+        "estimatedManDays": "12.50",
         "costCenterId": "FIN-1234",
         "inherentLikelihood": 3,
         "inherentImpact": 4,
@@ -119,6 +120,7 @@ def test_create_entity_with_full_payload(sa_client, finance_dept, finance_bu, su
     assert body["riskRating"] == "Medium"
     assert body["complianceStatus"] == "Compliant"
     assert body["tags"] == ["sox", "high-volume"]
+    assert body["estimatedManDays"] == "12.50"
     assert body["inherentScore"] == 12
     assert body["primaryOwner"]["id"] == str(super_admin.id)
     assert body["version"] == 1
@@ -179,6 +181,38 @@ def test_choice_validation_rejects_unknown_values(sa_client, finance_dept, field
     resp = sa_client.post("/api/auditable-entities/", payload, format="json")
     assert resp.status_code == status.HTTP_400_BAD_REQUEST, resp.content
     assert field in resp.json()
+
+
+@pytest.mark.django_db
+def test_estimated_man_days_round_trips_and_records_revision(sa_client, entity_ap):
+    resp = sa_client.patch(
+        f"/api/auditable-entities/{entity_ap.id}/",
+        {"estimatedManDays": "7.25", "version": entity_ap.version},
+        format="json",
+    )
+    assert resp.status_code == status.HTTP_200_OK, resp.content
+    assert resp.json()["estimatedManDays"] == "7.25"
+
+    last = (
+        AuditableEntityRevision.objects.filter(entity=entity_ap)
+        .order_by("-created_at")
+        .first()
+    )
+    assert "estimated_man_days" in last.changes
+    assert last.changes["estimated_man_days"]["to"] == "7.25"
+
+
+@pytest.mark.django_db
+def test_estimated_man_days_rejects_overflow(sa_client, finance_dept):
+    payload = {
+        "name": "Effort overflow",
+        "departmentId": str(finance_dept.id),
+        "riskRating": "Medium",
+        "estimatedManDays": "1000000.00",  # exceeds max_digits=6
+    }
+    resp = sa_client.post("/api/auditable-entities/", payload, format="json")
+    assert resp.status_code == status.HTTP_400_BAD_REQUEST
+    assert "estimatedManDays" in resp.json()
 
 
 @pytest.mark.django_db

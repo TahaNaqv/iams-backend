@@ -61,6 +61,10 @@ COLUMN_ALIASES: dict[str, str] = {
     "headcount": "headcount",
     "operating budget": "operatingBudget",
     "operating budget (usd)": "operatingBudget",
+    "estimated man days": "estimatedManDays",
+    "estimated man-days": "estimatedManDays",
+    "man days": "estimatedManDays",
+    "man-days": "estimatedManDays",
     "mandatory to audit": "isMandatoryToAudit",
     "cost center": "costCenterId",
     "cost center id": "costCenterId",
@@ -119,7 +123,7 @@ def _row_to_payload(row: dict, *, lookups: dict) -> tuple[dict, str | None]:
                 payload[key] = int(float(value))
             except (TypeError, ValueError):
                 pass
-        elif key == "operatingBudget":
+        elif key in ("operatingBudget", "estimatedManDays"):
             payload[key] = str(value)
         else:
             payload[key] = str(value).strip() if isinstance(value, str) else value

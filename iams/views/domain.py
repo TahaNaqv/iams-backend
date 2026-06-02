@@ -447,6 +447,7 @@ class AuditableEntityViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
         "location",
         "headcount",
         "operating_budget",
+        "estimated_man_days",
         "is_mandatory_to_audit",
         "cost_center_id",
         "tags",
@@ -642,6 +643,7 @@ class AuditableEntityViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
             primary_language=src.primary_language,
             headcount=src.headcount,
             operating_budget=src.operating_budget,
+            estimated_man_days=src.estimated_man_days,
             is_mandatory_to_audit=src.is_mandatory_to_audit,
             cost_center_id="",  # cost centers should not collide
             tags=list(src.tags or []),
@@ -807,6 +809,7 @@ class AuditableEntityViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
             ("cost_center_id", "costCenterId"),
             ("headcount", "headcount"),
             ("operating_budget", "operatingBudget"),
+            ("estimated_man_days", "estimatedManDays"),
             ("is_mandatory_to_audit", "isMandatoryToAudit"),
             ("external_source", "external_source"),
             ("external_id", "external_id"),

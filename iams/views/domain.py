@@ -19,6 +19,7 @@ from iams.domain_serializers import (
     AuditableEntitySerializer,
     AuditorSerializer,
     BulkImportJobSerializer,
+    EntityRiskSerializer,
     BusinessUnitSerializer,
     ChecklistItemSerializer,
     ChecklistItemWriteSerializer,
@@ -72,6 +73,7 @@ from iams.models import (
     BusinessUnit,
     ChecklistItem,
     Comment,
+    EntityRisk,
     CorrectiveAction,
     Department,
     EntityStatusChoices,
@@ -376,6 +378,7 @@ class AuditableEntityViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
         "archive": "edit_audits",
         "restore": "edit_audits",
         "recompute": "edit_audits",
+        "reset_risk_overrides": "edit_audits",
         "destroy": "edit_audits",
     }
 
@@ -410,12 +413,15 @@ class AuditableEntityViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
             "secondary_owner",
             "parent",
         )
-        # Annotate child count for tree-aware list views.
+        # Annotate child count for tree-aware list views, plus the count
+        # of attached risks (drives the Risk Register's per-engagement view).
         qs = qs.annotate(
             _child_count=Count(
                 "children",
                 filter=~Q(children__status=EntityStatusChoices.ARCHIVED),
-            )
+                distinct=True,
+            ),
+            _risk_count=Count("risks", distinct=True),
         )
         return qs
 
@@ -898,6 +904,76 @@ class AuditableEntityViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
             )
         count = recompute_all_scores_for_model(model, by_user=request.user)
         return Response({"recomputed": count, "modelId": str(model.id)})
+
+    @action(detail=True, methods=["post"], url_path="reset-risk-overrides")
+    def reset_risk_overrides(self, request, pk=None):
+        """Clear manual L/I/rating overrides and re-roll from the risks.
+
+        Accepts an optional ``fields`` list (subset of ``likelihood``,
+        ``impact``, ``rating``); defaults to all three.
+        """
+        from iams.risk_rollup import recompute_entity_risk_position
+
+        entity = self.get_object()
+        requested = request.data.get("fields") or ["likelihood", "impact", "rating"]
+        flag_map = {
+            "likelihood": "likelihood_is_overridden",
+            "impact": "impact_is_overridden",
+            "rating": "risk_rating_is_overridden",
+        }
+        changed = []
+        for key in requested:
+            attr = flag_map.get(key)
+            if attr and getattr(entity, attr):
+                setattr(entity, attr, False)
+                changed.append(attr)
+        if changed:
+            entity.save(update_fields=[*changed, "updated_at"])
+        recompute_entity_risk_position(entity)
+        entity.refresh_from_db()
+        return Response(self.get_serializer(entity).data)
+
+
+class EntityRiskViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
+    """Discrete risks attached to an auditable entity (engagement).
+
+    Filter the list by ``?entity=<uuid>``. Every create/update/delete
+    re-rolls the owning entity's likelihood / impact / risk_rating
+    (respecting per-field overrides) via
+    ``recompute_entity_risk_position``.
+    """
+
+    serializer_class = EntityRiskSerializer
+    ordering = ["-created_at"]
+
+    def get_queryset(self):
+        qs = EntityRisk.objects.select_related("entity", "owner").all()
+        entity_id = self.request.query_params.get("entity")
+        if entity_id:
+            qs = qs.filter(entity_id=entity_id)
+        return qs
+
+    def get_permissions(self):
+        if self.action in ("list", "retrieve"):
+            return [IsAuthenticated(), HasPermission("view_audits")()]
+        return [IsAuthenticated(), HasPermission("edit_audits")()]
+
+    def _reroll(self, entity):
+        from iams.risk_rollup import recompute_entity_risk_position
+        recompute_entity_risk_position(entity)
+
+    def perform_create(self, serializer):
+        risk = serializer.save()
+        self._reroll(risk.entity)
+
+    def perform_update(self, serializer):
+        risk = serializer.save()
+        self._reroll(risk.entity)
+
+    def perform_destroy(self, instance):
+        entity = instance.entity
+        instance.delete()
+        self._reroll(entity)
 
 
 class BusinessUnitViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):

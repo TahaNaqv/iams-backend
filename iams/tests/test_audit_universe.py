@@ -745,3 +745,121 @@ def test_coverage_endpoint_returns_full_breakdown(sa_client, super_admin, financ
     assert body["total"] >= 2
     assert body["withoutOwner"] >= 1
     assert "withoutRiskScore" in body
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Entity risk roll-up (individual risks → entity likelihood/impact/rating)
+# ══════════════════════════════════════════════════════════════════════
+def _add_risk(client, entity_id, **over):
+    payload = {
+        "entityId": str(entity_id),
+        "title": over.pop("title", "Risk"),
+        "category": "Operational",
+        "inherentLikelihood": over.pop("inherentLikelihood", 3),
+        "inherentImpact": over.pop("inherentImpact", 3),
+    }
+    payload.update(over)
+    return client.post("/api/entity-risks/", payload, format="json")
+
+
+@pytest.mark.django_db
+def test_adding_risk_rolls_up_to_entity(sa_client, finance_dept):
+    e = AuditableEntity.objects.create(name="GL", department_ref=finance_dept)
+    resp = _add_risk(sa_client, e.id, inherentLikelihood=2, inherentImpact=2)
+    assert resp.status_code == status.HTTP_201_CREATED, resp.content
+    e.refresh_from_db()
+    assert (e.inherent_likelihood, e.inherent_impact, e.risk_rating) == (2, 2, "Low")
+
+    # A worse risk drives the entity up to its coordinate.
+    _add_risk(sa_client, e.id, inherentLikelihood=5, inherentImpact=5)
+    e.refresh_from_db()
+    assert (e.inherent_likelihood, e.inherent_impact, e.risk_rating) == (5, 5, "Critical")
+
+
+@pytest.mark.django_db
+def test_rollup_uses_residual_not_inherent(sa_client, finance_dept):
+    e = AuditableEntity.objects.create(name="AR", department_ref=finance_dept)
+    _add_risk(sa_client, e.id, inherentLikelihood=5, inherentImpact=5,
+              residualLikelihood=2, residualImpact=2)
+    e.refresh_from_db()
+    assert (e.inherent_likelihood, e.inherent_impact, e.risk_rating) == (2, 2, "Low")
+
+
+@pytest.mark.django_db
+def test_closed_risks_excluded_from_rollup(sa_client, finance_dept):
+    e = AuditableEntity.objects.create(name="Tax", department_ref=finance_dept)
+    _add_risk(sa_client, e.id, inherentLikelihood=2, inherentImpact=2)
+    r2 = _add_risk(sa_client, e.id, inherentLikelihood=5, inherentImpact=5).json()
+    e.refresh_from_db()
+    assert e.risk_rating == "Critical"
+    # Close the severe risk → entity falls back to the remaining one.
+    sa_client.patch(f"/api/entity-risks/{r2['id']}/", {"status": "Closed"}, format="json")
+    e.refresh_from_db()
+    assert (e.inherent_likelihood, e.inherent_impact, e.risk_rating) == (2, 2, "Low")
+
+
+@pytest.mark.django_db
+def test_manual_override_survives_rollup(sa_client, finance_dept):
+    e = AuditableEntity.objects.create(name="Treasury", department_ref=finance_dept)
+    # Pin the rating manually.
+    resp = sa_client.patch(
+        f"/api/auditable-entities/{e.id}/",
+        {"riskRating": "Critical", "riskRatingIsOverridden": True, "version": e.version},
+        format="json",
+    )
+    assert resp.status_code == status.HTTP_200_OK, resp.content
+    # A low risk updates L/I but must NOT change the overridden rating.
+    _add_risk(sa_client, e.id, inherentLikelihood=1, inherentImpact=1)
+    e.refresh_from_db()
+    assert e.risk_rating == "Critical"
+    assert (e.inherent_likelihood, e.inherent_impact) == (1, 1)
+
+
+@pytest.mark.django_db
+def test_reset_risk_overrides_recomputes(sa_client, finance_dept):
+    e = AuditableEntity.objects.create(name="Payroll", department_ref=finance_dept)
+    _add_risk(sa_client, e.id, inherentLikelihood=2, inherentImpact=2)
+    e.refresh_from_db()
+    resp = sa_client.patch(
+        f"/api/auditable-entities/{e.id}/",
+        {"riskRating": "Critical", "riskRatingIsOverridden": True, "version": e.version},
+        format="json",
+    )
+    assert resp.status_code == status.HTTP_200_OK, resp.content
+    e.refresh_from_db()
+    assert e.risk_rating == "Critical"
+    resp = sa_client.post(f"/api/auditable-entities/{e.id}/reset-risk-overrides/", {}, format="json")
+    assert resp.status_code == status.HTTP_200_OK, resp.content
+    e.refresh_from_db()
+    assert e.risk_rating == "Low"
+    assert e.risk_rating_is_overridden is False
+
+
+@pytest.mark.django_db
+def test_deleting_worst_risk_rerolls(sa_client, finance_dept):
+    e = AuditableEntity.objects.create(name="Vendor", department_ref=finance_dept)
+    _add_risk(sa_client, e.id, inherentLikelihood=2, inherentImpact=2)
+    worst = _add_risk(sa_client, e.id, inherentLikelihood=4, inherentImpact=5).json()
+    e.refresh_from_db()
+    assert e.risk_rating == "Critical"
+    sa_client.delete(f"/api/entity-risks/{worst['id']}/")
+    e.refresh_from_db()
+    assert (e.inherent_likelihood, e.inherent_impact, e.risk_rating) == (2, 2, "Low")
+
+
+@pytest.mark.django_db
+def test_entity_serializer_exposes_risk_rollup_fields(sa_client, finance_dept):
+    e = AuditableEntity.objects.create(name="Investments", department_ref=finance_dept)
+    _add_risk(sa_client, e.id, inherentLikelihood=4, inherentImpact=4)
+    body = sa_client.get(f"/api/auditable-entities/{e.id}/?fields=full").json()
+    assert body["riskCount"] == 1
+    assert body["computedRating"] == "High"
+    assert body["likelihoodIsOverridden"] is False
+    assert len(body["risks"]) == 1
+
+
+@pytest.mark.django_db
+def test_auditor_cannot_add_risk(auditor_client, finance_dept):
+    e = AuditableEntity.objects.create(name="ReadOnly", department_ref=finance_dept)
+    resp = _add_risk(auditor_client, e.id, inherentLikelihood=3, inherentImpact=3)
+    assert resp.status_code == status.HTTP_403_FORBIDDEN

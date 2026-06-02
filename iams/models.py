@@ -1,7 +1,7 @@
 import uuid
 from decimal import Decimal
 from django.conf import settings
-from django.core.validators import MinValueValidator
+from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
 from django.contrib.contenttypes.fields import GenericForeignKey
 from django.contrib.contenttypes.models import ContentType
@@ -157,6 +157,37 @@ class TagCategoryChoices(models.TextChoices):
     FUNCTIONAL = "Functional", "Functional"
     RISK = "Risk", "Risk"
     CUSTOM = "Custom", "Custom"
+
+
+class ControlEffectivenessChoices(models.TextChoices):
+    EFFECTIVE = "Effective", "Effective"
+    PARTIALLY_EFFECTIVE = "Partially Effective", "Partially Effective"
+    INEFFECTIVE = "Ineffective", "Ineffective"
+    NOT_ASSESSED = "Not Assessed", "Not Assessed"
+
+
+class RiskCategoryChoices(models.TextChoices):
+    OPERATIONAL = "Operational", "Operational"
+    FINANCIAL = "Financial", "Financial"
+    COMPLIANCE = "Compliance", "Compliance"
+    STRATEGIC = "Strategic", "Strategic"
+    IT_CYBER = "IT/Cyber", "IT / Cyber"
+    REPUTATIONAL = "Reputational", "Reputational"
+    FRAUD = "Fraud", "Fraud"
+
+
+class RiskResponseChoices(models.TextChoices):
+    MITIGATE = "Mitigate", "Mitigate"
+    ACCEPT = "Accept", "Accept"
+    TRANSFER = "Transfer", "Transfer"
+    AVOID = "Avoid", "Avoid"
+
+
+class EntityRiskStatusChoices(models.TextChoices):
+    OPEN = "Open", "Open"
+    MITIGATED = "Mitigated", "Mitigated"
+    ACCEPTED = "Accepted", "Accepted"
+    CLOSED = "Closed", "Closed"
 
 
 class AuditableEntityActiveManager(models.Manager):
@@ -601,6 +632,13 @@ class AuditableEntity(TimeStampedModel):
     )
     inherent_likelihood = models.PositiveSmallIntegerField(null=True, blank=True)
     inherent_impact = models.PositiveSmallIntegerField(null=True, blank=True)
+    # When False, the field is auto-computed by rolling up the entity's
+    # ``EntityRisk`` line items (worst residual risk). When True, the value
+    # was set manually and the roll-up leaves it untouched. See
+    # ``iams.risk_rollup.recompute_entity_risk_position``.
+    likelihood_is_overridden = models.BooleanField(default=False)
+    impact_is_overridden = models.BooleanField(default=False)
+    risk_rating_is_overridden = models.BooleanField(default=False)
     description = models.TextField(blank=True)
     # Optimistic locking. Bumped on every save by the API serializer;
     # PATCH requests must include the current value or receive 409.
@@ -650,6 +688,98 @@ class AuditableEntity(TimeStampedModel):
 
     def __str__(self):
         return self.name
+
+
+class EntityRisk(TimeStampedModel):
+    """A discrete risk attached to an :class:`AuditableEntity`.
+
+    Each risk carries an inherent likelihood/impact (before controls) and
+    a residual likelihood/impact (after controls). The owning entity's
+    likelihood / impact / risk_rating are rolled up from these line items
+    (worst residual risk) unless the entity has the matching
+    ``*_is_overridden`` flag set — see
+    ``iams.risk_rollup.recompute_entity_risk_position``.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    entity = models.ForeignKey(
+        AuditableEntity,
+        on_delete=models.CASCADE,
+        related_name="risks",
+    )
+    title = models.CharField(max_length=255)
+    description = models.TextField(blank=True)
+    category = models.CharField(
+        max_length=24,
+        choices=RiskCategoryChoices.choices,
+        default=RiskCategoryChoices.OPERATIONAL,
+    )
+
+    # Inherent (before controls)
+    inherent_likelihood = models.PositiveSmallIntegerField(
+        validators=[MinValueValidator(1), MaxValueValidator(5)]
+    )
+    inherent_impact = models.PositiveSmallIntegerField(
+        validators=[MinValueValidator(1), MaxValueValidator(5)]
+    )
+
+    # Controls
+    existing_controls = models.TextField(blank=True)
+    control_effectiveness = models.CharField(
+        max_length=24,
+        choices=ControlEffectivenessChoices.choices,
+        default=ControlEffectivenessChoices.NOT_ASSESSED,
+    )
+
+    # Residual (after controls). Blank → falls back to inherent at roll-up.
+    residual_likelihood = models.PositiveSmallIntegerField(
+        null=True, blank=True, validators=[MinValueValidator(1), MaxValueValidator(5)]
+    )
+    residual_impact = models.PositiveSmallIntegerField(
+        null=True, blank=True, validators=[MinValueValidator(1), MaxValueValidator(5)]
+    )
+
+    risk_response = models.CharField(
+        max_length=16,
+        choices=RiskResponseChoices.choices,
+        default=RiskResponseChoices.MITIGATE,
+    )
+    status = models.CharField(
+        max_length=16,
+        choices=EntityRiskStatusChoices.choices,
+        default=EntityRiskStatusChoices.OPEN,
+    )
+    owner = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="owned_entity_risks",
+    )
+    target_date = models.DateField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["entity", "status"], name="entity_risk_status_idx"),
+        ]
+
+    # ── Derived helpers ────────────────────────────────────────────────
+    @property
+    def effective_likelihood(self) -> int:
+        """Residual likelihood, falling back to inherent when unset."""
+        return self.residual_likelihood or self.inherent_likelihood
+
+    @property
+    def effective_impact(self) -> int:
+        return self.residual_impact or self.inherent_impact
+
+    @property
+    def residual_score(self) -> int:
+        return self.effective_likelihood * self.effective_impact
+
+    def __str__(self):
+        return f"{self.title} ({self.entity_id})"
 
 
 class BulkImportJob(TimeStampedModel):

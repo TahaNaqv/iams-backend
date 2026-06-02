@@ -208,8 +208,8 @@ def record_score(
         notes=notes,
     )
 
-    # Bump entity risk_rating (preserve Critical)
-    if is_high and entity.risk_rating != "Critical":
+    # Bump entity risk_rating (preserve Critical; never stomp a manual override)
+    if is_high and entity.risk_rating != "Critical" and not entity.risk_rating_is_overridden:
         entity.risk_rating = "High"
         entity.save(update_fields=["risk_rating", "updated_at"])
 

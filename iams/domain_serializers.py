@@ -20,6 +20,7 @@ from iams.models import (
     Comment,
     CorrectiveAction,
     Department,
+    EntityRisk,
     EntityStatusChoices,
     EvidenceFile,
     Finding,
@@ -315,6 +316,62 @@ class CurrentRiskScoreSummarySerializer(serializers.Serializer):
             return None
 
 
+class EntityRiskSerializer(serializers.ModelSerializer):
+    """A discrete risk attached to an auditable entity (engagement)."""
+
+    entityId = serializers.PrimaryKeyRelatedField(
+        source="entity", queryset=AuditableEntity.all_objects.all()
+    )
+    inherentLikelihood = serializers.IntegerField(source="inherent_likelihood", min_value=1, max_value=5)
+    inherentImpact = serializers.IntegerField(source="inherent_impact", min_value=1, max_value=5)
+    existingControls = serializers.CharField(source="existing_controls", required=False, allow_blank=True)
+    controlEffectiveness = serializers.CharField(source="control_effectiveness", required=False)
+    residualLikelihood = serializers.IntegerField(source="residual_likelihood", min_value=1, max_value=5, required=False, allow_null=True)
+    residualImpact = serializers.IntegerField(source="residual_impact", min_value=1, max_value=5, required=False, allow_null=True)
+    riskResponse = serializers.CharField(source="risk_response", required=False)
+    ownerId = serializers.PrimaryKeyRelatedField(
+        source="owner", queryset=User.objects.all(), required=False, allow_null=True
+    )
+    owner = UserSummarySerializer(read_only=True)
+    targetDate = serializers.DateField(source="target_date", required=False, allow_null=True)
+    inherentScore = serializers.SerializerMethodField()
+    residualScore = serializers.SerializerMethodField()
+    createdAt = serializers.DateTimeField(source="created_at", read_only=True)
+    updatedAt = serializers.DateTimeField(source="updated_at", read_only=True)
+
+    class Meta:
+        model = EntityRisk
+        fields = [
+            "id",
+            "entityId",
+            "title",
+            "description",
+            "category",
+            "inherentLikelihood",
+            "inherentImpact",
+            "existingControls",
+            "controlEffectiveness",
+            "residualLikelihood",
+            "residualImpact",
+            "riskResponse",
+            "status",
+            "ownerId",
+            "owner",
+            "targetDate",
+            "inherentScore",
+            "residualScore",
+            "createdAt",
+            "updatedAt",
+        ]
+        read_only_fields = ["id", "createdAt", "updatedAt"]
+
+    def get_inherentScore(self, obj):
+        return obj.inherent_likelihood * obj.inherent_impact
+
+    def get_residualScore(self, obj):
+        return obj.residual_score
+
+
 class AuditableEntitySerializer(serializers.ModelSerializer):
     """Full read/write serializer for the audit universe.
 
@@ -434,12 +491,22 @@ class AuditableEntitySerializer(serializers.ModelSerializer):
     )
     secondaryOwner = UserSummarySerializer(source="secondary_owner", read_only=True)
 
+    # ── Risk roll-up: per-field manual override flags ──
+    likelihoodIsOverridden = serializers.BooleanField(source="likelihood_is_overridden", required=False)
+    impactIsOverridden = serializers.BooleanField(source="impact_is_overridden", required=False)
+    riskRatingIsOverridden = serializers.BooleanField(source="risk_rating_is_overridden", required=False)
+
     # ── Computed read fields ──
     childCount = serializers.SerializerMethodField()
     openAuditCount = serializers.SerializerMethodField()
     currentRiskScore = serializers.SerializerMethodField()
     lastRevisionAt = serializers.SerializerMethodField()
     inherentScore = serializers.SerializerMethodField()
+    riskCount = serializers.SerializerMethodField()
+    computedLikelihood = serializers.SerializerMethodField()
+    computedImpact = serializers.SerializerMethodField()
+    computedRating = serializers.SerializerMethodField()
+    risks = serializers.SerializerMethodField()
 
     # ── Optimistic locking ──
     version = serializers.IntegerField(required=False)
@@ -470,6 +537,14 @@ class AuditableEntitySerializer(serializers.ModelSerializer):
             "inherentLikelihood",
             "inherentImpact",
             "inherentScore",
+            "likelihoodIsOverridden",
+            "impactIsOverridden",
+            "riskRatingIsOverridden",
+            "computedLikelihood",
+            "computedImpact",
+            "computedRating",
+            "riskCount",
+            "risks",
             # legacy free-text
             "department",
             "owner",
@@ -541,6 +616,34 @@ class AuditableEntitySerializer(serializers.ModelSerializer):
         if obj.inherent_likelihood and obj.inherent_impact:
             return obj.inherent_likelihood * obj.inherent_impact
         return None
+
+    def get_riskCount(self, obj):
+        if not obj.pk:
+            return 0
+        return obj.risks.count()
+
+    def _rollup(self, obj):
+        # Cache the roll-up computation across the three computed getters.
+        cached = getattr(self, "_rollup_cache", None)
+        if cached is None or cached[0] != obj.pk:
+            from iams.risk_rollup import compute_entity_risk_position
+            cached = (obj.pk, compute_entity_risk_position(obj) if obj.pk else {})
+            self._rollup_cache = cached
+        return cached[1]
+
+    def get_computedLikelihood(self, obj):
+        return self._rollup(obj).get("likelihood")
+
+    def get_computedImpact(self, obj):
+        return self._rollup(obj).get("impact")
+
+    def get_computedRating(self, obj):
+        return self._rollup(obj).get("rating")
+
+    def get_risks(self, obj):
+        if not obj.pk:
+            return []
+        return EntityRiskSerializer(obj.risks.all(), many=True).data
 
     # ── Validation ──
     def validate_tags(self, value):
@@ -630,8 +733,14 @@ class AuditableEntityListSerializer(serializers.ModelSerializer):
     estimatedManDays = serializers.DecimalField(
         source="estimated_man_days", max_digits=6, decimal_places=2, allow_null=True
     )
+    inherentLikelihood = serializers.IntegerField(source="inherent_likelihood", allow_null=True)
+    inherentImpact = serializers.IntegerField(source="inherent_impact", allow_null=True)
+    likelihoodIsOverridden = serializers.BooleanField(source="likelihood_is_overridden")
+    impactIsOverridden = serializers.BooleanField(source="impact_is_overridden")
+    riskRatingIsOverridden = serializers.BooleanField(source="risk_rating_is_overridden")
     inherentScore = serializers.SerializerMethodField()
     childCount = serializers.IntegerField(read_only=True, default=0)
+    riskCount = serializers.IntegerField(source="_risk_count", read_only=True, default=0)
 
     class Meta:
         model = AuditableEntity
@@ -657,8 +766,14 @@ class AuditableEntityListSerializer(serializers.ModelSerializer):
             "primaryOwnerId",
             "estimatedManDays",
             "tags",
+            "inherentLikelihood",
+            "inherentImpact",
+            "likelihoodIsOverridden",
+            "impactIsOverridden",
+            "riskRatingIsOverridden",
             "inherentScore",
             "childCount",
+            "riskCount",
             "version",
         ]
         read_only_fields = fields

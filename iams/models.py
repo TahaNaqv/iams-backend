@@ -625,6 +625,8 @@ class AuditableEntity(TimeStampedModel):
     is_mandatory_to_audit = models.BooleanField(default=False)
     cost_center_id = models.CharField(max_length=64, blank=True, db_index=True)
     tags = models.JSONField(default=list, blank=True)
+    # User-defined extra fields: ordered list of {"label": str, "value": str}.
+    custom_fields = models.JSONField(default=list, blank=True)
     compliance_status = models.CharField(
         max_length=20,
         choices=ComplianceStatusChoices.choices,

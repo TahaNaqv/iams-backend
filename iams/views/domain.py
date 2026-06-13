@@ -598,6 +598,9 @@ class AuditableEntityViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
         by_parent: dict = {}
         for row in all_rows:
             by_parent.setdefault(row.parent_id, []).append(row)
+        # Stable, name-ordered siblings so the hierarchy renders deterministically.
+        for siblings in by_parent.values():
+            siblings.sort(key=lambda r: (r.name or "").lower())
 
         def build(node, level):
             data = AuditableEntityListSerializer(node).data

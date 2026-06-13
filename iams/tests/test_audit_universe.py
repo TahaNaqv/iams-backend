@@ -906,3 +906,77 @@ def test_entity_risk_residual_requires_both_or_neither(sa_client, finance_dept):
     )
     assert resp.status_code == status.HTTP_400_BAD_REQUEST
     assert "residualImpact" in resp.json()
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Custom fields (user-defined label/value pairs)
+# ══════════════════════════════════════════════════════════════════════
+@pytest.mark.django_db
+def test_custom_fields_round_trip_and_clean(sa_client, finance_dept):
+    payload = {
+        "name": "With custom fields",
+        "departmentId": str(finance_dept.id),
+        "riskRating": "Medium",
+        "customFields": [
+            {"label": "  Regulator ", "value": " SECP "},
+            {"label": "", "value": ""},  # blank row → dropped
+            {"label": "Review cycle", "value": "Biannual"},
+        ],
+    }
+    resp = sa_client.post("/api/auditable-entities/", payload, format="json")
+    assert resp.status_code == status.HTTP_201_CREATED, resp.content
+    cf = resp.json()["customFields"]
+    assert cf == [
+        {"label": "Regulator", "value": "SECP"},
+        {"label": "Review cycle", "value": "Biannual"},
+    ]
+
+
+@pytest.mark.django_db
+def test_custom_fields_reject_label_only_missing(sa_client, finance_dept):
+    resp = sa_client.post(
+        "/api/auditable-entities/",
+        {
+            "name": "Bad custom",
+            "departmentId": str(finance_dept.id),
+            "riskRating": "Medium",
+            "customFields": [{"value": "orphan value"}],  # no label
+        },
+        format="json",
+    )
+    assert resp.status_code == status.HTTP_400_BAD_REQUEST
+    assert "customFields" in resp.json()
+
+
+@pytest.mark.django_db
+def test_custom_fields_reject_over_cap(sa_client, finance_dept):
+    resp = sa_client.post(
+        "/api/auditable-entities/",
+        {
+            "name": "Too many custom",
+            "departmentId": str(finance_dept.id),
+            "riskRating": "Medium",
+            "customFields": [{"label": f"L{i}", "value": str(i)} for i in range(51)],
+        },
+        format="json",
+    )
+    assert resp.status_code == status.HTTP_400_BAD_REQUEST
+    assert "customFields" in resp.json()
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Hierarchy tree — nesting + ordering
+# ══════════════════════════════════════════════════════════════════════
+@pytest.mark.django_db
+def test_tree_nests_children_and_orders_by_name(sa_client, finance_dept):
+    parent = AuditableEntity.objects.create(name="Finance", department_ref=finance_dept, entity_type="Department")
+    # Children created out of alphabetical order on purpose.
+    AuditableEntity.objects.create(name="Treasury", department_ref=finance_dept, parent=parent, entity_type="Division")
+    AuditableEntity.objects.create(name="Accounts Payable", department_ref=finance_dept, parent=parent, entity_type="Process")
+
+    resp = sa_client.get(f"/api/auditable-entities/tree/?root={parent.id}")
+    assert resp.status_code == status.HTTP_200_OK, resp.content
+    root = resp.json()[0]
+    assert root["name"] == "Finance"
+    child_names = [c["name"] for c in root["children"]]
+    assert child_names == ["Accounts Payable", "Treasury"]  # name-ordered

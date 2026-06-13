@@ -504,6 +504,9 @@ class AuditableEntitySerializer(serializers.ModelSerializer):
     )
     secondaryOwner = UserSummarySerializer(source="secondary_owner", read_only=True)
 
+    # User-defined extra fields: list of {label, value}.
+    customFields = serializers.JSONField(source="custom_fields", required=False)
+
     # ── Risk roll-up: per-field manual override flags ──
     likelihoodIsOverridden = serializers.BooleanField(source="likelihood_is_overridden", required=False)
     impactIsOverridden = serializers.BooleanField(source="impact_is_overridden", required=False)
@@ -547,6 +550,7 @@ class AuditableEntitySerializer(serializers.ModelSerializer):
             "isMandatoryToAudit",
             "costCenterId",
             "tags",
+            "customFields",
             "inherentLikelihood",
             "inherentImpact",
             "inherentScore",
@@ -665,6 +669,33 @@ class AuditableEntitySerializer(serializers.ModelSerializer):
         if len(value) > 50:
             raise serializers.ValidationError("At most 50 tags are allowed.")
         return value
+
+    def validate_customFields(self, value):
+        """Normalise user-defined fields: list of {label, value} objects.
+
+        Drops fully-blank rows, requires a non-empty label on the rest,
+        trims whitespace, and enforces sane caps.
+        """
+        if not isinstance(value, list):
+            raise serializers.ValidationError("Custom fields must be a list.")
+        if len(value) > 50:
+            raise serializers.ValidationError("At most 50 custom fields are allowed.")
+        cleaned = []
+        for item in value:
+            if not isinstance(item, dict):
+                raise serializers.ValidationError("Each custom field must be an object.")
+            label = str(item.get("label", "")).strip()
+            val = str(item.get("value", "")).strip()
+            if not label and not val:
+                continue  # skip empty rows
+            if not label:
+                raise serializers.ValidationError("Each custom field needs a label.")
+            if len(label) > 100:
+                raise serializers.ValidationError("Custom field labels must be 100 characters or fewer.")
+            if len(val) > 2000:
+                raise serializers.ValidationError("Custom field values must be 2000 characters or fewer.")
+            cleaned.append({"label": label, "value": val})
+        return cleaned
 
     def validate_parentId(self, value):
         if value is None:

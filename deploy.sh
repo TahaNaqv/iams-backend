@@ -35,8 +35,8 @@ ssh "$SERVER_USER@$SERVER_HOST" bash << 'ENDSSH'
   # namespace and fails with "setns process: exit status 1". The
   # entrypoint owns this responsibility.
 
-  echo "  -> Waiting for backend health (up to 90s)..."
-  for i in $(seq 1 30); do
+  echo "  -> Waiting for backend health (up to 150s)..."
+  for i in $(seq 1 50); do
     status="$(docker inspect --format '{{.State.Health.Status}}' iams-backend-backend-1 2>/dev/null || echo missing)"
     if [ "$status" = "healthy" ]; then
       echo "  -> Backend reports healthy."

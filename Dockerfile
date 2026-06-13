@@ -82,8 +82,13 @@ COPY --chown=iams:iams . /app/
 COPY --chown=iams:iams docker/entrypoint.sh /usr/local/bin/iams-entrypoint
 RUN chmod +x /usr/local/bin/iams-entrypoint
 
-# Static files target dir (writable by app user)
-RUN mkdir -p /app/staticfiles /app/media && chown -R iams:iams /app/staticfiles /app/media
+# Static files target dir (writable by app user). Also make the /app
+# working directory itself iams-owned: gunicorn's control server creates a
+# ``.gunicorn`` dir in the cwd, which fails with EACCES when /app is the
+# root-owned WORKDIR (the COPY --chown only owns the contents, not the dir).
+RUN mkdir -p /app/staticfiles /app/media \
+    && chown iams:iams /app \
+    && chown -R iams:iams /app/staticfiles /app/media
 
 USER iams
 

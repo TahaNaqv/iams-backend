@@ -202,34 +202,10 @@ class AuditableEntityActiveManager(models.Manager):
         return super().get_queryset().exclude(status=EntityStatusChoices.ARCHIVED)
 
 
-class Department(TimeStampedModel):
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    name = models.CharField(max_length=200, unique=True)
-    head = models.CharField(max_length=200, blank=True)
-    risk_rating = models.CharField(
-        max_length=20,
-        choices=RiskRatingChoices.choices,
-        default=RiskRatingChoices.MEDIUM,
-    )
-    last_audit_date = models.DateField(null=True, blank=True)
-    next_audit_date = models.DateField(null=True, blank=True)
-    entity_count = models.PositiveIntegerField(default=0)
-    # Phase 7 Track 1 — link Departments under a BusinessUnit umbrella.
-    # Nullable for backfill compatibility; populated by the migration's
-    # seed step or by manual mapping in admin.
-    business_unit = models.ForeignKey(
-        "BusinessUnit",
-        on_delete=models.SET_NULL,
-        null=True,
-        blank=True,
-        related_name="departments",
-    )
-
-    class Meta:
-        ordering = ["name"]
-
-    def __str__(self):
-        return self.name
+# NOTE: The standalone ``Department`` model was removed in the department
+# merge (migration 0033). Departments are now ``AuditableEntity`` rows with
+# ``entity_type="Department"``; an engagement's owning department is its
+# ``department_entity`` (and/or nearest Department-type ``parent`` ancestor).
 
 
 class BusinessUnit(TimeStampedModel):
@@ -311,9 +287,6 @@ class Audit(TimeStampedModel):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     title = models.CharField(max_length=255)
     department = models.CharField(max_length=200)
-    department_ref = models.ForeignKey(
-        Department, on_delete=models.SET_NULL, null=True, blank=True, related_name="audits"
-    )
     lead_auditor = models.CharField(max_length=200)
     lead_auditor_ref = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="led_audits"
@@ -362,9 +335,6 @@ class Finding(TimeStampedModel):
     title = models.CharField(max_length=255)
     audit = models.ForeignKey(Audit, on_delete=models.CASCADE, related_name="findings")
     department = models.CharField(max_length=200)
-    department_ref = models.ForeignKey(
-        Department, on_delete=models.SET_NULL, null=True, blank=True, related_name="findings"
-    )
     severity = models.CharField(max_length=20, choices=SEVERITY_CHOICES, default="Medium")
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="Open")
     owner = models.CharField(max_length=200)
@@ -420,9 +390,6 @@ class CorrectiveAction(TimeStampedModel):
     description = models.TextField(blank=True)
     progress = models.PositiveIntegerField(default=0)
     department = models.CharField(max_length=200)
-    department_ref = models.ForeignKey(
-        Department, on_delete=models.SET_NULL, null=True, blank=True, related_name="corrective_actions"
-    )
 
     class Meta:
         ordering = ["-due_date", "title"]
@@ -538,22 +505,26 @@ class TimelineEvent(TimeStampedModel):
 class AuditableEntity(TimeStampedModel):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     name = models.CharField(max_length=255)
-    # ── DEPRECATED legacy free-text columns ──────────────────────────
-    # ``department`` and ``owner`` are retained for backward compatibility
-    # with pre-Phase-7 API consumers (the AuditableEntityListSerializer
-    # still emits both on the wire, and the contract test asserts their
-    # presence). New writes must populate ``department_ref`` /
-    # ``primary_owner`` — these scalar columns will be removed in a
-    # future migration once telemetry shows zero callers depend on them.
-    #
-    # Deprecation: 2026-05-15. Removal target: next major release.
+    # ── Legacy free-text columns ─────────────────────────────────────
+    # ``department`` and ``owner`` are denormalized display strings kept for
+    # backward compatibility with pre-Phase-7 API consumers (the list
+    # serializer still emits both, and dashboards key on the ``department``
+    # text). The canonical owning department is ``department_entity``.
     department = models.CharField(
         max_length=200,
         blank=True,
-        help_text="DEPRECATED — use ``department_ref`` (FK). Removed in next major release.",
+        help_text="Denormalized owning-department name; canonical FK is ``department_entity``.",
     )
-    department_ref = models.ForeignKey(
-        Department, on_delete=models.SET_NULL, null=True, blank=True, related_name="auditable_entities"
+    # The owning ``Department``-type entity (a self-reference). This is the
+    # tree-native department link that replaced the dropped ``department_ref``
+    # FK to the standalone Department model.
+    department_entity = models.ForeignKey(
+        "self",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="member_entities",
+        help_text="Owning Department-type entity (replaces department_ref).",
     )
     owner = models.CharField(
         max_length=200,
@@ -681,7 +652,7 @@ class AuditableEntity(TimeStampedModel):
         indexes = [
             models.Index(fields=["parent"], name="ae_parent_idx"),
             models.Index(fields=["business_unit", "status"], name="ae_bu_status_idx"),
-            models.Index(fields=["department_ref", "status"], name="ae_dept_status_idx"),
+            models.Index(fields=["department_entity", "status"], name="ae_dept_entity_status_idx"),
             models.Index(fields=["risk_rating", "status"], name="ae_risk_status_idx"),
             models.Index(fields=["next_audit_date"], name="ae_next_audit_idx"),
             models.Index(fields=["primary_owner"], name="ae_primary_owner_idx"),
@@ -690,6 +661,29 @@ class AuditableEntity(TimeStampedModel):
 
     def __str__(self):
         return self.name
+
+    def get_department(self):
+        """Return the nearest ancestor of type ``Department`` (excluding self).
+
+        Walks the ``parent`` chain. This is the single source of truth for an
+        engagement's owning department now that the standalone ``Department``
+        model is being merged into the audit-universe tree: a department is
+        simply an :class:`AuditableEntity` with ``entity_type="Department"``,
+        and an engagement belongs to the closest such ancestor. Cycle-guarded
+        so a corrupted ``parent`` loop terminates instead of hanging.
+
+        Returns ``None`` for top-level nodes and for department nodes
+        themselves (a department is not nested under another department by
+        default).
+        """
+        seen: set = set()
+        node = self.parent
+        while node is not None and node.pk not in seen:
+            seen.add(node.pk)
+            if node.entity_type == EntityTypeChoices.DEPARTMENT:
+                return node
+            node = node.parent
+        return None
 
 
 class EntityRisk(TimeStampedModel):
@@ -1480,9 +1474,6 @@ class AuditReport(TimeStampedModel):
     created_date = models.DateField(null=True, blank=True)
     last_modified = models.DateField(null=True, blank=True)
     department = models.CharField(max_length=200, blank=True)
-    department_ref = models.ForeignKey(
-        Department, on_delete=models.SET_NULL, null=True, blank=True, related_name="audit_reports"
-    )
 
     class Meta:
         ordering = ["-last_modified", "-created_at"]
@@ -1665,9 +1656,6 @@ class ManagedDocument(TimeStampedModel):
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="owned_documents"
     )
     department = models.CharField(max_length=200, blank=True)
-    department_ref = models.ForeignKey(
-        Department, on_delete=models.SET_NULL, null=True, blank=True, related_name="managed_documents"
-    )
     file = models.FileField(upload_to="documents/%Y/%m/%d/", blank=True, null=True)
     file_type = models.CharField(max_length=20, blank=True)
     file_size = models.CharField(max_length=50, blank=True)

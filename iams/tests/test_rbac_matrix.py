@@ -36,7 +36,6 @@ ENDPOINTS: list[tuple[str, str | None]] = [
     ("/api/audits/", "view_audits"),
     ("/api/findings/", "manage_findings"),
     ("/api/corrective-actions/", "manage_caps"),
-    ("/api/departments/", "view_audits"),
     ("/api/activities/", None),  # IsAuthenticated only
     # — Audit execution —
     ("/api/checklist-items/", "view_audits"),

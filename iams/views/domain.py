@@ -26,7 +26,6 @@ from iams.domain_serializers import (
     CommentSerializer,
     CorrectiveActionSerializer,
     CorrectiveActionWriteSerializer,
-    DepartmentSerializer,
     EvidenceFileSerializer,
     FindingSerializer,
     FindingWriteSerializer,
@@ -75,7 +74,6 @@ from iams.models import (
     Comment,
     EntityRisk,
     CorrectiveAction,
-    Department,
     EntityStatusChoices,
     EvidenceFile,
     Finding,
@@ -106,7 +104,6 @@ from iams.audit import AuditedViewSetMixin
 from iams.filters import (
     AuditableEntityFilter,
     BusinessUnitFilter,
-    DepartmentFilter,
     TagFilter,
 )
 from iams.permissions import HasPermission
@@ -166,19 +163,6 @@ class CorrectiveActionViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
         if self.action in ("create", "update", "partial_update"):
             return CorrectiveActionWriteSerializer
         return CorrectiveActionSerializer
-
-
-class DepartmentViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
-    queryset = Department.objects.all().select_related("business_unit").order_by("name", "id")
-    serializer_class = DepartmentSerializer
-    filterset_class = DepartmentFilter
-    search_fields = ["name", "head"]
-    ordering_fields = ["name", "risk_rating", "last_audit_date", "next_audit_date", "entity_count"]
-
-    def get_permissions(self):
-        if self.action in ("list", "retrieve"):
-            return [IsAuthenticated(), HasPermission("view_audits")()]
-        return [IsAuthenticated(), HasPermission("edit_audits")()]
 
 
 class ActivityViewSet(viewsets.ReadOnlyModelViewSet):
@@ -343,7 +327,7 @@ class AuditableEntityViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
         "description",
         "cost_center_id",
         "department",
-        "department_ref__name",
+        "department_entity__name",
         "business_unit__name",
     ]
     ordering_fields = [
@@ -407,7 +391,7 @@ class AuditableEntityViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
         explicit_status = self.request.query_params.get("status")
         manager = AuditableEntity.all_objects if (include_archived or explicit_status) else AuditableEntity.objects
         qs = manager.all().select_related(
-            "department_ref",
+            "department_entity",
             "business_unit",
             "primary_owner",
             "secondary_owner",
@@ -459,7 +443,7 @@ class AuditableEntityViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
         "tags",
         "inherent_likelihood",
         "inherent_impact",
-        "department_ref_id",
+        "department_entity_id",
         "business_unit_id",
         "primary_owner_id",
         "secondary_owner_id",
@@ -650,7 +634,7 @@ class AuditableEntityViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
         clone = AuditableEntity.objects.create(
             name=new_name,
             department=src.department,
-            department_ref=src.department_ref,
+            department_entity=src.department_entity,
             business_unit=src.business_unit,
             entity_type=src.entity_type,
             primary_owner=src.primary_owner,
@@ -727,7 +711,9 @@ class AuditableEntityViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
         return Response({
             "total": total,
             "withoutOwner": qs.filter(primary_owner__isnull=True).count(),
-            "withoutDepartment": qs.filter(department_ref__isnull=True).count(),
+            "withoutDepartment": qs.filter(department_entity__isnull=True)
+            .exclude(entity_type="Department")
+            .count(),
             "withoutNextAudit": qs.filter(next_audit_date__isnull=True).count(),
             "neverAudited": qs.filter(last_audit_date__isnull=True).count(),
             "staleOver3Years": qs.filter(last_audit_date__lt=three_years_ago).count(),

@@ -98,18 +98,20 @@ class Command(BaseCommand):
             bu_by_code[bu["code"]] = obj
         self.stdout.write(f"  Business units: {len(bu_by_code)}")
 
-        # ── Departments (linked to BU) ──
-        dept_by_name: dict[str, Department] = {}
+        # ── Departments (Department-type entities, linked to BU) ──
+        # Departments are auditable entities now — top-level nodes of the
+        # universe tree with ``entity_type="Department"``.
+        dept_by_name: dict[str, AuditableEntity] = {}
         for name, bu_code in DEPARTMENTS:
-            obj, _ = Department.objects.get_or_create(
+            obj, _ = AuditableEntity.all_objects.get_or_create(
                 name=name,
+                entity_type="Department",
                 defaults={
-                    "head": "",
                     "risk_rating": "Medium",
+                    "status": "Active",
                     "business_unit": bu_by_code.get(bu_code),
                 },
             )
-            # If the department pre-existed without a BU link, attach now.
             if obj.business_unit_id is None and bu_code in bu_by_code:
                 obj.business_unit = bu_by_code[bu_code]
                 obj.save(update_fields=["business_unit", "updated_at"])
@@ -136,7 +138,8 @@ class Command(BaseCommand):
                 name=name,
                 defaults={
                     "department": dept_name,
-                    "department_ref": dept,
+                    "department_entity": dept,
+                    "parent": dept,
                     "business_unit": dept.business_unit if dept else None,
                     "entity_type": entity_type,
                     "risk_rating": risk,

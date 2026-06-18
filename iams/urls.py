@@ -23,7 +23,6 @@ from iams.views import (
     DashboardRoleView,
     DashboardTrendsView,
     DashboardUpcomingAuditsView,
-    DepartmentViewSet,
     EvidenceByAuditView,
     EvidenceFileViewSet,
     FindingViewSet,
@@ -95,7 +94,6 @@ router.register("audits", AuditViewSet, basename="audit")
 router.register("findings", FindingViewSet, basename="finding")
 router.register("corrective-actions", CorrectiveActionViewSet, basename="corrective-action")
 router.register("entity-risks", EntityRiskViewSet, basename="entity-risk")
-router.register("departments", DepartmentViewSet, basename="department")
 router.register("activities", ActivityViewSet, basename="activity")
 router.register("checklist-items", ChecklistItemViewSet, basename="checklist-item")
 router.register("evidence-files", EvidenceFileViewSet, basename="evidence-file")

@@ -34,7 +34,6 @@ from iams.models import (
     ChecklistItem,
     Comment,
     CorrectiveAction,
-    Department,
     EvidenceFile,
     Finding,
     FollowUpItem,
@@ -219,25 +218,6 @@ def test_corrective_action_list_contract(sa_client):
 
 
 # ══════════════════════════════════════════════════════════════════════
-# Departments
-# ══════════════════════════════════════════════════════════════════════
-DEPARTMENT_FIELDS = {
-    "id", "name", "head", "riskRating", "lastAuditDate", "nextAuditDate", "entityCount",
-}
-
-
-def test_department_list_contract(sa_client):
-    Department.objects.create(
-        name="Finance", head="J. Doe", risk_rating="High",
-        last_audit_date=date(2025, 12, 1), next_audit_date=date(2026, 6, 1),
-        entity_count=12,
-    )
-    payload = get_payload(sa_client, "/api/departments/")
-    item = first_or_only(payload)
-    assert_has_fields(item, DEPARTMENT_FIELDS, context="GET /api/departments/")
-    assert item["riskRating"] == "High"
-    assert item["entityCount"] == 12
-
 
 # ══════════════════════════════════════════════════════════════════════
 # Execution: checklist items, evidence, timeline

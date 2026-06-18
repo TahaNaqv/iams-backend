@@ -9,19 +9,8 @@ from iams.models import (
     Audit,
     ChecklistItem,
     CorrectiveAction,
-    Department,
     Finding,
 )
-
-
-class DepartmentFactory(factory.django.DjangoModelFactory):
-    class Meta:
-        model = Department
-        django_get_or_create = ("name",)
-
-    name = factory.Sequence(lambda n: f"Department {n}")
-    risk_rating = "Medium"
-    entity_count = 5
 
 
 class AuditFactory(factory.django.DjangoModelFactory):

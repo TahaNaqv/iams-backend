@@ -11,7 +11,6 @@ from .audits import (
     AuditFactory,
     CheckListItemFactory,
     CorrectiveActionFactory,
-    DepartmentFactory,
     FindingFactory,
 )
 from .users import (
@@ -26,7 +25,6 @@ __all__ = [
     "AuditFactory",
     "CheckListItemFactory",
     "CorrectiveActionFactory",
-    "DepartmentFactory",
     "FindingFactory",
     "PermissionFactory",
     "RoleFactory",

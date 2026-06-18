@@ -22,7 +22,7 @@ import pytest
 from django.core.files.uploadedfile import SimpleUploadedFile
 from rest_framework import status
 
-from iams.models import AuditableEntity, BulkImportJob, Department
+from iams.models import AuditableEntity, BulkImportJob
 
 
 @pytest.fixture
@@ -31,8 +31,10 @@ def sa_client(super_admin, authed_client):
 
 
 @pytest.fixture
-def finance_dept(db) -> Department:
-    return Department.objects.create(name="Finance", head="J. Doe")
+def finance_dept(db) -> AuditableEntity:
+    return AuditableEntity.objects.create(
+        name="Finance", entity_type="Department", risk_rating="Medium", status="Active"
+    )
 
 
 def _csv_upload(rows: list[list[str]], name: str = "universe.csv") -> SimpleUploadedFile:
@@ -72,14 +74,14 @@ def test_csv_import_creates_entities_with_lookups(sa_client, finance_dept):
 
     ap = AuditableEntity.objects.get(name="Accounts Payable")
     assert ap.risk_rating == "High"
-    assert ap.department_ref_id == finance_dept.id
+    assert ap.department_entity_id == finance_dept.id
     assert ap.is_mandatory_to_audit is True
     assert sorted(ap.tags) == ["critical", "sox"]
 
 
 @pytest.mark.django_db
 def test_csv_import_updates_existing_by_name(sa_client, finance_dept):
-    AuditableEntity.objects.create(name="Treasury", department_ref=finance_dept, risk_rating="Medium")
+    AuditableEntity.objects.create(name="Treasury", department_entity=finance_dept, risk_rating="Medium")
     csv_file = _csv_upload([
         ["Name", "Department", "Risk Rating"],
         ["Treasury", "Finance", "Critical"],
@@ -179,8 +181,8 @@ def test_bulk_import_job_endpoint_is_scoped_to_owner(
 # ══════════════════════════════════════════════════════════════════════
 @pytest.mark.django_db
 def test_csv_export_streams_filtered_queryset(sa_client, finance_dept):
-    AuditableEntity.objects.create(name="Alpha", department_ref=finance_dept, risk_rating="High")
-    AuditableEntity.objects.create(name="Bravo", department_ref=finance_dept, risk_rating="Low")
+    AuditableEntity.objects.create(name="Alpha", department_entity=finance_dept, risk_rating="High")
+    AuditableEntity.objects.create(name="Bravo", department_entity=finance_dept, risk_rating="Low")
     resp = sa_client.get("/api/auditable-entities/export/?riskRating=High")
     assert resp.status_code == status.HTTP_200_OK
     assert resp["Content-Type"] == "text/csv"
@@ -195,7 +197,7 @@ def test_csv_export_streams_filtered_queryset(sa_client, finance_dept):
 
 @pytest.mark.django_db
 def test_xlsx_export_returns_binary(sa_client, finance_dept):
-    AuditableEntity.objects.create(name="Charlie", department_ref=finance_dept)
+    AuditableEntity.objects.create(name="Charlie", department_entity=finance_dept)
     resp = sa_client.get("/api/auditable-entities/export/?as=xlsx")
     assert resp.status_code == status.HTTP_200_OK
     assert "spreadsheetml.sheet" in resp["Content-Type"]

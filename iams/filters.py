@@ -23,7 +23,7 @@ import django_filters
 from django.db import connection
 from django.db.models import Q
 
-from iams.models import AuditableEntity, BusinessUnit, Department, Tag
+from iams.models import AuditableEntity, BusinessUnit, Tag
 
 
 def _tag_match_q(tag: str) -> Q:
@@ -56,7 +56,7 @@ class AuditableEntityFilter(django_filters.FilterSet):
     auditFrequency = CSVCharFilter(field_name="audit_frequency", lookup_expr="in")
 
     businessUnit = CSVUUIDFilter(field_name="business_unit_id", lookup_expr="in")
-    department = CSVUUIDFilter(field_name="department_ref_id", lookup_expr="in")
+    department = CSVUUIDFilter(field_name="department_entity_id", lookup_expr="in")
     parent = django_filters.UUIDFilter(field_name="parent_id")
     primaryOwner = django_filters.UUIDFilter(field_name="primary_owner_id")
     secondaryOwner = django_filters.UUIDFilter(field_name="secondary_owner_id")
@@ -151,7 +151,13 @@ class AuditableEntityFilter(django_filters.FilterSet):
     def filter_without_department(self, queryset, name, value):
         if not value:
             return queryset
-        return queryset.filter(department_ref__isnull=True)
+        # An entity is "without a department" when it has neither an explicit
+        # owning department entity nor a Department-type ancestor. The latter
+        # is approximated by the denormalized link; entities re-parented under
+        # a department node carry ``department_entity`` after migration 0032.
+        return queryset.filter(department_entity__isnull=True).exclude(
+            entity_type="Department"
+        )
 
     def filter_without_next_audit(self, queryset, name, value):
         if not value:
@@ -191,24 +197,9 @@ class AuditableEntityFilter(django_filters.FilterSet):
             | Q(description__icontains=value)
             | Q(cost_center_id__icontains=value)
             | Q(department__icontains=value)
-            | Q(department_ref__name__icontains=value)
+            | Q(department_entity__name__icontains=value)
             | Q(business_unit__name__icontains=value)
         ).distinct()
-
-
-class DepartmentFilter(django_filters.FilterSet):
-    riskRating = CSVCharFilter(field_name="risk_rating", lookup_expr="in")
-    businessUnit = CSVUUIDFilter(field_name="business_unit_id", lookup_expr="in")
-    q = django_filters.CharFilter(method="filter_q")
-
-    class Meta:
-        model = Department
-        fields: list[str] = []
-
-    def filter_q(self, queryset, name, value):
-        if not value:
-            return queryset
-        return queryset.filter(Q(name__icontains=value) | Q(head__icontains=value))
 
 
 class BusinessUnitFilter(django_filters.FilterSet):

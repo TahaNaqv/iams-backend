@@ -20,7 +20,7 @@ from django.test.utils import CaptureQueriesContext
 from django.db import connection
 from rest_framework import status
 
-from iams.models import AuditableEntity, Department
+from iams.models import AuditableEntity
 
 
 @pytest.fixture
@@ -32,14 +32,16 @@ def sa_client(super_admin, authed_client):
 def universe(db, super_admin):
     """Seed a multi-department universe with hierarchical structure."""
     departments = [
-        Department.objects.create(name=f"Dept-{i}", head=f"H-{i}")
+        AuditableEntity.objects.create(
+            name=f"Dept-{i}", entity_type="Department", status="Active"
+        )
         for i in range(5)
     ]
     parents = []
     for i in range(10):
         parent = AuditableEntity.objects.create(
             name=f"P-{i}",
-            department_ref=departments[i % len(departments)],
+            department_entity=departments[i % len(departments)],
             primary_owner=super_admin,
             risk_rating="High" if i % 2 == 0 else "Medium",
             inherent_likelihood=(i % 5) + 1,
@@ -50,7 +52,7 @@ def universe(db, super_admin):
         for j in range(3):
             AuditableEntity.objects.create(
                 name=f"P-{i}-C-{j}",
-                department_ref=departments[j % len(departments)],
+                department_entity=departments[j % len(departments)],
                 primary_owner=super_admin,
                 parent=parent,
                 risk_rating="Low",
@@ -123,14 +125,16 @@ def test_list_endpoint_completes_within_one_second(sa_client, super_admin):
     bound mainly catches accidental quadratic behaviour or sync I/O
     introduced by a regression.
     """
-    dept = Department.objects.create(name="Bulk")
+    dept = AuditableEntity.objects.create(
+        name="Bulk", entity_type="Department", status="Active"
+    )
     # 500 rows is enough to surface a real N+1 (~1k queries) but small
     # enough that seeding stays cheap.
     AuditableEntity.objects.bulk_create(
         [
             AuditableEntity(
                 name=f"E-{i}",
-                department_ref=dept,
+                department_entity=dept,
                 primary_owner=super_admin,
                 risk_rating="Medium",
             )

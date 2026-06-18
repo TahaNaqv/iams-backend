@@ -19,7 +19,6 @@ from iams.models import (
     ChecklistItem,
     Comment,
     CorrectiveAction,
-    Department,
     EntityRisk,
     EntityStatusChoices,
     EvidenceFile,
@@ -90,7 +89,10 @@ class BusinessUnitSerializer(serializers.ModelSerializer):
         ]
 
     def get_departmentCount(self, obj):
-        return obj.departments.count() if obj.pk else 0
+        # Departments are Department-type auditable entities now.
+        if not obj.pk:
+            return 0
+        return obj.auditable_entities.filter(entity_type="Department").count()
 
     def get_childCount(self, obj):
         return obj.children.count() if obj.pk else 0
@@ -124,34 +126,6 @@ class TagSerializer(serializers.ModelSerializer):
         validated_data.setdefault("slug", slugify(validated_data["name"]))
         return super().create(validated_data)
 
-
-class DepartmentSerializer(serializers.ModelSerializer):
-    riskRating = serializers.CharField(source="risk_rating", required=False)
-    lastAuditDate = serializers.DateField(source="last_audit_date", allow_null=True, required=False)
-    nextAuditDate = serializers.DateField(source="next_audit_date", allow_null=True, required=False)
-    entityCount = serializers.IntegerField(source="entity_count", read_only=True)
-    businessUnit = BusinessUnitSummarySerializer(source="business_unit", read_only=True)
-    businessUnitId = serializers.PrimaryKeyRelatedField(
-        source="business_unit",
-        queryset=BusinessUnit.objects.all(),
-        required=False,
-        allow_null=True,
-        write_only=True,
-    )
-
-    class Meta:
-        model = Department
-        fields = [
-            "id",
-            "name",
-            "head",
-            "riskRating",
-            "lastAuditDate",
-            "nextAuditDate",
-            "entityCount",
-            "businessUnit",
-            "businessUnitId",
-        ]
 
 
 class AuditSerializer(serializers.ModelSerializer):
@@ -469,8 +443,8 @@ class AuditableEntitySerializer(serializers.ModelSerializer):
         help_text="Deprecated. Use departmentId / departmentRef.",
     )
     departmentId = serializers.PrimaryKeyRelatedField(
-        source="department_ref",
-        queryset=Department.objects.all(),
+        source="department_entity",
+        queryset=AuditableEntity.objects.filter(entity_type="Department"),
         required=False,
         allow_null=True,
     )
@@ -591,10 +565,17 @@ class AuditableEntitySerializer(serializers.ModelSerializer):
 
     # ── Computed read fields ──
     def get_departmentRef(self, obj):
-        ref = obj.department_ref
-        if ref is None:
+        # Prefer the explicit owning-department entity; otherwise derive it
+        # from the tree (nearest ``Department``-type ancestor).
+        entity = obj.department_entity
+        if entity is not None:
+            return {"id": str(entity.id), "name": entity.name}
+        if not obj.pk:
             return None
-        return {"id": str(ref.id), "name": ref.name}
+        dept = obj.get_department()
+        if dept is None:
+            return None
+        return {"id": str(dept.id), "name": dept.name}
 
     def get_parent(self, obj):
         if obj.parent_id is None:
@@ -611,9 +592,12 @@ class AuditableEntitySerializer(serializers.ModelSerializer):
             return 0
         # Imported lazily to avoid circular imports
         from iams.models import Audit
-        return Audit.objects.filter(
-            department=obj.department or obj.department_ref.name if obj.department_ref else obj.department,
-        ).exclude(status="Completed").count()
+        dept_name = obj.department or (
+            obj.department_entity.name if obj.department_entity_id else ""
+        )
+        if not dept_name:
+            return 0
+        return Audit.objects.filter(department=dept_name).exclude(status="Completed").count()
 
     def get_currentRiskScore(self, obj):
         if not obj.pk:
@@ -743,18 +727,19 @@ class AuditableEntitySerializer(serializers.ModelSerializer):
         return attrs
 
     def create(self, validated_data):
-        # If FK is provided but legacy free-text isn't, populate it from the FK
-        # for backward compatibility with consumers reading the old shape.
-        dept_ref = validated_data.get("department_ref")
-        if dept_ref and not validated_data.get("department"):
-            validated_data["department"] = dept_ref.name
+        # If the owning department entity is provided but the legacy free-text
+        # isn't, denormalize the name so consumers reading the old shape (and
+        # dashboards keyed on the free-text column) keep working.
+        dept = validated_data.get("department_entity")
+        if dept and not validated_data.get("department"):
+            validated_data["department"] = dept.name
         instance = super().create(validated_data)
         return instance
 
     def update(self, instance, validated_data):
-        dept_ref = validated_data.get("department_ref", instance.department_ref)
-        if dept_ref and not validated_data.get("department") and not instance.department:
-            validated_data["department"] = dept_ref.name
+        dept = validated_data.get("department_entity", instance.department_entity)
+        if dept and not validated_data.get("department") and not instance.department:
+            validated_data["department"] = dept.name
         # Bump version on every successful write
         validated_data["version"] = (instance.version or 0) + 1
         return super().update(instance, validated_data)
@@ -771,7 +756,7 @@ class AuditableEntityListSerializer(serializers.ModelSerializer):
     nextAuditDate = serializers.DateField(source="next_audit_date", allow_null=True)
     isMandatoryToAudit = serializers.BooleanField(source="is_mandatory_to_audit")
     parentId = serializers.UUIDField(source="parent_id", allow_null=True)
-    departmentId = serializers.UUIDField(source="department_ref_id", allow_null=True)
+    departmentId = serializers.UUIDField(source="department_entity_id", allow_null=True)
     businessUnitId = serializers.UUIDField(source="business_unit_id", allow_null=True)
     primaryOwnerId = serializers.UUIDField(source="primary_owner_id", allow_null=True)
     estimatedManDays = serializers.DecimalField(

@@ -98,6 +98,7 @@ def _row_to_payload(row: dict, *, lookups: dict) -> tuple[dict, str | None]:
             dept = lookups["departments_by_name"].get(str(value).strip().lower())
             if dept:
                 payload["departmentId"] = str(dept.id)
+                payload.setdefault("department", dept.name)
         elif key == "businessUnitName":
             bu = lookups["bus_by_name"].get(str(value).strip().lower())
             if bu:
@@ -189,7 +190,6 @@ def process_bulk_import(job_id: str) -> dict:
         AuditableEntity,
         BulkImportJob,
         BusinessUnit,
-        Department,
     )
     from django.contrib.auth import get_user_model
 
@@ -206,7 +206,13 @@ def process_bulk_import(job_id: str) -> dict:
         return {"processed": 0, "reason": "already_processed"}
 
     lookups = {
-        "departments_by_name": {d.name.lower(): d for d in Department.objects.all()},
+        # Departments are now Department-type auditable entities. Resolving by
+        # name lets a row reference its owning department; unknown names are
+        # left unset (lenient) exactly as before.
+        "departments_by_name": {
+            e.name.lower(): e
+            for e in AuditableEntity.objects.filter(entity_type="Department")
+        },
         "bus_by_name": {b.name.lower(): b for b in BusinessUnit.objects.all()},
         "users_by_email": {u.email.lower(): u for u in User.objects.all() if u.email},
     }

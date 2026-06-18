@@ -10,7 +10,6 @@ from iams.models import (
     ChecklistItem,
     Comment,
     CorrectiveAction,
-    Department,
     EvidenceFile,
     Finding,
     FollowUpItem,
@@ -32,7 +31,6 @@ from iams.models import (
 admin.site.register(Permission)
 admin.site.register(Role)
 admin.site.register(UserProfile)
-admin.site.register(Department)
 admin.site.register(Audit)
 admin.site.register(Finding)
 admin.site.register(CorrectiveAction)

@@ -28,7 +28,6 @@ from iams.models import (
     AuditableEntity,
     AuditableEntityRevision,
     BusinessUnit,
-    Department,
     EntityStatusChoices,
     RiskRatingChoices,
     Tag,
@@ -54,13 +53,17 @@ def manager_client(audit_manager, authed_client):
 
 
 @pytest.fixture
-def finance_dept(db) -> Department:
-    return Department.objects.create(name="Finance", head="J. Doe", risk_rating="High")
+def finance_dept(db) -> AuditableEntity:
+    return AuditableEntity.objects.create(
+        name="Finance", entity_type="Department", risk_rating="High", status="Active"
+    )
 
 
 @pytest.fixture
-def it_dept(db) -> Department:
-    return Department.objects.create(name="IT", head="K. Lin", risk_rating="Medium")
+def it_dept(db) -> AuditableEntity:
+    return AuditableEntity.objects.create(
+        name="IT", entity_type="Department", risk_rating="Medium", status="Active"
+    )
 
 
 @pytest.fixture
@@ -73,7 +76,7 @@ def entity_ap(db, finance_dept, finance_bu) -> AuditableEntity:
     return AuditableEntity.objects.create(
         name="Accounts Payable",
         department=finance_dept.name,
-        department_ref=finance_dept,
+        department_entity=finance_dept,
         business_unit=finance_bu,
         owner="J. Doe",
         risk_rating="High",
@@ -286,9 +289,9 @@ def test_self_parent_rejected(sa_client, entity_ap):
 
 @pytest.mark.django_db
 def test_cycle_detection_in_parent_chain(sa_client, finance_dept):
-    a = AuditableEntity.objects.create(name="A", department_ref=finance_dept)
-    b = AuditableEntity.objects.create(name="B", department_ref=finance_dept, parent=a)
-    c = AuditableEntity.objects.create(name="C", department_ref=finance_dept, parent=b)
+    a = AuditableEntity.objects.create(name="A", department_entity=finance_dept)
+    b = AuditableEntity.objects.create(name="B", department_entity=finance_dept, parent=a)
+    c = AuditableEntity.objects.create(name="C", department_entity=finance_dept, parent=b)
     # Try to make A a child of C → A->...->C->A would cycle.
     resp = sa_client.patch(
         f"/api/auditable-entities/{a.id}/",
@@ -300,9 +303,9 @@ def test_cycle_detection_in_parent_chain(sa_client, finance_dept):
 
 @pytest.mark.django_db
 def test_tree_endpoint_returns_nested_children(sa_client, finance_dept):
-    parent = AuditableEntity.objects.create(name="Financial Operations", department_ref=finance_dept)
-    AuditableEntity.objects.create(name="AP Oversight", department_ref=finance_dept, parent=parent)
-    AuditableEntity.objects.create(name="Treasury Hedging", department_ref=finance_dept, parent=parent)
+    parent = AuditableEntity.objects.create(name="Financial Operations", department_entity=finance_dept)
+    AuditableEntity.objects.create(name="AP Oversight", department_entity=finance_dept, parent=parent)
+    AuditableEntity.objects.create(name="Treasury Hedging", department_entity=finance_dept, parent=parent)
     resp = sa_client.get("/api/auditable-entities/tree/")
     assert resp.status_code == status.HTTP_200_OK
     body = resp.json()
@@ -313,9 +316,9 @@ def test_tree_endpoint_returns_nested_children(sa_client, finance_dept):
 
 @pytest.mark.django_db
 def test_lineage_returns_ancestor_chain(sa_client, finance_dept):
-    a = AuditableEntity.objects.create(name="A", department_ref=finance_dept)
-    b = AuditableEntity.objects.create(name="B", department_ref=finance_dept, parent=a)
-    c = AuditableEntity.objects.create(name="C", department_ref=finance_dept, parent=b)
+    a = AuditableEntity.objects.create(name="A", department_entity=finance_dept)
+    b = AuditableEntity.objects.create(name="B", department_entity=finance_dept, parent=a)
+    c = AuditableEntity.objects.create(name="C", department_entity=finance_dept, parent=b)
     resp = sa_client.get(f"/api/auditable-entities/{c.id}/lineage/")
     assert resp.status_code == status.HTTP_200_OK
     names = [n["name"] for n in resp.json()]
@@ -374,9 +377,9 @@ def test_restore_action_reactivates(sa_client, entity_ap):
 # ══════════════════════════════════════════════════════════════════════
 @pytest.mark.django_db
 def test_filter_by_risk_rating_multi_value(sa_client, finance_dept):
-    AuditableEntity.objects.create(name="Low one", department_ref=finance_dept, risk_rating="Low")
-    AuditableEntity.objects.create(name="High one", department_ref=finance_dept, risk_rating="High")
-    AuditableEntity.objects.create(name="Med one", department_ref=finance_dept, risk_rating="Medium")
+    AuditableEntity.objects.create(name="Low one", department_entity=finance_dept, risk_rating="Low")
+    AuditableEntity.objects.create(name="High one", department_entity=finance_dept, risk_rating="High")
+    AuditableEntity.objects.create(name="Med one", department_entity=finance_dept, risk_rating="Medium")
     resp = sa_client.get("/api/auditable-entities/?riskRating=High,Low")
     names = {r["name"] for r in resp.json()["results"]}
     assert "Low one" in names and "High one" in names
@@ -386,7 +389,7 @@ def test_filter_by_risk_rating_multi_value(sa_client, finance_dept):
 @pytest.mark.django_db
 def test_search_q_matches_name_or_costcenter(sa_client, finance_dept):
     AuditableEntity.objects.create(
-        name="Procurement", department_ref=finance_dept, cost_center_id="PRC-9001"
+        name="Procurement", department_entity=finance_dept, cost_center_id="PRC-9001"
     )
     resp = sa_client.get("/api/auditable-entities/?q=PRC-9001")
     assert any(r["name"] == "Procurement" for r in resp.json()["results"])
@@ -394,9 +397,9 @@ def test_search_q_matches_name_or_costcenter(sa_client, finance_dept):
 
 @pytest.mark.django_db
 def test_tags_any_filter(sa_client, finance_dept):
-    AuditableEntity.objects.create(name="A", department_ref=finance_dept, tags=["sox"])
-    AuditableEntity.objects.create(name="B", department_ref=finance_dept, tags=["gdpr"])
-    AuditableEntity.objects.create(name="C", department_ref=finance_dept, tags=["other"])
+    AuditableEntity.objects.create(name="A", department_entity=finance_dept, tags=["sox"])
+    AuditableEntity.objects.create(name="B", department_entity=finance_dept, tags=["gdpr"])
+    AuditableEntity.objects.create(name="C", department_entity=finance_dept, tags=["other"])
     resp = sa_client.get("/api/auditable-entities/?tagsAny=sox,gdpr")
     names = {r["name"] for r in resp.json()["results"]}
     assert names == {"A", "B"}
@@ -405,9 +408,9 @@ def test_tags_any_filter(sa_client, finance_dept):
 @pytest.mark.django_db
 def test_mine_filter_scopes_to_request_user(sa_client, super_admin, finance_dept):
     AuditableEntity.objects.create(
-        name="Mine", department_ref=finance_dept, primary_owner=super_admin
+        name="Mine", department_entity=finance_dept, primary_owner=super_admin
     )
-    AuditableEntity.objects.create(name="Not mine", department_ref=finance_dept)
+    AuditableEntity.objects.create(name="Not mine", department_entity=finance_dept)
     resp = sa_client.get("/api/auditable-entities/?mine=true")
     names = {r["name"] for r in resp.json()["results"]}
     assert names == {"Mine"}
@@ -416,12 +419,12 @@ def test_mine_filter_scopes_to_request_user(sa_client, super_admin, finance_dept
 @pytest.mark.django_db
 def test_overdue_and_never_audited_filters(sa_client, finance_dept):
     AuditableEntity.objects.create(
-        name="Overdue", department_ref=finance_dept,
+        name="Overdue", department_entity=finance_dept,
         next_audit_date=date.today() - timedelta(days=10),
     )
-    AuditableEntity.objects.create(name="Never", department_ref=finance_dept)
+    AuditableEntity.objects.create(name="Never", department_entity=finance_dept)
     AuditableEntity.objects.create(
-        name="Recent", department_ref=finance_dept,
+        name="Recent", department_entity=finance_dept,
         last_audit_date=date.today() - timedelta(days=30),
     )
     overdue = sa_client.get("/api/auditable-entities/?overdue=true").json()["results"]
@@ -435,8 +438,8 @@ def test_overdue_and_never_audited_filters(sa_client, finance_dept):
 # ══════════════════════════════════════════════════════════════════════
 @pytest.mark.django_db
 def test_kpis_endpoint_returns_strip(sa_client, finance_dept):
-    AuditableEntity.objects.create(name="A", department_ref=finance_dept, risk_rating="Critical")
-    AuditableEntity.objects.create(name="B", department_ref=finance_dept, risk_rating="High")
+    AuditableEntity.objects.create(name="A", department_entity=finance_dept, risk_rating="Critical")
+    AuditableEntity.objects.create(name="B", department_entity=finance_dept, risk_rating="High")
     resp = sa_client.get("/api/auditable-entities/kpis/")
     assert resp.status_code == status.HTTP_200_OK
     body = resp.json()
@@ -446,7 +449,7 @@ def test_kpis_endpoint_returns_strip(sa_client, finance_dept):
 
 @pytest.mark.django_db
 def test_coverage_endpoint(sa_client, finance_dept):
-    AuditableEntity.objects.create(name="No owner", department_ref=finance_dept)
+    AuditableEntity.objects.create(name="No owner", department_entity=finance_dept)
     resp = sa_client.get("/api/auditable-entities/coverage/")
     assert resp.status_code == status.HTTP_200_OK
     body = resp.json()
@@ -586,14 +589,17 @@ def test_tag_create_auto_slug(sa_client):
 
 
 @pytest.mark.django_db
-def test_department_now_writable(sa_client, finance_bu):
+def test_department_is_a_department_type_entity(sa_client, finance_bu):
+    # Departments are auditable entities now — created via the unified
+    # endpoint with entityType="Department", not a separate /departments/ API.
     resp = sa_client.post(
-        "/api/departments/",
-        {"name": "Logistics", "head": "M. Patel", "riskRating": "Medium",
+        "/api/auditable-entities/",
+        {"name": "Logistics", "entityType": "Department", "riskRating": "Medium",
          "businessUnitId": str(finance_bu.id)},
         format="json",
     )
-    assert resp.status_code == status.HTTP_201_CREATED
+    assert resp.status_code == status.HTTP_201_CREATED, resp.content
+    assert resp.json()["entityType"] == "Department"
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -621,36 +627,38 @@ def test_recompute_action_with_no_active_model(sa_client):
 # ══════════════════════════════════════════════════════════════════════
 @pytest.mark.django_db
 def test_without_owner_filter(sa_client, super_admin, finance_dept):
-    AuditableEntity.objects.create(name="No owner", department_ref=finance_dept)
+    AuditableEntity.objects.create(name="No owner", department_entity=finance_dept)
     AuditableEntity.objects.create(
-        name="Has owner", department_ref=finance_dept, primary_owner=super_admin,
+        name="Has owner", department_entity=finance_dept, primary_owner=super_admin,
     )
     resp = sa_client.get("/api/auditable-entities/?withoutOwner=true")
     names = {r["name"] for r in resp.json()["results"]}
-    assert names == {"No owner"}
+    # The Finance department is itself an entity now and has no owner, so it
+    # legitimately surfaces in the coverage gap alongside the test rows.
+    assert names == {"No owner", "Finance"}
 
 
 @pytest.mark.django_db
 def test_without_next_audit_filter(sa_client, finance_dept):
     from datetime import date as _date
-    AuditableEntity.objects.create(name="No plan", department_ref=finance_dept)
+    AuditableEntity.objects.create(name="No plan", department_entity=finance_dept)
     AuditableEntity.objects.create(
-        name="Planned", department_ref=finance_dept, next_audit_date=_date(2027, 1, 1),
+        name="Planned", department_entity=finance_dept, next_audit_date=_date(2027, 1, 1),
     )
     resp = sa_client.get("/api/auditable-entities/?withoutNextAudit=true")
     names = {r["name"] for r in resp.json()["results"]}
-    assert names == {"No plan"}
+    assert names == {"No plan", "Finance"}
 
 
 @pytest.mark.django_db
 def test_stale_over_years_filter(sa_client, finance_dept):
     from datetime import date as _date, timedelta as _td
     AuditableEntity.objects.create(
-        name="Stale", department_ref=finance_dept,
+        name="Stale", department_entity=finance_dept,
         last_audit_date=_date.today() - _td(days=365 * 4),
     )
     AuditableEntity.objects.create(
-        name="Recent", department_ref=finance_dept,
+        name="Recent", department_entity=finance_dept,
         last_audit_date=_date.today() - _td(days=30),
     )
     resp = sa_client.get("/api/auditable-entities/?staleOverYears=3")
@@ -661,11 +669,11 @@ def test_stale_over_years_filter(sa_client, finance_dept):
 @pytest.mark.django_db
 def test_mandatory_without_plan_filter(sa_client, finance_dept):
     AuditableEntity.objects.create(
-        name="Compulsory orphan", department_ref=finance_dept,
+        name="Compulsory orphan", department_entity=finance_dept,
         is_mandatory_to_audit=True,
     )
     AuditableEntity.objects.create(
-        name="Optional", department_ref=finance_dept,
+        name="Optional", department_entity=finance_dept,
         is_mandatory_to_audit=False,
     )
     resp = sa_client.get("/api/auditable-entities/?mandatoryWithoutPlan=true")
@@ -676,13 +684,13 @@ def test_mandatory_without_plan_filter(sa_client, finance_dept):
 @pytest.mark.django_db
 def test_without_risk_score_filter(sa_client, finance_dept):
     AuditableEntity.objects.create(
-        name="Scored", department_ref=finance_dept,
+        name="Scored", department_entity=finance_dept,
         inherent_likelihood=3, inherent_impact=4,
     )
-    AuditableEntity.objects.create(name="Unscored", department_ref=finance_dept)
+    AuditableEntity.objects.create(name="Unscored", department_entity=finance_dept)
     resp = sa_client.get("/api/auditable-entities/?withoutRiskScore=true")
     names = {r["name"] for r in resp.json()["results"]}
-    assert names == {"Unscored"}
+    assert names == {"Unscored", "Finance"}
 
 
 @pytest.mark.django_db
@@ -732,13 +740,13 @@ def test_create_bumps_prometheus_counter(sa_client, finance_dept):
 def test_coverage_endpoint_returns_full_breakdown(sa_client, super_admin, finance_dept):
     from datetime import date as _date, timedelta as _td
     AuditableEntity.objects.create(
-        name="Good", department_ref=finance_dept,
+        name="Good", department_entity=finance_dept,
         primary_owner=super_admin,
         last_audit_date=_date.today() - _td(days=30),
         next_audit_date=_date.today() + _td(days=180),
         inherent_likelihood=3, inherent_impact=4,
     )
-    AuditableEntity.objects.create(name="No owner", department_ref=finance_dept)
+    AuditableEntity.objects.create(name="No owner", department_entity=finance_dept)
     resp = sa_client.get("/api/auditable-entities/coverage/")
     assert resp.status_code == status.HTTP_200_OK
     body = resp.json()
@@ -764,7 +772,7 @@ def _add_risk(client, entity_id, **over):
 
 @pytest.mark.django_db
 def test_adding_risk_rolls_up_to_entity(sa_client, finance_dept):
-    e = AuditableEntity.objects.create(name="GL", department_ref=finance_dept)
+    e = AuditableEntity.objects.create(name="GL", department_entity=finance_dept)
     resp = _add_risk(sa_client, e.id, inherentLikelihood=2, inherentImpact=2)
     assert resp.status_code == status.HTTP_201_CREATED, resp.content
     e.refresh_from_db()
@@ -778,7 +786,7 @@ def test_adding_risk_rolls_up_to_entity(sa_client, finance_dept):
 
 @pytest.mark.django_db
 def test_rollup_uses_residual_not_inherent(sa_client, finance_dept):
-    e = AuditableEntity.objects.create(name="AR", department_ref=finance_dept)
+    e = AuditableEntity.objects.create(name="AR", department_entity=finance_dept)
     _add_risk(sa_client, e.id, inherentLikelihood=5, inherentImpact=5,
               residualLikelihood=2, residualImpact=2)
     e.refresh_from_db()
@@ -787,7 +795,7 @@ def test_rollup_uses_residual_not_inherent(sa_client, finance_dept):
 
 @pytest.mark.django_db
 def test_closed_risks_excluded_from_rollup(sa_client, finance_dept):
-    e = AuditableEntity.objects.create(name="Tax", department_ref=finance_dept)
+    e = AuditableEntity.objects.create(name="Tax", department_entity=finance_dept)
     _add_risk(sa_client, e.id, inherentLikelihood=2, inherentImpact=2)
     r2 = _add_risk(sa_client, e.id, inherentLikelihood=5, inherentImpact=5).json()
     e.refresh_from_db()
@@ -800,7 +808,7 @@ def test_closed_risks_excluded_from_rollup(sa_client, finance_dept):
 
 @pytest.mark.django_db
 def test_manual_override_survives_rollup(sa_client, finance_dept):
-    e = AuditableEntity.objects.create(name="Treasury", department_ref=finance_dept)
+    e = AuditableEntity.objects.create(name="Treasury", department_entity=finance_dept)
     # Pin the rating manually.
     resp = sa_client.patch(
         f"/api/auditable-entities/{e.id}/",
@@ -817,7 +825,7 @@ def test_manual_override_survives_rollup(sa_client, finance_dept):
 
 @pytest.mark.django_db
 def test_reset_risk_overrides_recomputes(sa_client, finance_dept):
-    e = AuditableEntity.objects.create(name="Payroll", department_ref=finance_dept)
+    e = AuditableEntity.objects.create(name="Payroll", department_entity=finance_dept)
     _add_risk(sa_client, e.id, inherentLikelihood=2, inherentImpact=2)
     e.refresh_from_db()
     resp = sa_client.patch(
@@ -837,7 +845,7 @@ def test_reset_risk_overrides_recomputes(sa_client, finance_dept):
 
 @pytest.mark.django_db
 def test_deleting_worst_risk_rerolls(sa_client, finance_dept):
-    e = AuditableEntity.objects.create(name="Vendor", department_ref=finance_dept)
+    e = AuditableEntity.objects.create(name="Vendor", department_entity=finance_dept)
     _add_risk(sa_client, e.id, inherentLikelihood=2, inherentImpact=2)
     worst = _add_risk(sa_client, e.id, inherentLikelihood=4, inherentImpact=5).json()
     e.refresh_from_db()
@@ -849,7 +857,7 @@ def test_deleting_worst_risk_rerolls(sa_client, finance_dept):
 
 @pytest.mark.django_db
 def test_entity_serializer_exposes_risk_rollup_fields(sa_client, finance_dept):
-    e = AuditableEntity.objects.create(name="Investments", department_ref=finance_dept)
+    e = AuditableEntity.objects.create(name="Investments", department_entity=finance_dept)
     _add_risk(sa_client, e.id, inherentLikelihood=4, inherentImpact=4)
     body = sa_client.get(f"/api/auditable-entities/{e.id}/?fields=full").json()
     assert body["riskCount"] == 1
@@ -860,14 +868,14 @@ def test_entity_serializer_exposes_risk_rollup_fields(sa_client, finance_dept):
 
 @pytest.mark.django_db
 def test_auditor_cannot_add_risk(auditor_client, finance_dept):
-    e = AuditableEntity.objects.create(name="ReadOnly", department_ref=finance_dept)
+    e = AuditableEntity.objects.create(name="ReadOnly", department_entity=finance_dept)
     resp = _add_risk(auditor_client, e.id, inherentLikelihood=3, inherentImpact=3)
     assert resp.status_code == status.HTTP_403_FORBIDDEN
 
 
 @pytest.mark.django_db
 def test_clearing_override_via_entity_patch_recomputes(sa_client, finance_dept):
-    e = AuditableEntity.objects.create(name="Override clear", department_ref=finance_dept)
+    e = AuditableEntity.objects.create(name="Override clear", department_entity=finance_dept)
     _add_risk(sa_client, e.id, inherentLikelihood=2, inherentImpact=2)  # auto → Low
     e.refresh_from_db()
     # Pin rating manually.
@@ -892,7 +900,7 @@ def test_clearing_override_via_entity_patch_recomputes(sa_client, finance_dept):
 
 @pytest.mark.django_db
 def test_entity_risk_residual_requires_both_or_neither(sa_client, finance_dept):
-    e = AuditableEntity.objects.create(name="Residual half", department_ref=finance_dept)
+    e = AuditableEntity.objects.create(name="Residual half", department_entity=finance_dept)
     resp = sa_client.post(
         "/api/entity-risks/",
         {
@@ -969,10 +977,10 @@ def test_custom_fields_reject_over_cap(sa_client, finance_dept):
 # ══════════════════════════════════════════════════════════════════════
 @pytest.mark.django_db
 def test_tree_nests_children_and_orders_by_name(sa_client, finance_dept):
-    parent = AuditableEntity.objects.create(name="Finance", department_ref=finance_dept, entity_type="Department")
+    parent = AuditableEntity.objects.create(name="Finance", department_entity=finance_dept, entity_type="Department")
     # Children created out of alphabetical order on purpose.
-    AuditableEntity.objects.create(name="Treasury", department_ref=finance_dept, parent=parent, entity_type="Division")
-    AuditableEntity.objects.create(name="Accounts Payable", department_ref=finance_dept, parent=parent, entity_type="Process")
+    AuditableEntity.objects.create(name="Treasury", department_entity=finance_dept, parent=parent, entity_type="Division")
+    AuditableEntity.objects.create(name="Accounts Payable", department_entity=finance_dept, parent=parent, entity_type="Process")
 
     resp = sa_client.get(f"/api/auditable-entities/tree/?root={parent.id}")
     assert resp.status_code == status.HTTP_200_OK, resp.content

@@ -752,6 +752,7 @@ class AuditableEntityListSerializer(serializers.ModelSerializer):
     entityType = serializers.CharField(source="entity_type")
     complianceStatus = serializers.CharField(source="compliance_status")
     auditFrequency = serializers.CharField(source="audit_frequency")
+    lastAuditRating = serializers.CharField(source="last_audit_rating", allow_blank=True)
     lastAuditDate = serializers.DateField(source="last_audit_date", allow_null=True)
     nextAuditDate = serializers.DateField(source="next_audit_date", allow_null=True)
     isMandatoryToAudit = serializers.BooleanField(source="is_mandatory_to_audit")
@@ -787,6 +788,7 @@ class AuditableEntityListSerializer(serializers.ModelSerializer):
             "riskRating",
             "complianceStatus",
             "auditFrequency",
+            "lastAuditRating",
             "lastAuditDate",
             "nextAuditDate",
             "isMandatoryToAudit",

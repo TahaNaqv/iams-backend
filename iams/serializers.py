@@ -4,7 +4,15 @@ from django.utils.encoding import force_str
 from django.utils.http import urlsafe_base64_decode
 from rest_framework import serializers
 
-from iams.models import KeycloakGroupRoleMap, Permission, Role, UserProfile
+from iams.models import (
+    AccessLevelChoices,
+    KeycloakGroupRoleMap,
+    Module,
+    Permission,
+    Role,
+    RoleModuleAccess,
+    UserProfile,
+)
 
 User = get_user_model()
 
@@ -16,18 +24,43 @@ class PermissionSerializer(serializers.ModelSerializer):
         read_only_fields = fields
 
 
+class ModuleSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Module
+        fields = ["id", "key", "name", "order"]
+        read_only_fields = fields
+
+
+class RoleModuleAccessUpdateSerializer(serializers.Serializer):
+    """One cell in a bulk matrix update."""
+
+    module = serializers.CharField()
+    level = serializers.ChoiceField(choices=AccessLevelChoices.choices)
+    scoped = serializers.BooleanField(required=False, default=False)
+
+
+class RoleAccessBulkUpdateSerializer(serializers.Serializer):
+    access = RoleModuleAccessUpdateSerializer(many=True)
+
+
 class RoleSerializer(serializers.ModelSerializer):
     permissions = PermissionSerializer(many=True, read_only=True)
     permission_keys = serializers.SerializerMethodField()
+    module_access = serializers.SerializerMethodField()
 
     class Meta:
         model = Role
-        fields = ["id", "name", "description", "is_super_admin", "permissions", "permission_keys"]
+        fields = [
+            "id", "name", "description", "is_super_admin", "requires_issuance_gate",
+            "permissions", "permission_keys", "module_access",
+        ]
 
     def get_permission_keys(self, obj):
-        if obj.is_super_admin:
-            return list(Permission.objects.values_list("key", flat=True))
-        return list(obj.permissions.values_list("key", flat=True))
+        # Derived from the matrix (single source of truth), not the legacy M2M.
+        return obj.derived_permission_keys()
+
+    def get_module_access(self, obj):
+        return obj.full_access_map()
 
 
 class RoleWriteSerializer(serializers.ModelSerializer):
@@ -203,11 +236,10 @@ class MeSerializer(serializers.ModelSerializer):
             "name": role.name,
             "description": role.description,
             "is_super_admin": role.is_super_admin,
-            "permissions": list(
-                Permission.objects.values_list("key", flat=True)
-                if role.is_super_admin
-                else role.permissions.values_list("key", flat=True)
-            ),
+            # Legacy flat keys, now DERIVED from the matrix for back-compat.
+            "permissions": role.derived_permission_keys(),
+            # Structured matrix: {module_key: {"level", "scoped"}}.
+            "access": role.full_access_map(),
         }
 
 

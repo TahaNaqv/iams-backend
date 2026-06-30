@@ -4,6 +4,7 @@ from rest_framework import status
 from rest_framework.test import APITestCase
 
 from iams.models import Permission, Role, UserProfile
+from iams.tests._rbac import seed_role_matrix
 
 User = get_user_model()
 
@@ -25,6 +26,8 @@ class DomainApiTests(APITestCase):
         }
         role = Role.objects.create(name="Audit Manager")
         role.permissions.set(self.permissions.values())
+        # Matrix is now the source of truth; seed cells from the legacy keys.
+        seed_role_matrix(role, self.permissions.keys())
         self.user = User.objects.create_user(username="tester", email="tester@example.com", password="Password123!")
         UserProfile.objects.create(user=self.user, role=role, department="Internal Audit", status="Active")
         token_res = self.client.post("/api/auth/token/", {"username": "tester", "password": "Password123!"}, format="json")

@@ -15,6 +15,7 @@ from iams.views import (
     ChecklistItemViewSet,
     CommentViewSet,
     CorrectiveActionViewSet,
+    ManagementResponseViewSet,
     EntityRiskViewSet,
     DashboardActivityView,
     DashboardKPIView,
@@ -42,6 +43,7 @@ from iams.views import (
     IntegrationSourceViewSet,
     IntegrationWebhookView,
     KeycloakGroupRoleMapViewSet,
+    ModuleViewSet,
     RolePermissionsView,
     RoleViewSet,
     ApprovalChainTemplateViewSet,
@@ -83,6 +85,7 @@ from iams.views import (
 router = DefaultRouter()
 router.register("users", UserViewSet, basename="user")
 router.register("roles", RoleViewSet, basename="role")
+router.register("modules", ModuleViewSet, basename="module")
 router.register(
     "sso/group-role-maps", KeycloakGroupRoleMapViewSet, basename="sso-group-role-map",
 )
@@ -93,6 +96,7 @@ router.register("permissions", PermissionViewSet, basename="permission")
 router.register("audits", AuditViewSet, basename="audit")
 router.register("findings", FindingViewSet, basename="finding")
 router.register("corrective-actions", CorrectiveActionViewSet, basename="corrective-action")
+router.register("management-responses", ManagementResponseViewSet, basename="management-response")
 router.register("entity-risks", EntityRiskViewSet, basename="entity-risk")
 router.register("activities", ActivityViewSet, basename="activity")
 router.register("checklist-items", ChecklistItemViewSet, basename="checklist-item")

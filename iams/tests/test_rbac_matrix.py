@@ -58,7 +58,9 @@ ENDPOINTS: list[tuple[str, str | None]] = [
     ("/api/risk-assessment-sheets/", "view_audits"),
     ("/api/risk-assessment-matrix/", "view_audits"),
     ("/api/risk-assessment-summary/", "view_audits"),
-    ("/api/risk-assessment-import/issues/", "manage_settings"),
+    # Phase 8: now gated to the risk_assessment module at read level (was
+    # manage_settings) so audit staff can review their import issues.
+    ("/api/risk-assessment-import/issues/", "view_audits"),
     # — Work programs & reports —
     ("/api/work-programs/", "view_audits"),
     ("/api/work-procedures/", "view_audits"),

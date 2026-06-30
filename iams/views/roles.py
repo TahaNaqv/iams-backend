@@ -1,22 +1,33 @@
 from rest_framework import viewsets, status
+from rest_framework.decorators import action
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from django.shortcuts import get_object_or_404
 
 from iams.audit import AuditedViewSetMixin
-from iams.models import KeycloakGroupRoleMap, Role
+from iams.models import KeycloakGroupRoleMap, Module, Role, RoleModuleAccess
 from iams.serializers import (
     KeycloakGroupRoleMapSerializer,
+    ModuleSerializer,
+    RoleAccessBulkUpdateSerializer,
     RoleSerializer,
     RoleWriteSerializer,
     RolePermissionsUpdateSerializer,
 )
-from iams.permissions import HasPermission
+from iams.permissions import HasPermission, ModuleAccess
+
+
+class ModuleViewSet(viewsets.ReadOnlyModelViewSet):
+    """Read-only registry of the 11 matrix modules (the matrix columns)."""
+
+    queryset = Module.objects.all()
+    serializer_class = ModuleSerializer
+    permission_classes = [ModuleAccess("users_roles", "read")]
 
 
 class RoleViewSet(viewsets.ModelViewSet):
-    queryset = Role.objects.prefetch_related("permissions").all()
+    queryset = Role.objects.prefetch_related("permissions", "module_access__module").all()
     permission_classes = [HasPermission("manage_roles")]
 
     def get_serializer_class(self):
@@ -36,6 +47,46 @@ class RoleViewSet(viewsets.ModelViewSet):
             )
         self.perform_destroy(instance)
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+    @action(
+        detail=True,
+        methods=["get", "put"],
+        url_path="access",
+        permission_classes=[ModuleAccess("users_roles", "full")],
+    )
+    def access(self, request, pk=None):
+        """GET → the role's 11-module access map. PUT → bulk-upsert cells.
+
+        Editing the matrix is an administration action (users_roles=full).
+        The Super Admin role is always Full and cannot be downgraded.
+        """
+        role = self.get_object()
+        if request.method == "GET":
+            return Response(role.full_access_map())
+
+        if role.is_super_admin:
+            return Response(
+                {"detail": "The Super Admin role is always Full and cannot be edited."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        serializer = RoleAccessBulkUpdateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        modules = {m.key: m for m in Module.objects.all()}
+        for cell in serializer.validated_data["access"]:
+            module = modules.get(cell["module"])
+            if module is None:
+                return Response(
+                    {"detail": f"Unknown module '{cell['module']}'."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            RoleModuleAccess.objects.update_or_create(
+                role=role,
+                module=module,
+                defaults={"level": cell["level"], "scoped": cell.get("scoped", False)},
+            )
+        role.refresh_from_db()
+        role.__dict__.pop("_access_map_cache", None)
+        return Response(role.full_access_map())
 
 
 class KeycloakGroupRoleMapViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):

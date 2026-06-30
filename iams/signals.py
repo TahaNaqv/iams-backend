@@ -13,12 +13,14 @@ import logging
 
 from django.db.models.signals import post_save, pre_save
 from django.dispatch import receiver
+from django.utils import timezone
 
 from iams.models import (
     ApprovalRequest,
     ApprovalStep,
     Audit,
     AuditAssignment,
+    AuditReport,
     CorrectiveAction,
     Finding,
     Notification,
@@ -236,6 +238,46 @@ def approval_request_apply_chain(sender, instance: ApprovalRequest, created: boo
 # ──────────────────────────────────────────────────────────────────────
 # Domain-specific side effects on approval completion
 # ──────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────
+# Finding formal issuance — set Finding.is_issued when a covering
+# AuditReport reaches "Final". This is the anchor for the Auditee /
+# client manager scoping rule (scoped users see only *issued* findings).
+# ──────────────────────────────────────────────────────────────────────
+def issue_findings_for_audit(audit_id) -> None:
+    """Mark all not-yet-issued findings of an audit as formally issued."""
+    if not audit_id:
+        return
+    try:
+        Finding.objects.filter(audit_id=audit_id, is_issued=False).update(
+            is_issued=True, issued_at=timezone.now()
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("issuance: failed to issue findings for audit %s", audit_id)
+
+
+@receiver(pre_save, sender=AuditReport, dispatch_uid="iams_report_issuance_capture")
+def _capture_prior_report_status(sender, instance: AuditReport, **kwargs):
+    if instance.pk:
+        try:
+            instance._prior_status = (
+                AuditReport.objects.only("status").get(pk=instance.pk).status
+            )
+        except AuditReport.DoesNotExist:
+            instance._prior_status = None
+    else:
+        instance._prior_status = None
+
+
+@receiver(post_save, sender=AuditReport, dispatch_uid="iams_report_issuance_emit")
+def _report_final_issues_findings(sender, instance: AuditReport, created: bool, **kwargs):
+    """When a report transitions to Final (via the API/admin save path),
+    issue the audit's findings. The approval-workflow path uses .update()
+    which bypasses signals, so it issues findings explicitly (below)."""
+    prior = getattr(instance, "_prior_status", None)
+    if instance.status == "Final" and prior != "Final":
+        issue_findings_for_audit(instance.audit_id)
+
+
 @receiver(approval_request_approved, dispatch_uid="iams_approval_approved_side_effects")
 def approval_request_approved_side_effects(sender, instance: ApprovalRequest, **kwargs):
     """React to the fully-approved request.
@@ -254,8 +296,12 @@ def approval_request_approved_side_effects(sender, instance: ApprovalRequest, **
             CorrectiveAction.objects.filter(pk=ref).update(status="Closed", progress=100)
             logger.info("workflow: CAP %s closed via approved request %s", ref, instance.pk)
         elif instance.type == "Report":
-            from iams.models import AuditReport
             AuditReport.objects.filter(pk=ref).update(status="Final")
+            # .update() bypasses the AuditReport post_save signal, so issue
+            # the audit's findings explicitly here.
+            report = AuditReport.objects.filter(pk=ref).only("audit_id").first()
+            if report is not None:
+                issue_findings_for_audit(report.audit_id)
             logger.info("workflow: report %s finalized via approved request %s", ref, instance.pk)
         elif instance.type == "Audit Plan":
             # Audit plan approval doesn't mutate a specific row in the

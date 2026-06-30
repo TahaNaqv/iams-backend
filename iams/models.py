@@ -7,6 +7,34 @@ from django.contrib.contenttypes.fields import GenericForeignKey
 from django.contrib.contenttypes.models import ContentType
 
 
+class AccessLevelChoices(models.TextChoices):
+    """Graded access levels for the Role Access Matrix (see RoleModuleAccess).
+
+    Ordered most→least powerful via ``ACCESS_RANK``. "Scoped" is *not* a
+    level — it is the ``scoped`` boolean on RoleModuleAccess combined with
+    EDIT or READ (i.e. "Edit/Read but only own-department records").
+    """
+
+    FULL = "full", "Full"           # CRUD + configure
+    APPROVE = "approve", "Approve"  # sign-off; not necessarily edit
+    EDIT = "edit", "Edit"           # create + update
+    READ = "read", "Read"           # view only
+    NONE = "none", "—"              # no access
+
+
+# Rank used for ``>=`` comparisons. Higher number = more powerful.
+# Note: APPROVE (4) outranks EDIT (3), so an Approve cell satisfies any
+# ">= edit" check (e.g. a CAE with reports=approve may export reports) but
+# never a ">= full" check (delete / administration stays Full-only).
+ACCESS_RANK = {
+    AccessLevelChoices.FULL: 5,
+    AccessLevelChoices.APPROVE: 4,
+    AccessLevelChoices.EDIT: 3,
+    AccessLevelChoices.READ: 2,
+    AccessLevelChoices.NONE: 1,
+}
+
+
 class Permission(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     key = models.CharField(max_length=100, unique=True)
@@ -33,12 +61,89 @@ class Role(models.Model):
         help_text="Force MFA enrollment for every user with this role.",
     )
     permissions = models.ManyToManyField(Permission, related_name="roles", blank=True)
+    # Phase 8 — RBAC matrix. When True, "Scoped" access for this role on
+    # findings/reports/follow-up is additionally gated to *formally issued*
+    # records only (the Auditee / client manager rule). See
+    # DepartmentScopedQuerysetMixin.
+    requires_issuance_gate = models.BooleanField(
+        default=False,
+        help_text="Scoped access only sees records after formal issuance.",
+    )
 
     class Meta:
         ordering = ["name"]
 
     def __str__(self):
         return self.name
+
+    # ── Phase 8 RBAC matrix helpers ──────────────────────────────────
+    @property
+    def _access_map(self):
+        """Per-instance cache of {module_key: RoleModuleAccess} to avoid N+1.
+
+        Cleared implicitly when a fresh Role is loaded from the DB each
+        request; never share Role instances across requests when editing
+        the matrix.
+        """
+        cache = self.__dict__.get("_access_map_cache")
+        if cache is None:
+            cache = {
+                rma.module.key: rma
+                for rma in self.module_access.select_related("module").all()
+            }
+            self.__dict__["_access_map_cache"] = cache
+        return cache
+
+    def access_for(self, module_key):
+        """Return the RoleModuleAccess row for a module key, or None."""
+        return self._access_map.get(module_key)
+
+    def has_access(self, module_key, min_level):
+        """True if this role's access to ``module_key`` is >= ``min_level``.
+
+        Super Admin always passes. ``min_level`` is an AccessLevelChoices
+        value (or equivalent string).
+        """
+        if self.is_super_admin:
+            return True
+        acc = self.access_for(module_key)
+        if acc is None:
+            return False
+        return ACCESS_RANK.get(acc.level, 1) >= ACCESS_RANK.get(min_level, 1)
+
+    def full_access_map(self):
+        """Return {module_key: {"level", "scoped"}} for ALL known modules.
+
+        Super Admin gets Full/unscoped everywhere. Modules with no row
+        default to level "none". Used by serializers (/auth/me, RoleSerializer)
+        to expose the matrix to the frontend.
+        """
+        keys = list(Module.objects.values_list("key", flat=True))
+        if self.is_super_admin:
+            return {
+                k: {"level": AccessLevelChoices.FULL, "scoped": False} for k in keys
+            }
+        rows = self._access_map
+        out = {}
+        for k in keys:
+            acc = rows.get(k)
+            if acc is None:
+                out[k] = {"level": AccessLevelChoices.NONE, "scoped": False}
+            else:
+                out[k] = {"level": acc.level, "scoped": acc.scoped}
+        return out
+
+    def derived_permission_keys(self):
+        """Compute the legacy permission-key set this role effectively holds,
+        derived from its matrix cells (single source of truth)."""
+        from iams.rbac_matrix import derived_permission_keys
+
+        if self.is_super_admin:
+            from iams.rbac_matrix import LEGACY_PERMISSION_MAP
+
+            return list(LEGACY_PERMISSION_MAP.keys())
+        level_map = {k: v["level"] for k, v in self.full_access_map().items()}
+        return derived_permission_keys(level_map)
 
 
 class UserProfile(models.Model):
@@ -61,6 +166,19 @@ class UserProfile(models.Model):
         blank=True,
     )
     department = models.CharField(max_length=200, blank=True)
+    # Phase 8 — canonical department link for RBAC scoping. Departments are
+    # AuditableEntity rows with entity_type="Department". The free-text
+    # ``department`` above is kept for back-compat and as a fallback scope
+    # filter when this FK is null (see DepartmentScopedQuerysetMixin).
+    department_entity = models.ForeignKey(
+        "AuditableEntity",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="member_user_profiles",
+        limit_choices_to={"entity_type": "Department"},
+        help_text="Canonical owning department (Department-type AuditableEntity).",
+    )
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="Active")
     # Phase 5 — set whenever the password is changed; the MFA grace
     # period (30 days from account creation OR last password change)
@@ -85,6 +203,60 @@ class UserProfile(models.Model):
 
     def __str__(self):
         return f"{self.user.email} - {self.role.name if self.role else 'No role'}"
+
+
+class Module(models.Model):
+    """One of the 11 functional areas in the Role Access Matrix.
+
+    Acts as the column registry for the matrix. Seeded by migration 0037
+    and ``seed_rbac``; rarely changes at runtime.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    key = models.CharField(max_length=50, unique=True)
+    name = models.CharField(max_length=100)
+    order = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        ordering = ["order", "key"]
+
+    def __str__(self):
+        return self.name
+
+
+class RoleModuleAccess(models.Model):
+    """A single cell of the Role Access Matrix: (role, module) -> level + scoped.
+
+    This is the source of truth for authorization. ``HasPermission`` (legacy
+    keys) and ``ModuleAccess`` both resolve through these rows. "Scoped" is
+    represented as ``scoped=True`` with ``level`` EDIT or READ.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    role = models.ForeignKey(
+        Role, on_delete=models.CASCADE, related_name="module_access"
+    )
+    module = models.ForeignKey(
+        Module, on_delete=models.CASCADE, related_name="role_access"
+    )
+    level = models.CharField(
+        max_length=10,
+        choices=AccessLevelChoices.choices,
+        default=AccessLevelChoices.NONE,
+    )
+    scoped = models.BooleanField(default=False)
+
+    class Meta:
+        ordering = ["role", "module"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["role", "module"], name="iams_role_module_unique"
+            ),
+        ]
+        indexes = [models.Index(fields=["role", "module"])]
+
+    def __str__(self):
+        return f"{self.role.name} / {self.module.key} = {self.level}{' (scoped)' if self.scoped else ''}"
 
 
 class TimeStampedModel(models.Model):
@@ -346,6 +518,11 @@ class Finding(TimeStampedModel):
     root_cause = models.TextField(blank=True)
     recommendation = models.TextField(blank=True)
     created_date = models.DateField(null=True, blank=True)
+    # Phase 8 — formal issuance. Set True (and ``issued_at`` stamped) when a
+    # covering AuditReport reaches "Final". Drives the Auditee / client
+    # manager scoping rule: scoped users only see *issued* findings.
+    is_issued = models.BooleanField(default=False, db_index=True)
+    issued_at = models.DateTimeField(null=True, blank=True)
     # Phase 6 Track 2 — external provenance for inbound ERP findings.
     external_source = models.CharField(max_length=64, blank=True, db_index=True)
     external_id = models.CharField(max_length=128, blank=True, db_index=True)
@@ -403,6 +580,47 @@ class CorrectiveAction(TimeStampedModel):
 
     def __str__(self):
         return self.title
+
+
+class ManagementResponse(TimeStampedModel):
+    """An auditee's formal response to a finding (the Mgmt Responses module).
+
+    Auditee / client managers submit and edit responses scoped to their own
+    department; CAE / Audit manager have read access. Backs the
+    ``mgmt_responses`` matrix module.
+    """
+
+    STATUS_CHOICES = [
+        ("Draft", "Draft"),
+        ("Submitted", "Submitted"),
+        ("Accepted", "Accepted"),
+        ("Rejected", "Rejected"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    finding = models.ForeignKey(
+        Finding, on_delete=models.CASCADE, related_name="management_responses"
+    )
+    department = models.CharField(max_length=200, blank=True)
+    author_ref = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="authored_management_responses",
+    )
+    body = models.TextField(blank=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="Draft")
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["department", "status"]),
+            models.Index(fields=["finding", "status"]),
+        ]
+
+    def __str__(self):
+        return f"Response to {self.finding_id} ({self.status})"
 
 
 class ActivityItem(TimeStampedModel):

@@ -21,7 +21,12 @@ from .integrations import (
     IntegrationWebhookView,
 )
 from .users import UserViewSet
-from .roles import KeycloakGroupRoleMapViewSet, RoleViewSet, RolePermissionsView
+from .roles import (
+    KeycloakGroupRoleMapViewSet,
+    ModuleViewSet,
+    RoleViewSet,
+    RolePermissionsView,
+)
 from .permissions import PermissionViewSet
 from .domain import (
     ActivityViewSet,
@@ -37,6 +42,7 @@ from .domain import (
     ChecklistItemViewSet,
     CommentViewSet,
     CorrectiveActionViewSet,
+    ManagementResponseViewSet,
     DashboardActivityView,
     DashboardKPIView,
     DashboardRatingSummaryView,
@@ -117,11 +123,13 @@ __all__ = [
     "ReadinessView",
     "UserViewSet",
     "RoleViewSet",
+    "ModuleViewSet",
     "RolePermissionsView",
     "PermissionViewSet",
     "AuditViewSet",
     "FindingViewSet",
     "CorrectiveActionViewSet",
+    "ManagementResponseViewSet",
     "ActivityViewSet",
     "ChecklistByAuditView",
     "ChecklistItemViewSet",

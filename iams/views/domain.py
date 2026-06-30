@@ -26,6 +26,8 @@ from iams.domain_serializers import (
     CommentSerializer,
     CorrectiveActionSerializer,
     CorrectiveActionWriteSerializer,
+    ManagementResponseSerializer,
+    ManagementResponseWriteSerializer,
     EvidenceFileSerializer,
     FindingSerializer,
     FindingWriteSerializer,
@@ -74,6 +76,7 @@ from iams.models import (
     Comment,
     EntityRisk,
     CorrectiveAction,
+    ManagementResponse,
     EntityStatusChoices,
     EvidenceFile,
     Finding,
@@ -106,23 +109,37 @@ from iams.filters import (
     BusinessUnitFilter,
     TagFilter,
 )
-from iams.permissions import HasPermission
+from iams.permissions import (
+    DepartmentScopedQuerysetMixin,
+    HasPermission,
+    ModuleAccess,
+    ModuleGatedMixin,
+)
 
 
-class AuditViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
+class AuditViewSet(
+    DepartmentScopedQuerysetMixin,
+    ModuleGatedMixin,
+    AuditedViewSetMixin,
+    viewsets.ModelViewSet,
+):
     queryset = Audit.objects.all()
     serializer_class = AuditSerializer
+    # Engagements module. The annual-plan create/approve actions are gated to
+    # the audit_plan module instead (see get_permissions). Scoped for Staff
+    # auditor: own-department audits + audits they lead.
+    module = "engagements"
+    scope_module = "engagements"
+    scope_department_field = "department"
+    scope_owner_fields = ("lead_auditor_ref",)
 
     def get_permissions(self):
-        if self.action in ("list", "retrieve"):
-            return [HasPermission("view_audits")]
+        # Plan-level actions belong to the audit_plan module.
         if self.action == "create":
-            return [HasPermission("create_audits")]
-        if self.action in ("update", "partial_update"):
-            return [HasPermission("edit_audits")]
-        if self.action == "destroy":
-            return [HasPermission("delete_audits")]
-        return [IsAuthenticated()]
+            return [ModuleAccess("audit_plan", "edit")]
+        if self.action == "approve_plan":
+            return [ModuleAccess("audit_plan", "approve")]
+        return super().get_permissions()
 
     def get_queryset(self):
         qs = super().get_queryset()
@@ -138,9 +155,19 @@ class AuditViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
         return qs
 
 
-class FindingViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
+class FindingViewSet(
+    DepartmentScopedQuerysetMixin,
+    ModuleGatedMixin,
+    AuditedViewSetMixin,
+    viewsets.ModelViewSet,
+):
     queryset = Finding.objects.select_related("audit").all()
-    permission_classes = [HasPermission("manage_findings")]
+    module = "findings"
+    scope_module = "findings"
+    scope_department_field = "department"
+    scope_owner_fields = ("owner_ref",)
+    # Issuance-gated roles (Auditee) only see formally issued findings.
+    scope_issued_filter = Q(is_issued=True)
 
     def get_serializer_class(self):
         if self.action in ("create", "update", "partial_update"):
@@ -155,14 +182,66 @@ class FindingViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
         return qs
 
 
-class CorrectiveActionViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
+class CorrectiveActionViewSet(
+    DepartmentScopedQuerysetMixin,
+    ModuleGatedMixin,
+    AuditedViewSetMixin,
+    viewsets.ModelViewSet,
+):
     queryset = CorrectiveAction.objects.select_related("finding", "finding__audit").all()
-    permission_classes = [HasPermission("manage_caps")]
+    module = "follow_up"
+    scope_module = "follow_up"
+    scope_department_field = "department"
+    scope_owner_fields = ("owner_ref",)
+    scope_issued_filter = Q(finding__is_issued=True)
 
     def get_serializer_class(self):
         if self.action in ("create", "update", "partial_update"):
             return CorrectiveActionWriteSerializer
         return CorrectiveActionSerializer
+
+
+class ManagementResponseViewSet(
+    DepartmentScopedQuerysetMixin,
+    ModuleGatedMixin,
+    AuditedViewSetMixin,
+    viewsets.ModelViewSet,
+):
+    """Auditee management responses (the Mgmt Responses module).
+
+    Auditees edit responses scoped to their own department; CAE / Audit
+    manager have read access. No issuance gate — responses are authored
+    around issuance, not gated by it.
+    """
+
+    queryset = ManagementResponse.objects.select_related("finding", "author_ref").all()
+    module = "mgmt_responses"
+    scope_module = "mgmt_responses"
+    scope_department_field = "department"
+    scope_owner_fields = ("author_ref",)
+
+    def get_serializer_class(self):
+        if self.action in ("create", "update", "partial_update"):
+            return ManagementResponseWriteSerializer
+        return ManagementResponseSerializer
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        finding_id = self.request.query_params.get("finding_id")
+        if finding_id:
+            qs = qs.filter(finding_id=finding_id)
+        return qs
+
+    def perform_create(self, serializer):
+        # Stamp author. Scoped users (auditees) are forced to their own
+        # department; non-scoped users may set it (defaulting to their own).
+        profile = getattr(self.request.user, "profile", None)
+        own_dept = profile.department if profile else ""
+        if self._is_scoped():
+            department = own_dept
+        else:
+            department = serializer.validated_data.get("department") or own_dept
+        serializer.save(author_ref=self.request.user, department=department)
 
 
 class ActivityViewSet(viewsets.ReadOnlyModelViewSet):
@@ -172,7 +251,7 @@ class ActivityViewSet(viewsets.ReadOnlyModelViewSet):
 
 
 class ChecklistByAuditView(APIView):
-    permission_classes = [HasPermission("view_audits")]
+    permission_classes = [ModuleAccess("engagements", "read")]
 
     def get(self, request, audit_id):
         items = ChecklistItem.objects.filter(audit_id=audit_id)
@@ -180,7 +259,7 @@ class ChecklistByAuditView(APIView):
 
     def post(self, request, audit_id):
         self.check_permissions(request)
-        if not HasPermission("edit_audits").has_permission(request, self):
+        if not ModuleAccess("engagements", "edit").has_permission(request, self):
             return Response(status=status.HTTP_403_FORBIDDEN)
         serializer = ChecklistItemWriteSerializer(data={**request.data, "auditId": str(audit_id)})
         serializer.is_valid(raise_exception=True)
@@ -188,15 +267,10 @@ class ChecklistByAuditView(APIView):
         return Response(ChecklistItemSerializer(item).data, status=status.HTTP_201_CREATED)
 
 
-class ChecklistItemViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
+class ChecklistItemViewSet(ModuleGatedMixin, AuditedViewSetMixin, viewsets.ModelViewSet):
     queryset = ChecklistItem.objects.all().order_by("created_at", "id")
     serializer_class = ChecklistItemSerializer
-
-    def get_permissions(self):
-        # Reads: anyone with view_audits. Writes: edit_audits.
-        if self.action in ("list", "retrieve"):
-            return [HasPermission("view_audits")]
-        return [HasPermission("edit_audits")]
+    module = "engagements"
 
     def get_serializer_class(self):
         if self.action in ("create", "update", "partial_update"):
@@ -212,7 +286,7 @@ class ChecklistItemViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
 
 
 class EvidenceByAuditView(APIView):
-    permission_classes = [HasPermission("view_audits")]
+    permission_classes = [ModuleAccess("engagements", "read")]
     parser_classes = [MultiPartParser, FormParser]
 
     def get(self, request, audit_id):
@@ -221,7 +295,7 @@ class EvidenceByAuditView(APIView):
 
     def post(self, request, audit_id):
         self.check_permissions(request)
-        if not HasPermission("edit_audits").has_permission(request, self):
+        if not ModuleAccess("engagements", "edit").has_permission(request, self):
             return Response(status=status.HTTP_403_FORBIDDEN)
         uploaded_file = request.FILES.get("file")
         if not uploaded_file:
@@ -244,10 +318,10 @@ class EvidenceByAuditView(APIView):
         return Response(EvidenceFileSerializer(item).data, status=status.HTTP_201_CREATED)
 
 
-class EvidenceFileViewSet(viewsets.ReadOnlyModelViewSet):
+class EvidenceFileViewSet(ModuleGatedMixin, viewsets.ReadOnlyModelViewSet):
     queryset = EvidenceFile.objects.all().order_by("-uploaded_at", "id")
     serializer_class = EvidenceFileSerializer
-    permission_classes = [HasPermission("view_audits")]
+    module = "engagements"
 
     @action(detail=True, methods=["get"], url_path="download")
     def download(self, request, pk=None):
@@ -288,7 +362,7 @@ class EvidenceFileViewSet(viewsets.ReadOnlyModelViewSet):
 
 
 class TimelineByAuditView(APIView):
-    permission_classes = [HasPermission("view_audits")]
+    permission_classes = [ModuleAccess("engagements", "read")]
 
     def get(self, request, audit_id):
         items = TimelineEvent.objects.filter(audit_id=audit_id)
@@ -296,7 +370,7 @@ class TimelineByAuditView(APIView):
 
     def post(self, request, audit_id):
         self.check_permissions(request)
-        if not HasPermission("edit_audits").has_permission(request, self):
+        if not ModuleAccess("engagements", "edit").has_permission(request, self):
             return Response(status=status.HTTP_403_FORBIDDEN)
         serializer = TimelineEventWriteSerializer(data={**request.data, "auditId": str(audit_id)})
         serializer.is_valid(raise_exception=True)
@@ -304,7 +378,7 @@ class TimelineByAuditView(APIView):
         return Response(TimelineEventSerializer(item).data, status=status.HTTP_201_CREATED)
 
 
-class AuditableEntityViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
+class AuditableEntityViewSet(ModuleGatedMixin, AuditedViewSetMixin, viewsets.ModelViewSet):
     """Writable audit-universe API.
 
     Defaults to the active set (``status != Archived``); use
@@ -343,32 +417,20 @@ class AuditableEntityViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
     ]
     ordering = ["name", "id"]
 
-    # Map every action to a permission code so the role matrix is auditable.
-    _ACTION_PERMISSIONS: dict[str, str] = {
-        "list": "view_audits",
-        "retrieve": "view_audits",
-        "tree": "view_audits",
-        "lineage": "view_audits",
-        "revisions": "view_audits",
-        "coverage": "view_audits",
-        "kpis": "view_audits",
-        "export": "view_audits",
-        "create": "create_audits",
-        "bulk_import": "create_audits",
-        "clone": "create_audits",
-        "update": "edit_audits",
-        "partial_update": "edit_audits",
-        "bulk_update": "edit_audits",
-        "archive": "edit_audits",
-        "restore": "edit_audits",
-        "recompute": "edit_audits",
-        "reset_risk_overrides": "edit_audits",
-        "destroy": "edit_audits",
-    }
-
-    def get_permissions(self):
-        perm = self._ACTION_PERMISSIONS.get(self.action, "view_audits")
-        return [IsAuthenticated(), HasPermission(perm)()]
+    # Gated to the audit_universe module. The GET-only custom actions are
+    # read-level; create/update/clone/archive/restore/recompute/etc. default
+    # to edit, and destroy to full.
+    module = "audit_universe"
+    read_actions = (
+        "list",
+        "retrieve",
+        "tree",
+        "lineage",
+        "revisions",
+        "coverage",
+        "kpis",
+        "export",
+    )
 
     def finalize_response(self, request, response, *args, **kwargs):
         # Surface a RFC-8594-style ``Deprecation`` header on every read
@@ -931,7 +993,7 @@ class AuditableEntityViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
         return Response(self.get_serializer(entity).data)
 
 
-class EntityRiskViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
+class EntityRiskViewSet(ModuleGatedMixin, AuditedViewSetMixin, viewsets.ModelViewSet):
     """Discrete risks attached to an auditable entity (engagement).
 
     Filter the list by ``?entity=<uuid>``. Every create/update/delete
@@ -942,6 +1004,7 @@ class EntityRiskViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
 
     serializer_class = EntityRiskSerializer
     ordering = ["-created_at"]
+    module = "audit_universe"
 
     def get_queryset(self):
         qs = EntityRisk.objects.select_related("entity", "owner").all()
@@ -949,11 +1012,6 @@ class EntityRiskViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
         if entity_id:
             qs = qs.filter(entity_id=entity_id)
         return qs
-
-    def get_permissions(self):
-        if self.action in ("list", "retrieve"):
-            return [IsAuthenticated(), HasPermission("view_audits")()]
-        return [IsAuthenticated(), HasPermission("edit_audits")()]
 
     def _reroll(self, entity):
         from iams.risk_rollup import recompute_entity_risk_position
@@ -977,33 +1035,25 @@ class EntityRiskViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
         self._reroll(entity)
 
 
-class BusinessUnitViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
+class BusinessUnitViewSet(ModuleGatedMixin, AuditedViewSetMixin, viewsets.ModelViewSet):
     queryset = BusinessUnit.objects.all().select_related("parent", "head").order_by("name", "id")
     serializer_class = BusinessUnitSerializer
     filterset_class = BusinessUnitFilter
     search_fields = ["name", "code", "description"]
     ordering_fields = ["name", "code", "created_at"]
-
-    def get_permissions(self):
-        if self.action in ("list", "retrieve"):
-            return [IsAuthenticated(), HasPermission("view_audits")()]
-        return [IsAuthenticated(), HasPermission("edit_audits")()]
+    module = "audit_universe"
 
 
-class TagViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
+class TagViewSet(ModuleGatedMixin, AuditedViewSetMixin, viewsets.ModelViewSet):
     queryset = Tag.objects.all().order_by("category", "name")
     serializer_class = TagSerializer
     filterset_class = TagFilter
     search_fields = ["name", "description"]
     ordering_fields = ["name", "category", "created_at"]
-
-    def get_permissions(self):
-        if self.action in ("list", "retrieve"):
-            return [IsAuthenticated(), HasPermission("view_audits")()]
-        return [IsAuthenticated(), HasPermission("edit_audits")()]
+    module = "audit_universe"
 
 
-class BulkImportJobViewSet(viewsets.ReadOnlyModelViewSet):
+class BulkImportJobViewSet(ModuleGatedMixin, viewsets.ReadOnlyModelViewSet):
     """Poll-only viewset for bulk-import progress.
 
     Job rows are created by ``POST /api/auditable-entities/bulk-import/``
@@ -1015,7 +1065,7 @@ class BulkImportJobViewSet(viewsets.ReadOnlyModelViewSet):
     """
 
     serializer_class = BulkImportJobSerializer
-    permission_classes = [HasPermission("view_audits")]
+    module = "audit_universe"
 
     def get_queryset(self):
         qs = BulkImportJob.objects.all().select_related("requested_by")
@@ -1031,7 +1081,7 @@ class BulkImportJobViewSet(viewsets.ReadOnlyModelViewSet):
         return qs.filter(requested_by=u)
 
 
-class AuditableEntityRevisionViewSet(viewsets.ReadOnlyModelViewSet):
+class AuditableEntityRevisionViewSet(ModuleGatedMixin, viewsets.ReadOnlyModelViewSet):
     """Read-only listing of every revision across all entities.
 
     Per-entity revisions are also exposed via
@@ -1041,14 +1091,14 @@ class AuditableEntityRevisionViewSet(viewsets.ReadOnlyModelViewSet):
 
     queryset = AuditableEntityRevision.objects.all().select_related("entity", "changed_by")
     serializer_class = AuditableEntityRevisionSerializer
-    permission_classes = [HasPermission("view_audits")]
     ordering = ["-created_at"]
+    module = "audit_universe"
 
 
-class RiskHistoryViewSet(viewsets.ReadOnlyModelViewSet):
+class RiskHistoryViewSet(ModuleGatedMixin, viewsets.ReadOnlyModelViewSet):
     queryset = RiskHistoryEntry.objects.all()
     serializer_class = RiskHistoryEntrySerializer
-    permission_classes = [HasPermission("view_audits")]
+    module = "audit_universe"
 
 
 class NotificationViewSet(viewsets.ReadOnlyModelViewSet):
@@ -1152,15 +1202,17 @@ class NotificationPreferenceViewSet(viewsets.ModelViewSet):
         return Response(serializer.data, status=status.HTTP_201_CREATED if instance is None else status.HTTP_200_OK)
 
 
-class AuditLogViewSet(viewsets.ReadOnlyModelViewSet):
+class AuditLogViewSet(ModuleGatedMixin, viewsets.ReadOnlyModelViewSet):
     # Phase 5 Track 2 — ``select_related("target_content_type")`` removes
     # the per-row ContentType lookup that ``get_targetType`` triggers.
     queryset = AuditLogEntry.objects.select_related("target_content_type").all()
     serializer_class = AuditLogEntrySerializer
-    permission_classes = [HasPermission("view_reports")]
+    module = "reports"
 
 
 class FollowUpViewSet(
+    DepartmentScopedQuerysetMixin,
+    ModuleGatedMixin,
     AuditedViewSetMixin,
     viewsets.GenericViewSet,
     mixins.ListModelMixin,
@@ -1169,7 +1221,13 @@ class FollowUpViewSet(
 ):
     queryset = FollowUpItem.objects.select_related("finding").all().order_by("due_date", "id")
     serializer_class = FollowUpItemSerializer
-    permission_classes = [HasPermission("manage_findings")]
+    module = "follow_up"
+    scope_module = "follow_up"
+    # FollowUpItem has no own department/owner — scope via its finding.
+    scope_department_field = "finding__department"
+    scope_owner_fields = ("finding__owner_ref",)
+    scope_issued_filter = Q(finding__is_issued=True)
+    scope_create_stamp_field = None  # no own department column; no create action
 
 
 class CommentViewSet(
@@ -1201,7 +1259,7 @@ class DashboardKPIView(APIView):
       ?period=YYYY | YYYY-Qn   filter by audit/finding/CAP year/quarter
       ?department=Finance      filter by department name
     """
-    permission_classes = [IsAuthenticated]
+    permission_classes = [ModuleAccess("dashboards", "read")]
 
     def get(self, request):
         from iams.dashboards import _cache_key, cache_or_compute, core_kpis
@@ -1215,19 +1273,19 @@ class DashboardKPIView(APIView):
         return Response(payload)
 
 
-class AuditorViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
+class AuditorViewSet(ModuleGatedMixin, AuditedViewSetMixin, viewsets.ModelViewSet):
     queryset = Auditor.objects.all()
     serializer_class = AuditorSerializer
-    permission_classes = [HasPermission("view_audits")]
+    module = "engagements"
 
 
-class AssignmentViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
+class AssignmentViewSet(ModuleGatedMixin, AuditedViewSetMixin, viewsets.ModelViewSet):
     queryset = (
         AuditAssignment.objects.select_related("auditor", "audit")
         .all()
         .order_by("start_date", "id")
     )
-    permission_classes = [HasPermission("view_audits")]
+    module = "engagements"
 
     def get_serializer_class(self):
         if self.action in ("create", "update", "partial_update"):
@@ -1242,9 +1300,9 @@ class AssignmentViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
         return qs
 
 
-class TimeEntryViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
+class TimeEntryViewSet(ModuleGatedMixin, AuditedViewSetMixin, viewsets.ModelViewSet):
     queryset = TimeEntry.objects.select_related("auditor", "audit").all()
-    permission_classes = [HasPermission("view_audits")]
+    module = "engagements"
 
     def get_serializer_class(self):
         if self.action in ("create", "update", "partial_update"):
@@ -1259,9 +1317,9 @@ class TimeEntryViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
         return qs
 
 
-class HoursBudgetViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
+class HoursBudgetViewSet(ModuleGatedMixin, AuditedViewSetMixin, viewsets.ModelViewSet):
     queryset = HoursBudget.objects.select_related("audit").all().order_by("id")
-    permission_classes = [HasPermission("view_audits")]
+    module = "engagements"
 
     def get_serializer_class(self):
         if self.action in ("create", "update", "partial_update"):
@@ -1276,10 +1334,10 @@ class HoursBudgetViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
         return qs
 
 
-class RiskAssessmentViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
+class RiskAssessmentViewSet(ModuleGatedMixin, AuditedViewSetMixin, viewsets.ModelViewSet):
     queryset = RiskAssessmentRecord.objects.all().order_by("department", "source_row", "id")
     serializer_class = RiskAssessmentRecordSerializer
-    permission_classes = [HasPermission("view_audits")]
+    module = "risk_assessment"
 
     def get_queryset(self):
         qs = super().get_queryset()
@@ -1289,38 +1347,49 @@ class RiskAssessmentViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
         return qs
 
 
-class RiskAssessmentSheetsViewSet(viewsets.ReadOnlyModelViewSet):
+class RiskAssessmentSheetsViewSet(ModuleGatedMixin, viewsets.ReadOnlyModelViewSet):
     queryset = RiskAssessmentSheet.objects.all()
     serializer_class = RiskAssessmentSheetSerializer
-    permission_classes = [HasPermission("view_audits")]
+    module = "risk_assessment"
 
 
-class RiskAssessmentMatrixViewSet(viewsets.ReadOnlyModelViewSet):
+class RiskAssessmentMatrixViewSet(ModuleGatedMixin, viewsets.ReadOnlyModelViewSet):
     queryset = RiskAssessmentMatrixCell.objects.all().order_by("likelihood", "impact")
     serializer_class = RiskAssessmentMatrixCellSerializer
-    permission_classes = [HasPermission("view_audits")]
+    module = "risk_assessment"
 
 
-class RiskAssessmentSummaryViewSet(viewsets.ReadOnlyModelViewSet):
+class RiskAssessmentSummaryViewSet(ModuleGatedMixin, viewsets.ReadOnlyModelViewSet):
     queryset = (
         RiskAssessmentSummaryItem.objects.select_related("record")
         .all()
         .order_by("record__department", "id")
     )
     serializer_class = RiskAssessmentSummaryItemSerializer
-    permission_classes = [HasPermission("view_audits")]
+    module = "risk_assessment"
 
 
-class RiskAssessmentImportIssuesViewSet(viewsets.ReadOnlyModelViewSet):
+class RiskAssessmentImportIssuesViewSet(ModuleGatedMixin, viewsets.ReadOnlyModelViewSet):
     queryset = RiskAssessmentImportIssue.objects.all().order_by("severity", "id")
     serializer_class = RiskAssessmentImportIssueSerializer
-    permission_classes = [HasPermission("manage_settings")]
+    module = "risk_assessment"
 
 
 class ApprovalRequestViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
     queryset = ApprovalRequest.objects.prefetch_related("steps").all().order_by("-created_at")
     serializer_class = ApprovalRequestSerializer
     permission_classes = [IsAuthenticated]
+
+    # NOTE on the matrix "Approve" level: approval authority is enforced by the
+    # approval-chain step designation — advance_on_approve requires the caller
+    # to match the current step's approver (email) or role, returning 400
+    # otherwise (see iams.workflows). The matrix "Approve" column is realized
+    # by routing final sign-off steps to approve-capable roles in the chain
+    # templates (e.g. the audit-plan chain ends at CAE; see
+    # seed_approval_chains). A blanket module-level approve gate is deliberately
+    # NOT added here because it would reject legitimately-designated
+    # intermediate approvers (e.g. an Audit manager assigned an audit-plan
+    # review step holds audit_plan=edit, not approve).
 
     def get_queryset(self):
         qs = super().get_queryset()
@@ -1400,9 +1469,9 @@ class ApprovalRequestViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
         return Response(ApprovalRequestSerializer(obj).data)
 
 
-class WorkProgramViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
+class WorkProgramViewSet(ModuleGatedMixin, AuditedViewSetMixin, viewsets.ModelViewSet):
     queryset = WorkProgram.objects.select_related("audit").prefetch_related("procedures__steps").all()
-    permission_classes = [HasPermission("view_audits")]
+    module = "engagements"
 
     def get_serializer_class(self):
         if self.action in ("create", "update", "partial_update"):
@@ -1410,9 +1479,9 @@ class WorkProgramViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
         return WorkProgramSerializer
 
 
-class WorkProcedureViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
+class WorkProcedureViewSet(ModuleGatedMixin, AuditedViewSetMixin, viewsets.ModelViewSet):
     queryset = WorkProcedure.objects.select_related("work_program").prefetch_related("steps").all()
-    permission_classes = [HasPermission("view_audits")]
+    module = "engagements"
 
     def get_serializer_class(self):
         if self.action in ("create", "update", "partial_update"):
@@ -1420,10 +1489,10 @@ class WorkProcedureViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
         return WorkProcedureSerializer
 
 
-class WorkProcedureStepViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
+class WorkProcedureStepViewSet(ModuleGatedMixin, AuditedViewSetMixin, viewsets.ModelViewSet):
     queryset = WorkProcedureStep.objects.select_related("procedure").all()
     serializer_class = WorkProcedureStepSerializer
-    permission_classes = [HasPermission("view_audits")]
+    module = "engagements"
 
     def get_serializer_class(self):
         if self.action in ("create", "update", "partial_update"):
@@ -1431,9 +1500,22 @@ class WorkProcedureStepViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
         return WorkProcedureStepSerializer
 
 
-class AuditReportViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
+class AuditReportViewSet(
+    DepartmentScopedQuerysetMixin,
+    ModuleGatedMixin,
+    AuditedViewSetMixin,
+    viewsets.ModelViewSet,
+):
     queryset = AuditReport.objects.select_related("audit").prefetch_related("sections").all()
-    permission_classes = [HasPermission("view_reports")]
+    module = "reports"
+    scope_module = "reports"
+    # Scoped roles (Auditee, External auditor) see only their department's
+    # reports, and only once finalized ("Final" == issued).
+    scope_department_field = "department"
+    scope_owner_fields = ("author_ref", "reviewer_ref")
+    scope_dept_entity_field = None
+    scope_issued_filter = Q(status="Final")
+    scope_issued_always = True  # never expose draft reports to scoped roles
 
     def get_serializer_class(self):
         if self.action in ("create", "update", "partial_update"):
@@ -1441,9 +1523,9 @@ class AuditReportViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
         return AuditReportSerializer
 
 
-class AuditReportSectionViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
+class AuditReportSectionViewSet(ModuleGatedMixin, AuditedViewSetMixin, viewsets.ModelViewSet):
     queryset = AuditReportSection.objects.select_related("report").all()
-    permission_classes = [HasPermission("view_reports")]
+    module = "reports"
 
     def get_serializer_class(self):
         if self.action in ("create", "update", "partial_update"):
@@ -1451,10 +1533,10 @@ class AuditReportSectionViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
         return AuditReportSectionSerializer
 
 
-class ManagedDocumentViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
+class ManagedDocumentViewSet(ModuleGatedMixin, AuditedViewSetMixin, viewsets.ModelViewSet):
     queryset = ManagedDocument.objects.all()
     parser_classes = [MultiPartParser, FormParser]
-    permission_classes = [HasPermission("view_reports")]
+    module = "reports"
 
     def get_serializer_class(self):
         if self.action in ("create", "update", "partial_update"):
@@ -1498,11 +1580,16 @@ class ApprovalChainTemplateViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
 
     def get_permissions(self):
         if self.action in ("list", "retrieve"):
-            return [HasPermission("view_audits")]
-        return [HasPermission("manage_settings")]
+            return [ModuleAccess("engagements", "read")]
+        return [ModuleAccess("users_roles", "full")]
 
 
-class WorkingPaperViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
+class WorkingPaperViewSet(
+    DepartmentScopedQuerysetMixin,
+    ModuleGatedMixin,
+    AuditedViewSetMixin,
+    viewsets.ModelViewSet,
+):
     """Engagement-scoped working papers with versioning + sign-off.
 
     Endpoints:
@@ -1521,11 +1608,13 @@ class WorkingPaperViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
     queryset = WorkingPaper.objects.select_related("audit", "auditor_signed_by", "reviewer_signed_by").prefetch_related("findings")
     # JSONParser for PATCH-as-JSON edits; Multipart/Form for uploads.
     parser_classes = [MultiPartParser, FormParser, JSONParser]
-
-    def get_permissions(self):
-        if self.action in ("list", "retrieve", "versions", "download"):
-            return [HasPermission("view_audits")]
-        return [HasPermission("edit_audits")]
+    module = "workpapers"
+    read_actions = ("list", "retrieve", "versions", "download")
+    scope_module = "workpapers"
+    # Working papers carry no own department — scope via the parent audit.
+    scope_department_field = "audit__department"
+    scope_owner_fields = ("audit__lead_auditor_ref", "auditor_signed_by", "reviewer_signed_by")
+    scope_create_stamp_field = None  # no own department column to stamp
 
     def get_serializer_class(self):
         if self.action in ("create", "update", "partial_update"):
@@ -1701,7 +1790,7 @@ from iams.domain_serializers import (  # noqa: E402
 )
 
 
-class QAIPAssessmentViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
+class QAIPAssessmentViewSet(ModuleGatedMixin, AuditedViewSetMixin, viewsets.ModelViewSet):
     queryset = (
         QAIPAssessment.objects
         .select_related("lead_reviewer")
@@ -1709,7 +1798,7 @@ class QAIPAssessmentViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
         .all()
     )
     serializer_class = QAIPAssessmentSerializer
-    permission_classes = [HasPermission("view_reports")]
+    module = "reports"
 
     def get_queryset(self):
         qs = super().get_queryset()
@@ -1725,10 +1814,10 @@ class QAIPAssessmentViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
         return qs
 
 
-class QAIPFindingViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
+class QAIPFindingViewSet(ModuleGatedMixin, AuditedViewSetMixin, viewsets.ModelViewSet):
     queryset = QAIPFinding.objects.select_related("assessment", "owner_ref").all()
     serializer_class = QAIPFindingSerializer
-    permission_classes = [HasPermission("view_reports")]
+    module = "reports"
 
     def get_queryset(self):
         qs = super().get_queryset()
@@ -1741,10 +1830,10 @@ class QAIPFindingViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
         return qs
 
 
-class StakeholderSurveyViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
+class StakeholderSurveyViewSet(ModuleGatedMixin, AuditedViewSetMixin, viewsets.ModelViewSet):
     queryset = StakeholderSurvey.objects.select_related("audit", "respondent").all()
     serializer_class = StakeholderSurveySerializer
-    permission_classes = [HasPermission("view_reports")]
+    module = "reports"
 
     def get_queryset(self):
         qs = super().get_queryset()
@@ -1757,10 +1846,10 @@ class StakeholderSurveyViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
         return qs
 
 
-class AuditKPIViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
+class AuditKPIViewSet(ModuleGatedMixin, AuditedViewSetMixin, viewsets.ModelViewSet):
     queryset = AuditKPI.objects.all()
     serializer_class = AuditKPISerializer
-    permission_classes = [HasPermission("view_reports")]
+    module = "reports"
 
     def get_queryset(self):
         qs = super().get_queryset()
@@ -1789,7 +1878,7 @@ class QAIPDashboardView(APIView):
       - ?period=PERIOD   restrict aggregations to that period label
     """
 
-    permission_classes = [HasPermission("view_reports")]
+    permission_classes = [ModuleAccess("reports", "read")]
 
     def get(self, request):
         from django.db.models import Avg
@@ -1860,7 +1949,7 @@ from iams.domain_serializers import (  # noqa: E402
 )
 
 
-class CSAQuestionnaireViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
+class CSAQuestionnaireViewSet(ModuleGatedMixin, AuditedViewSetMixin, viewsets.ModelViewSet):
     """Questionnaire CRUD.
 
     Read access requires ``view_audits`` (auditees need to see the
@@ -1870,11 +1959,7 @@ class CSAQuestionnaireViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
     """
     queryset = CSAQuestionnaire.objects.prefetch_related("questions").all()
     serializer_class = CSAQuestionnaireSerializer
-
-    def get_permissions(self):
-        if self.action in ("list", "retrieve"):
-            return [HasPermission("view_audits")]
-        return [HasPermission("manage_settings")]
+    module = "engagements"
 
     def get_queryset(self):
         qs = super().get_queryset()
@@ -1887,14 +1972,10 @@ class CSAQuestionnaireViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
         return qs
 
 
-class CSAQuestionViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
+class CSAQuestionViewSet(ModuleGatedMixin, AuditedViewSetMixin, viewsets.ModelViewSet):
     queryset = CSAQuestion.objects.select_related("questionnaire").all()
     serializer_class = CSAQuestionSerializer
-
-    def get_permissions(self):
-        if self.action in ("list", "retrieve"):
-            return [HasPermission("view_audits")]
-        return [HasPermission("manage_settings")]
+    module = "engagements"
 
     def get_queryset(self):
         qs = super().get_queryset()
@@ -2057,10 +2138,10 @@ from iams.domain_serializers import (  # noqa: E402
 )
 
 
-class ControlViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
+class ControlViewSet(ModuleGatedMixin, AuditedViewSetMixin, viewsets.ModelViewSet):
     queryset = Control.objects.select_related("entity", "owner_ref").all()
     serializer_class = ControlSerializer
-    permission_classes = [HasPermission("view_audits")]
+    module = "engagements"
 
     def get_queryset(self):
         qs = super().get_queryset()
@@ -2076,7 +2157,7 @@ class ControlViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
         return qs
 
 
-class ControlTestViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
+class ControlTestViewSet(ModuleGatedMixin, AuditedViewSetMixin, viewsets.ModelViewSet):
     queryset = (
         ControlTest.objects
         .select_related("control", "control__entity", "tester", "reviewer")
@@ -2084,7 +2165,7 @@ class ControlTestViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
         .all()
     )
     serializer_class = ControlTestSerializer
-    permission_classes = [HasPermission("view_audits")]
+    module = "engagements"
 
     def get_queryset(self):
         qs = super().get_queryset()
@@ -2140,10 +2221,10 @@ class ControlTestViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
         return Response(ControlTestSerializer(test).data)
 
 
-class ControlExceptionViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
+class ControlExceptionViewSet(ModuleGatedMixin, AuditedViewSetMixin, viewsets.ModelViewSet):
     queryset = ControlException.objects.select_related("test").prefetch_related("evidence_files").all()
     serializer_class = ControlExceptionSerializer
-    permission_classes = [HasPermission("view_audits")]
+    module = "engagements"
 
     def get_queryset(self):
         qs = super().get_queryset()
@@ -2156,10 +2237,10 @@ class ControlExceptionViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
         return qs
 
 
-class DeficiencyReportViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
+class DeficiencyReportViewSet(ModuleGatedMixin, AuditedViewSetMixin, viewsets.ModelViewSet):
     queryset = DeficiencyReport.objects.select_related("test", "test__control").all()
     serializer_class = DeficiencyReportSerializer
-    permission_classes = [HasPermission("view_audits")]
+    module = "engagements"
 
     def get_queryset(self):
         qs = super().get_queryset()
@@ -2226,7 +2307,7 @@ class ICFRSummaryView(APIView):
     Query params:
       - ?period=PERIOD   restrict test/exception/deficiency counts to that period
     """
-    permission_classes = [HasPermission("view_audits")]
+    permission_classes = [ModuleAccess("engagements", "read")]
 
     def get(self, request):
         from iams.icfr import build_icfr_summary
@@ -2251,24 +2332,16 @@ from iams.domain_serializers import (  # noqa: E402
 )
 
 
-class RiskFactorViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
+class RiskFactorViewSet(ModuleGatedMixin, AuditedViewSetMixin, viewsets.ModelViewSet):
     queryset = RiskFactor.objects.all().order_by("name")
     serializer_class = RiskFactorSerializer
-
-    def get_permissions(self):
-        if self.action in ("list", "retrieve"):
-            return [HasPermission("view_audits")]
-        return [HasPermission("manage_settings")]
+    module = "risk_assessment"
 
 
-class RiskScoringModelViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
+class RiskScoringModelViewSet(ModuleGatedMixin, AuditedViewSetMixin, viewsets.ModelViewSet):
     queryset = RiskScoringModel.objects.prefetch_related("factor_weights__factor").all().order_by("name", "-version")
     serializer_class = RiskScoringModelSerializer
-
-    def get_permissions(self):
-        if self.action in ("list", "retrieve"):
-            return [HasPermission("view_audits")]
-        return [HasPermission("manage_settings")]
+    module = "risk_assessment"
 
     @action(detail=True, methods=["post"], url_path="recompute")
     def recompute(self, request, pk=None):
@@ -2291,15 +2364,11 @@ class RiskScoringModelViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
         return Response({"recomputed": n})
 
 
-class RiskFactorWeightViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
+class RiskFactorWeightViewSet(ModuleGatedMixin, AuditedViewSetMixin, viewsets.ModelViewSet):
     """Per-model factor weights, attached via the through-model."""
     queryset = RiskFactorWeight.objects.select_related("factor", "scoring_model").all()
     serializer_class = RiskFactorWeightSerializer
-
-    def get_permissions(self):
-        if self.action in ("list", "retrieve"):
-            return [HasPermission("view_audits")]
-        return [HasPermission("manage_settings")]
+    module = "risk_assessment"
 
     def get_queryset(self):
         qs = super().get_queryset()
@@ -2318,7 +2387,7 @@ class RiskFactorWeightViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
         serializer.save(scoring_model_id=scoring_model_id)
 
 
-class EntityRiskScoreViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
+class EntityRiskScoreViewSet(ModuleGatedMixin, AuditedViewSetMixin, viewsets.ModelViewSet):
     """Read-mostly endpoint over the score history.
 
     Writes go through the ``record`` custom action which routes
@@ -2332,11 +2401,7 @@ class EntityRiskScoreViewSet(AuditedViewSetMixin, viewsets.ModelViewSet):
         .all()
     )
     serializer_class = EntityRiskScoreSerializer
-
-    def get_permissions(self):
-        if self.action in ("list", "retrieve"):
-            return [HasPermission("view_audits")]
-        return [HasPermission("manage_settings")]
+    module = "risk_assessment"
 
     def create(self, request, *args, **kwargs):
         return Response(
@@ -2431,7 +2496,7 @@ class RiskHeatMapView(APIView):
     Query params:
       ?scoring_model_id=...   (required)
     """
-    permission_classes = [HasPermission("view_audits")]
+    permission_classes = [ModuleAccess("risk_assessment", "read")]
 
     def get(self, request):
         from iams.risk_engine import RiskEngineError, heat_map
@@ -2461,7 +2526,7 @@ class GenerateAuditPlanView(APIView):
 
     Returns the created ``ApprovalRequest`` (chain auto-applied).
     """
-    permission_classes = [HasPermission("create_audits")]
+    permission_classes = [ModuleAccess("audit_plan", "edit")]
 
     def post(self, request):
         from iams.audit import record_audit_event
@@ -2509,7 +2574,7 @@ from iams.models import ReportJob  # noqa: E402
 from iams.domain_serializers import ReportJobSerializer  # noqa: E402
 
 
-class ReportJobViewSet(viewsets.ReadOnlyModelViewSet):
+class ReportJobViewSet(ModuleGatedMixin, viewsets.ReadOnlyModelViewSet):
     """List / inspect / download report jobs.
 
     Job creation goes through ``POST /api/reports/generate/`` so the
@@ -2518,7 +2583,7 @@ class ReportJobViewSet(viewsets.ReadOnlyModelViewSet):
     expire via a retention task in Phase 5).
     """
     serializer_class = ReportJobSerializer
-    permission_classes = [HasPermission("view_reports")]
+    module = "reports"
 
     def get_queryset(self):
         qs = ReportJob.objects.select_related("requested_by").all().order_by("-created_at")
@@ -2577,7 +2642,7 @@ class GenerateReportView(APIView):
     ``GET /api/reports/jobs/{id}/`` for status, or relies on the
     in-app notification dispatched when the task finishes.
     """
-    permission_classes = [HasPermission("view_reports")]
+    permission_classes = [ModuleAccess("reports", "read")]
 
     def post(self, request):
         from iams.audit import record_audit_event
@@ -2601,7 +2666,7 @@ class GenerateReportView(APIView):
         # need ``view_reports``.
         output_format = renderer_cls.output_format
         if output_format == ReportJob.FORMAT_XLSX:
-            if not HasPermission("export_reports").has_permission(request, self):
+            if not ModuleAccess("reports", "edit").has_permission(request, self):
                 return Response(
                     {"detail": "export_reports permission required for Excel exports."},
                     status=status.HTTP_403_FORBIDDEN,
@@ -2651,7 +2716,7 @@ class DashboardTrendsView(APIView):
 
     Query params: ?period=YoY|FY2026 (default YoY) &department=Finance
     """
-    permission_classes = [HasPermission("view_reports")]
+    permission_classes = [ModuleAccess("dashboards", "read")]
 
     def get(self, request):
         period = request.query_params.get("period") or "YoY"
@@ -2665,7 +2730,7 @@ class DashboardTrendsView(APIView):
 
 class DashboardRiskHeatmapByDepartmentView(APIView):
     """Department × risk-category aggregate of current EntityRiskScore rows."""
-    permission_classes = [HasPermission("view_reports")]
+    permission_classes = [ModuleAccess("dashboards", "read")]
 
     def get(self, request):
         key = _cache_key("risk-heatmap")
@@ -2675,7 +2740,7 @@ class DashboardRiskHeatmapByDepartmentView(APIView):
 
 class DashboardRatingSummaryView(APIView):
     """Rating rollups across QAIP / ICFR / CSA (FR-DASH-09)."""
-    permission_classes = [HasPermission("view_reports")]
+    permission_classes = [ModuleAccess("dashboards", "read")]
 
     def get(self, request):
         period = request.query_params.get("period")
@@ -2686,7 +2751,7 @@ class DashboardRatingSummaryView(APIView):
 
 class DashboardActivityView(APIView):
     """Recent activity feed (FR-DASH-05)."""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [ModuleAccess("dashboards", "read")]
 
     def get(self, request):
         limit = min(int(request.query_params.get("limit", 20)), 100)
@@ -2696,7 +2761,7 @@ class DashboardActivityView(APIView):
 
 class DashboardUpcomingAuditsView(APIView):
     """Upcoming audits (FR-DASH-06)."""
-    permission_classes = [HasPermission("view_audits")]
+    permission_classes = [ModuleAccess("dashboards", "read")]
 
     def get(self, request):
         limit = min(int(request.query_params.get("limit", 10)), 50)
@@ -2714,7 +2779,7 @@ class DashboardRoleView(APIView):
     Path: /api/dashboard/role/<role>/
     Roles: executive / manager / auditor / auditee
     """
-    permission_classes = [IsAuthenticated]
+    permission_classes = [ModuleAccess("dashboards", "read")]
 
     def get(self, request, role):
         role = (role or "").lower()

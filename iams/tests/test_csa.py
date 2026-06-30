@@ -379,20 +379,32 @@ def test_api_submit_rejected_when_not_owner_user_unauthenticated(
     assert res.status_code == 401
 
 
-def test_api_questionnaire_write_requires_manage_settings(
-    authed_client, audit_manager, super_admin
+def test_api_questionnaire_write_requires_engagements_edit(
+    authed_client, auditor_user, audit_manager, super_admin
 ):
-    """audit_manager doesn't have manage_settings — should get 403 on POST."""
-    payload = {"title": "Q1", "framework": "COSO", "version": "1.0", "status": "draft", "weakThreshold": 60}
-    res = authed_client(audit_manager).post(
-        "/api/csa/questionnaires/", payload, format="json"
+    """Phase 8: CSA questionnaires are gated to the engagements module.
+
+    A read-only engagements role (Auditor) is denied write; an editor
+    (Audit manager) and super_admin are allowed.
+    """
+    def payload(version):
+        return {"title": "Q1", "framework": "COSO", "version": version, "status": "draft", "weakThreshold": 60}
+
+    # Auditor has engagements=read only → 403.
+    res = authed_client(auditor_user).post(
+        "/api/csa/questionnaires/", payload("1.0"), format="json"
     )
     assert res.status_code == 403
-    # super_admin can
-    res2 = authed_client(super_admin).post(
-        "/api/csa/questionnaires/", payload, format="json"
+    # Audit manager has engagements=edit → 201.
+    res2 = authed_client(audit_manager).post(
+        "/api/csa/questionnaires/", payload("1.1"), format="json"
     )
     assert res2.status_code == 201
+    # super_admin can.
+    res3 = authed_client(super_admin).post(
+        "/api/csa/questionnaires/", payload("1.2"), format="json"
+    )
+    assert res3.status_code == 201
 
 
 def test_api_filter_responses_weak_only(

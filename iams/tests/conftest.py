@@ -16,7 +16,9 @@ from django.contrib.auth import get_user_model
 from rest_framework.test import APIClient
 from rest_framework_simplejwt.tokens import RefreshToken
 
-from iams.models import Permission, Role, UserProfile
+from iams.models import Module, Permission, Role, RoleModuleAccess, UserProfile
+from iams.rbac_matrix import MODULES
+from iams.tests._rbac import cells_from_keys as _cells_from_keys
 
 User = get_user_model()
 
@@ -73,7 +75,15 @@ def permissions(db) -> dict[str, Permission]:
 
 
 @pytest.fixture
-def roles(db, permissions) -> dict[str, Role]:
+def modules(db) -> dict[str, Module]:
+    return {
+        key: Module.objects.create(key=key, name=name, order=order)
+        for key, name, order in MODULES
+    }
+
+
+@pytest.fixture
+def roles(db, permissions, modules) -> dict[str, Role]:
     role_map: dict[str, Role] = {}
     for name, perm_keys in ROLE_DEFINITIONS.items():
         role = Role.objects.create(
@@ -81,6 +91,12 @@ def roles(db, permissions) -> dict[str, Role]:
             is_super_admin=(name == "Super Admin"),
         )
         role.permissions.set([permissions[k] for k in perm_keys])
+        # Seed the matrix cells the new HasPermission shim resolves against,
+        # reconstructed from the legacy key set so effective access is identical.
+        for module_key, level in _cells_from_keys(perm_keys).items():
+            RoleModuleAccess.objects.create(
+                role=role, module=modules[module_key], level=level
+            )
         role_map[name] = role
     return role_map
 

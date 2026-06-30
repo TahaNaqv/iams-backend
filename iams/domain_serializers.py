@@ -24,6 +24,7 @@ from iams.models import (
     EvidenceFile,
     Finding,
     FollowUpItem,
+    ManagementResponse,
     HoursBudget,
     Notification,
     NotificationPreference,
@@ -195,6 +196,28 @@ class CorrectiveActionWriteSerializer(serializers.ModelSerializer):
         fields = [
             "id", "title", "findingId", "owner", "dueDate", "status", "priority", "description", "progress", "department",
         ]
+
+
+class ManagementResponseSerializer(serializers.ModelSerializer):
+    findingId = serializers.UUIDField(source="finding_id", read_only=True)
+    findingTitle = serializers.CharField(source="finding.title", read_only=True)
+    authorId = serializers.UUIDField(source="author_ref_id", read_only=True)
+    createdAt = serializers.DateTimeField(source="created_at", read_only=True)
+
+    class Meta:
+        model = ManagementResponse
+        fields = [
+            "id", "findingId", "findingTitle", "department", "authorId",
+            "body", "status", "createdAt",
+        ]
+
+
+class ManagementResponseWriteSerializer(serializers.ModelSerializer):
+    findingId = serializers.PrimaryKeyRelatedField(source="finding", queryset=Finding.objects.all())
+
+    class Meta:
+        model = ManagementResponse
+        fields = ["id", "findingId", "department", "body", "status"]
 
 
 class ActivityItemSerializer(serializers.ModelSerializer):

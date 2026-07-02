@@ -452,6 +452,14 @@ class AuditableEntitySerializer(serializers.ModelSerializer):
         min_value=1,
         max_value=5,
     )
+    # Residual (post-control) position — read-only; always auto-rolled from
+    # the driving risk's residual likelihood/impact (no manual override).
+    residualLikelihood = serializers.IntegerField(
+        source="residual_likelihood", read_only=True, allow_null=True
+    )
+    residualImpact = serializers.IntegerField(
+        source="residual_impact", read_only=True, allow_null=True
+    )
 
     # ── FK relations: nested read, *Id write ──
     # ``department`` (free-text) and ``owner`` (free-text, defined further
@@ -524,6 +532,18 @@ class AuditableEntitySerializer(serializers.ModelSerializer):
     # ── Optimistic locking ──
     version = serializers.IntegerField(required=False)
 
+    # ── External provenance (ERP feed) ──
+    # Declared explicitly so they can be flipped writable on the trusted
+    # bulk-import path (see ``__init__``). Read-only on the public API. Kept
+    # optional/blank so the public read path and non-ERP imports don't require
+    # them.
+    external_source = serializers.CharField(
+        required=False, allow_blank=True, max_length=64
+    )
+    external_id = serializers.CharField(
+        required=False, allow_blank=True, max_length=128
+    )
+
     class Meta:
         model = AuditableEntity
         fields = [
@@ -550,6 +570,8 @@ class AuditableEntitySerializer(serializers.ModelSerializer):
             "customFields",
             "inherentLikelihood",
             "inherentImpact",
+            "residualLikelihood",
+            "residualImpact",
             "inherentScore",
             "likelihoodIsOverridden",
             "impactIsOverridden",
@@ -584,7 +606,42 @@ class AuditableEntitySerializer(serializers.ModelSerializer):
             "lastRevisionAt",
             "version",
         ]
-        read_only_fields = ["id", "external_source", "external_id"]
+        # ``status`` is lifecycle-controlled: it may only change through the
+        # dedicated archive/restore actions (which record a revision + metric),
+        # never via a plain PATCH — otherwise a client could archive/un-archive
+        # silently, bypassing the audit trail. ``external_source``/``external_id``
+        # are declared explicitly above and defaulted to read-only in
+        # ``__init__`` (writable only on the trusted bulk-import path).
+        read_only_fields = ["id", "status"]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # External-provenance keys are read-only on the public API but writable
+        # on the trusted bulk-import path, which keys idempotent ERP upserts off
+        # (external_source, external_id). The importer opts in via serializer
+        # context; every other caller gets the read-only default.
+        if not self.context.get("allow_external_write"):
+            for name in ("external_source", "external_id"):
+                if name in self.fields:
+                    self.fields[name].read_only = True
+        else:
+            # DRF auto-derives a UniqueTogetherValidator from the
+            # (external_source, external_id) UniqueConstraint; once those
+            # fields are writable it would force BOTH to be present on every
+            # row ("This field is required"), breaking imports of rows that
+            # carry no ERP keys. Drop it — the partial-unique DB constraint
+            # still guarantees uniqueness and the importer resolves conflicts
+            # via existence lookups + per-row savepoints.
+            from rest_framework.validators import UniqueTogetherValidator
+
+            self.validators = [
+                v
+                for v in self.validators
+                if not (
+                    isinstance(v, UniqueTogetherValidator)
+                    and set(v.fields) & {"external_source", "external_id"}
+                )
+            ]
 
     # ── Computed read fields ──
     def get_departmentRef(self, obj):
@@ -734,14 +791,28 @@ class AuditableEntitySerializer(serializers.ModelSerializer):
                 "nextAuditDate": "Next audit date cannot precede last audit date.",
             })
 
-        # Optimistic locking: if `version` supplied on update, it must match.
-        if self.instance is not None and "version" in attrs:
-            supplied = attrs.pop("version")
-            if supplied != self.instance.version:
+        # Optimistic locking. ``version`` is MANDATORY on updates: without it
+        # concurrent writers silently clobber each other (last-write-wins).
+        # We keep the supplied value in ``attrs`` so the view's
+        # ``perform_update`` can perform the authoritative check under a row
+        # lock (``SELECT … FOR UPDATE``); the serializer's ``update()`` then
+        # overwrites ``version`` with ``instance.version + 1``. A fast
+        # fail-early check against the (unlocked) instance gives a friendly
+        # error without waiting on the lock in the common case.
+        if self.instance is not None:
+            if "version" not in attrs:
+                raise serializers.ValidationError({
+                    "version": (
+                        "This field is required when updating "
+                        "(optimistic-locking guard)."
+                    ),
+                })
+            if attrs["version"] != self.instance.version:
                 raise serializers.ValidationError({
                     "version": (
                         f"Stale version: server has {self.instance.version}, "
-                        f"client sent {supplied}. Reload and re-apply your changes."
+                        f"client sent {attrs['version']}. Reload and re-apply "
+                        f"your changes."
                     ),
                 })
         elif "version" in attrs:
@@ -792,7 +863,7 @@ class AuditableEntityListSerializer(serializers.ModelSerializer):
     impactIsOverridden = serializers.BooleanField(source="impact_is_overridden")
     riskRatingIsOverridden = serializers.BooleanField(source="risk_rating_is_overridden")
     inherentScore = serializers.SerializerMethodField()
-    childCount = serializers.IntegerField(read_only=True, default=0)
+    childCount = serializers.IntegerField(source="_child_count", read_only=True, default=0)
     riskCount = serializers.IntegerField(source="_risk_count", read_only=True, default=0)
 
     class Meta:

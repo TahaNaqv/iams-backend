@@ -293,6 +293,9 @@ REST_FRAMEWORK = {
         "anon": "60/minute",
         "user": "300/minute",
         "auth_burst": "10/minute",
+        # Expensive audit-universe actions (bulk import, full recompute,
+        # export, whole-tree) get a tighter bucket than the generic user rate.
+        "audit_universe_heavy": "12/minute",
     },
     "DEFAULT_PAGINATION_CLASS": "iams.pagination.DefaultPagination",
     "PAGE_SIZE": 25,

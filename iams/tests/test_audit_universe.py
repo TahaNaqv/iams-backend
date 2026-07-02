@@ -27,6 +27,7 @@ from rest_framework import status
 from iams.models import (
     AuditableEntity,
     AuditableEntityRevision,
+    AuditLogEntry,
     BusinessUnit,
     EntityStatusChoices,
     RiskRatingChoices,
@@ -168,7 +169,6 @@ def test_optimistic_lock_rejects_stale_version(sa_client, entity_ap):
     "field,bad_value",
     [
         ("riskRating", "Extreme"),
-        ("status", "Banana"),
         ("entityType", "NotAType"),
         ("complianceStatus", "Pending"),
         ("auditFrequency", "Sometimes"),
@@ -184,6 +184,119 @@ def test_choice_validation_rejects_unknown_values(sa_client, finance_dept, field
     resp = sa_client.post("/api/auditable-entities/", payload, format="json")
     assert resp.status_code == status.HTTP_400_BAD_REQUEST, resp.content
     assert field in resp.json()
+
+
+@pytest.mark.django_db
+def test_entity_writes_populate_global_audit_log(sa_client, finance_dept):
+    """Create / update / archive each append an AuditLogEntry.
+
+    Regression guard: the viewset overrode perform_* without super(), so the
+    global admin audit trail had NO record of audit-universe changes.
+    """
+    resp = sa_client.post(
+        "/api/auditable-entities/",
+        {"name": "Trade Settlement", "departmentId": str(finance_dept.id), "riskRating": "Medium"},
+        format="json",
+    )
+    assert resp.status_code == status.HTTP_201_CREATED, resp.content
+    eid = resp.json()["id"]
+    ver = resp.json()["version"]
+
+    logs = AuditLogEntry.objects.filter(target_object_id=str(eid))
+    assert logs.filter(action=AuditLogEntry.ACTION_CREATE).exists()
+
+    sa_client.patch(
+        f"/api/auditable-entities/{eid}/",
+        {"riskRating": "High", "version": ver},
+        format="json",
+    )
+    assert logs.filter(action=AuditLogEntry.ACTION_UPDATE).exists()
+
+    sa_client.post(f"/api/auditable-entities/{eid}/archive/")
+    assert logs.filter(action="Archive").exists()
+
+
+@pytest.mark.django_db
+def test_tree_rollup_aggregates_child_risk_to_parent(sa_client, finance_dept):
+    """?rollup=true surfaces the worst rating anywhere in each subtree."""
+    parent = AuditableEntity.objects.create(
+        name="Ops", department_entity=finance_dept, risk_rating="Low",
+    )
+    child = AuditableEntity.objects.create(
+        name="Ops - Payments", parent=parent, risk_rating="Critical",
+    )
+    AuditableEntity.objects.create(
+        name="Ops - Filing", parent=parent, risk_rating="Medium",
+    )
+
+    # Without rollup: the parent reports only its own (Low) rating.
+    plain = sa_client.get(f"/api/auditable-entities/tree/?root={parent.id}").json()
+    assert "rolledUpRating" not in plain[0]
+
+    rolled = sa_client.get(
+        f"/api/auditable-entities/tree/?root={parent.id}&rollup=true"
+    ).json()
+    node = rolled[0]
+    assert node["riskRating"] == "Low"
+    assert node["rolledUpRating"] == "Critical"  # worst descendant wins
+    # Leaf keeps its own rating as its subtree roll-up.
+    payments = next(c for c in node["children"] if c["id"] == str(child.id))
+    assert payments["rolledUpRating"] == "Critical"
+
+
+@pytest.mark.django_db
+def test_entity_risk_rollup_fires_on_non_api_write(finance_dept):
+    """A risk written via the ORM (not the API) still re-rolls the entity.
+
+    The roll-up used to live only in the viewset; the signal now covers
+    admin / import / raw-ORM writes.
+    """
+    from iams.models import EntityRisk
+
+    entity = AuditableEntity.objects.create(name="Ledger", department_entity=finance_dept)
+    EntityRisk.objects.create(
+        entity=entity,
+        title="Manual JE risk",
+        inherent_likelihood=5,
+        inherent_impact=5,
+    )
+    entity.refresh_from_db()
+    assert entity.risk_rating == "Critical"
+    assert (entity.inherent_likelihood, entity.inherent_impact) == (5, 5)
+
+
+@pytest.mark.django_db
+def test_status_is_read_only_and_lifecycle_controlled(sa_client, finance_dept):
+    """``status`` cannot be set via create/PATCH — only archive/restore move it."""
+    # Create ignores a client-supplied status (defaults to Active).
+    resp = sa_client.post(
+        "/api/auditable-entities/",
+        {
+            "name": "Lifecycle",
+            "departmentId": str(finance_dept.id),
+            "riskRating": "Medium",
+            "status": "Archived",
+        },
+        format="json",
+    )
+    assert resp.status_code == status.HTTP_201_CREATED, resp.content
+    assert resp.json()["status"] == "Active"
+    eid = resp.json()["id"]
+
+    # A plain PATCH cannot archive — status is silently ignored, row stays Active.
+    ver = resp.json()["version"]
+    patched = sa_client.patch(
+        f"/api/auditable-entities/{eid}/",
+        {"status": "Archived", "version": ver},
+        format="json",
+    )
+    assert patched.status_code == status.HTTP_200_OK, patched.content
+    assert patched.json()["status"] == "Active"
+
+    # The archive action is the only way to change the lifecycle state.
+    archived = sa_client.post(f"/api/auditable-entities/{eid}/archive/")
+    assert archived.status_code == status.HTTP_200_OK, archived.content
+    assert archived.json()["status"] == "Archived"
 
 
 @pytest.mark.django_db
@@ -549,6 +662,44 @@ def test_manager_can_create_and_edit(manager_client, finance_dept):
     assert upd_resp.status_code == status.HTTP_200_OK
 
 
+@pytest.mark.django_db
+def test_auditor_cannot_patch_archive_or_delete(auditor_client, finance_dept):
+    """Read-level role is blocked from every write verb, not just create."""
+    e = AuditableEntity.objects.create(name="Locked", department_entity=finance_dept)
+    patch = auditor_client.patch(
+        f"/api/auditable-entities/{e.id}/",
+        {"riskRating": "High", "version": e.version},
+        format="json",
+    )
+    assert patch.status_code == status.HTTP_403_FORBIDDEN
+    archive = auditor_client.post(f"/api/auditable-entities/{e.id}/archive/")
+    assert archive.status_code == status.HTTP_403_FORBIDDEN
+    delete = auditor_client.delete(f"/api/auditable-entities/{e.id}/")
+    assert delete.status_code == status.HTTP_403_FORBIDDEN
+
+
+@pytest.mark.django_db
+def test_hard_delete_requires_full_not_just_edit(manager_client, sa_client, finance_dept):
+    """DELETE (hard) needs full access; an edit-level manager is blocked but
+    the archive action (edit-level) still works. Full-access admin can DELETE."""
+    e = AuditableEntity.objects.create(name="DeleteMe", department_entity=finance_dept)
+
+    # Manager has edit → can archive but NOT hard-delete (needs full).
+    assert manager_client.post(
+        f"/api/auditable-entities/{e.id}/archive/"
+    ).status_code == status.HTTP_200_OK
+    assert manager_client.delete(
+        f"/api/auditable-entities/{e.id}/"
+    ).status_code == status.HTTP_403_FORBIDDEN
+
+    # Super admin has full → DELETE (soft-delete → 204) succeeds on an
+    # active entity.
+    other = AuditableEntity.objects.create(name="DeleteMe2", department_entity=finance_dept)
+    assert sa_client.delete(
+        f"/api/auditable-entities/{other.id}/"
+    ).status_code == status.HTTP_204_NO_CONTENT
+
+
 # ══════════════════════════════════════════════════════════════════════
 # Business Units & Tags
 # ══════════════════════════════════════════════════════════════════════
@@ -785,12 +936,19 @@ def test_adding_risk_rolls_up_to_entity(sa_client, finance_dept):
 
 
 @pytest.mark.django_db
-def test_rollup_uses_residual_not_inherent(sa_client, finance_dept):
+def test_rollup_separates_inherent_and_residual(sa_client, finance_dept):
+    """Inherent (pre-control) and residual (post-control) roll up to their
+    own entity fields; the rating is banded from the residual position."""
     e = AuditableEntity.objects.create(name="AR", department_entity=finance_dept)
     _add_risk(sa_client, e.id, inherentLikelihood=5, inherentImpact=5,
               residualLikelihood=2, residualImpact=2)
     e.refresh_from_db()
-    assert (e.inherent_likelihood, e.inherent_impact, e.risk_rating) == (2, 2, "Low")
+    # Inherent columns carry the pre-control (5×5) position…
+    assert (e.inherent_likelihood, e.inherent_impact) == (5, 5)
+    # …residual columns carry the post-control (2×2) position…
+    assert (e.residual_likelihood, e.residual_impact) == (2, 2)
+    # …and the rating is banded from residual (2×2 = 4 → Low).
+    assert e.risk_rating == "Low"
 
 
 @pytest.mark.django_db

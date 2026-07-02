@@ -1,3 +1,4 @@
+from django.db import transaction
 from django.db.models import Count, Q
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
@@ -432,6 +433,18 @@ class AuditableEntityViewSet(ModuleGatedMixin, AuditedViewSetMixin, viewsets.Mod
         "export",
     )
 
+    # Expensive actions ride a tighter rate bucket (audit_universe_heavy)
+    # instead of the generic 300/min user throttle.
+    _HEAVY_ACTIONS = {"bulk_import", "recompute", "export", "tree"}
+
+    def get_throttles(self):
+        # Set the scope for heavy actions and defer to the configured throttle
+        # classes (DEFAULT_THROTTLE_CLASSES includes ScopedRateThrottle in
+        # prod; tests set it to [] so throttling stays off there).
+        if getattr(self, "action", None) in self._HEAVY_ACTIONS:
+            self.throttle_scope = "audit_universe_heavy"
+        return super().get_throttles()
+
     def finalize_response(self, request, response, *args, **kwargs):
         # Surface a RFC-8594-style ``Deprecation`` header on every read
         # response. Consumers (and external monitors) can spot which
@@ -469,6 +482,15 @@ class AuditableEntityViewSet(ModuleGatedMixin, AuditedViewSetMixin, viewsets.Mod
             ),
             _risk_count=Count("risks", distinct=True),
         )
+        # The full serializer walks each entity's risks (get_risks / roll-up),
+        # which is N+1 on retrieve and on a ``?fields=full`` list. Prefetch
+        # risks for those paths; the light list/tree projection doesn't need it.
+        wants_full = (
+            self.action == "retrieve"
+            or self.request.query_params.get("fields") == "full"
+        )
+        if wants_full:
+            qs = qs.prefetch_related("risks")
         return qs
 
     def get_serializer_class(self):
@@ -525,6 +547,13 @@ class AuditableEntityViewSet(ModuleGatedMixin, AuditedViewSetMixin, viewsets.Mod
         return snapshot
 
     def _record_revision(self, instance, before, comment=""):
+        """Append an immutable revision row and return the change-set.
+
+        Returns the field-level ``diff`` (``{field: {from, to}}``) on update,
+        or ``{"_initial": snapshot}`` on create, so callers can forward the
+        same change-set to the global ``AuditLogEntry`` trail. Returns ``None``
+        for a no-op update (idempotent PATCH) — no revision is written.
+        """
         after = self._capture_field_values(instance)
         diff = {}
         for key, new_val in after.items():
@@ -533,30 +562,65 @@ class AuditableEntityViewSet(ModuleGatedMixin, AuditedViewSetMixin, viewsets.Mod
                 diff[key] = {"from": old_val, "to": new_val}
         if not diff and before is not None:
             # No-op save (e.g. an idempotent PATCH); skip a noisy revision.
-            return
+            return None
+        changes = diff if before is not None else {"_initial": after}
         AuditableEntityRevision.objects.create(
             entity=instance,
             version=instance.version or 1,
             changed_by=self.request.user if self.request.user.is_authenticated else None,
-            changes=diff if before is not None else {"_initial": after},
+            changes=changes,
             comment=comment,
         )
+        return changes
 
     def perform_create(self, serializer):
-        instance = serializer.save()
-        self._record_revision(instance, before=None, comment="Created.")
+        # Entity write + immutable revision must commit together — a failure
+        # after the entity row is written must not leave a gap in the trail.
+        with transaction.atomic():
+            instance = serializer.save()
+            changes = self._record_revision(instance, before=None, comment="Created.")
+            self._audit_capture(
+                action=AuditLogEntry.ACTION_CREATE,
+                instance=instance,
+                changes=changes or {},
+            )
         self._bump_metric("created")
 
     def perform_update(self, serializer):
-        before = self._capture_field_values(serializer.instance)
-        instance = serializer.save()
-        self._record_revision(instance, before=before)
-        # Re-roll after the write so that clearing an override flag (Manual →
-        # Auto) immediately recomputes the affected field from the entity's
-        # risks. Respects any still-set overrides, and is a no-op when nothing
-        # changes.
-        from iams.risk_rollup import recompute_entity_risk_position
-        recompute_entity_risk_position(instance)
+        supplied_version = serializer.validated_data.get("version")
+        with transaction.atomic():
+            # Authoritative optimistic-lock check under a row lock. Re-read the
+            # target FOR UPDATE so two concurrent PATCHes serialize: the first
+            # commits (version → N+1) and releases the lock; the second then
+            # sees N+1 ≠ its supplied N and is rejected. Use a plain queryset
+            # (no Count annotations — a GROUP BY that PostgreSQL forbids with
+            # FOR UPDATE).
+            locked = AuditableEntity.all_objects.select_for_update().get(
+                pk=serializer.instance.pk
+            )
+            if supplied_version is not None and supplied_version != locked.version:
+                raise serializers.ValidationError({
+                    "version": (
+                        f"Stale version: server has {locked.version}, "
+                        f"client sent {supplied_version}. Reload and re-apply "
+                        f"your changes."
+                    ),
+                })
+            before = self._capture_field_values(serializer.instance)
+            instance = serializer.save()
+            changes = self._record_revision(instance, before=before)
+            if changes:
+                self._audit_capture(
+                    action=AuditLogEntry.ACTION_UPDATE,
+                    instance=instance,
+                    changes=changes,
+                )
+            # Re-roll after the write so that clearing an override flag
+            # (Manual → Auto) immediately recomputes the affected field from
+            # the entity's risks. Respects any still-set overrides, and is a
+            # no-op when nothing changes.
+            from iams.risk_rollup import recompute_entity_risk_position
+            recompute_entity_risk_position(instance)
         self._bump_metric("updated")
 
     @staticmethod
@@ -582,11 +646,17 @@ class AuditableEntityViewSet(ModuleGatedMixin, AuditedViewSetMixin, viewsets.Mod
 
     # ─── Soft-delete semantics ────────────────────────────────────────
     def perform_destroy(self, instance):
-        before = self._capture_field_values(instance)
-        instance.status = EntityStatusChoices.ARCHIVED
-        instance.version = (instance.version or 0) + 1
-        instance.save(update_fields=["status", "version", "updated_at"])
-        self._record_revision(instance, before=before, comment="Archived (DELETE).")
+        with transaction.atomic():
+            before = self._capture_field_values(instance)
+            instance.status = EntityStatusChoices.ARCHIVED
+            instance.version = (instance.version or 0) + 1
+            instance.save(update_fields=["status", "version", "updated_at"])
+            changes = self._record_revision(instance, before=before, comment="Archived (DELETE).")
+            self._audit_capture(
+                action=AuditLogEntry.ACTION_DELETE,
+                instance=instance,
+                changes=changes or {},
+            )
         self._bump_metric("archived")
 
     @action(detail=True, methods=["post"], url_path="archive")
@@ -597,30 +667,43 @@ class AuditableEntityViewSet(ModuleGatedMixin, AuditedViewSetMixin, viewsets.Mod
                 {"detail": "Entity is already archived."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        before = self._capture_field_values(instance)
-        instance.status = EntityStatusChoices.ARCHIVED
-        instance.version = (instance.version or 0) + 1
-        instance.save(update_fields=["status", "version", "updated_at"])
-        self._record_revision(instance, before=before, comment="Archived.")
+        with transaction.atomic():
+            before = self._capture_field_values(instance)
+            instance.status = EntityStatusChoices.ARCHIVED
+            instance.version = (instance.version or 0) + 1
+            instance.save(update_fields=["status", "version", "updated_at"])
+            changes = self._record_revision(instance, before=before, comment="Archived.")
+            self._audit_capture(
+                action="Archive",
+                instance=instance,
+                changes=changes or {},
+            )
         self._bump_metric("archived")
         return Response(self.get_serializer(instance).data)
 
     @action(detail=True, methods=["post"], url_path="restore")
     def restore(self, request, pk=None):
-        try:
-            instance = AuditableEntity.all_objects.get(pk=pk)
-        except AuditableEntity.DoesNotExist:
-            return Response(status=status.HTTP_404_NOT_FOUND)
+        # Look up in the archived-inclusive set, then run the standard
+        # object-permission hooks so restore can't bypass access control
+        # (every other detail action goes through get_object()).
+        instance = get_object_or_404(AuditableEntity.all_objects.all(), pk=pk)
+        self.check_object_permissions(request, instance)
         if instance.status != EntityStatusChoices.ARCHIVED:
             return Response(
                 {"detail": "Entity is not archived."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        before = self._capture_field_values(instance)
-        instance.status = EntityStatusChoices.ACTIVE
-        instance.version = (instance.version or 0) + 1
-        instance.save(update_fields=["status", "version", "updated_at"])
-        self._record_revision(instance, before=before, comment="Restored.")
+        with transaction.atomic():
+            before = self._capture_field_values(instance)
+            instance.status = EntityStatusChoices.ACTIVE
+            instance.version = (instance.version or 0) + 1
+            instance.save(update_fields=["status", "version", "updated_at"])
+            changes = self._record_revision(instance, before=before, comment="Restored.")
+            self._audit_capture(
+                action="Restore",
+                instance=instance,
+                changes=changes or {},
+            )
         return Response(self.get_serializer(instance).data)
 
     # ─── Hierarchy ────────────────────────────────────────────────────
@@ -638,8 +721,28 @@ class AuditableEntityViewSet(ModuleGatedMixin, AuditedViewSetMixin, viewsets.Mod
         except (TypeError, ValueError):
             depth = 5
         root_id = request.query_params.get("root")
+        want_rollup = request.query_params.get("rollup", "").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
 
+        # Bound the whole-universe projection so a large tree can't be
+        # materialized into memory (and recursively serialized) in one request.
+        # Callers must narrow with ``?root=`` or a filter past the cap.
+        MAX_TREE_NODES = 5000
         qs = self.filter_queryset(self.get_queryset())
+        if not root_id and qs.count() > MAX_TREE_NODES:
+            return Response(
+                {
+                    "detail": (
+                        f"Tree is too large to return in one request "
+                        f"(> {MAX_TREE_NODES} nodes). Narrow with ?root=<id> "
+                        f"or a filter."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         all_rows = list(qs)
         by_parent: dict = {}
         for row in all_rows:
@@ -648,8 +751,32 @@ class AuditableEntityViewSet(ModuleGatedMixin, AuditedViewSetMixin, viewsets.Mod
         for siblings in by_parent.values():
             siblings.sort(key=lambda r: (r.name or "").lower())
 
+        # Optional hierarchical roll-up: each node's ``rolledUpRating`` is the
+        # worst of its own rating and every descendant's — so a parent reflects
+        # the highest risk anywhere in its subtree. Computed over the FULL tree
+        # (independent of the display ``depth`` cap), memoized for O(n), and
+        # cycle-guarded against a corrupted ``parent`` loop.
+        from iams.risk_rollup import RATING_SEVERITY
+
+        rollup_memo: dict = {}
+
+        def subtree_rating(node, seen: frozenset):
+            if node.id in rollup_memo:
+                return rollup_memo[node.id]
+            worst = node.risk_rating
+            for child in by_parent.get(node.id, []):
+                if child.id in seen:
+                    continue
+                child_rating = subtree_rating(child, seen | {child.id})
+                if RATING_SEVERITY.get(child_rating, 0) > RATING_SEVERITY.get(worst, 0):
+                    worst = child_rating
+            rollup_memo[node.id] = worst
+            return worst
+
         def build(node, level):
             data = AuditableEntityListSerializer(node).data
+            if want_rollup:
+                data["rolledUpRating"] = subtree_rating(node, frozenset({node.id}))
             if level >= depth:
                 data["children"] = []
             else:
@@ -693,28 +820,40 @@ class AuditableEntityViewSet(ModuleGatedMixin, AuditedViewSetMixin, viewsets.Mod
     def clone(self, request, pk=None):
         src = self.get_object()
         new_name = request.data.get("name") or f"{src.name} (Copy)"
-        clone = AuditableEntity.objects.create(
-            name=new_name,
-            department=src.department,
-            department_entity=src.department_entity,
-            business_unit=src.business_unit,
-            entity_type=src.entity_type,
-            primary_owner=src.primary_owner,
-            secondary_owner=src.secondary_owner,
-            location=src.location,
-            audit_frequency=src.audit_frequency,
-            primary_language=src.primary_language,
-            headcount=src.headcount,
-            operating_budget=src.operating_budget,
-            estimated_man_days=src.estimated_man_days,
-            is_mandatory_to_audit=src.is_mandatory_to_audit,
-            cost_center_id="",  # cost centers should not collide
-            tags=list(src.tags or []),
-            description=src.description,
-            inherent_likelihood=src.inherent_likelihood,
-            inherent_impact=src.inherent_impact,
-            parent=src.parent,
-        )
+        with transaction.atomic():
+            clone = AuditableEntity.objects.create(
+                name=new_name,
+                department=src.department,
+                department_entity=src.department_entity,
+                business_unit=src.business_unit,
+                entity_type=src.entity_type,
+                primary_owner=src.primary_owner,
+                secondary_owner=src.secondary_owner,
+                location=src.location,
+                audit_frequency=src.audit_frequency,
+                primary_language=src.primary_language,
+                headcount=src.headcount,
+                operating_budget=src.operating_budget,
+                estimated_man_days=src.estimated_man_days,
+                is_mandatory_to_audit=src.is_mandatory_to_audit,
+                cost_center_id="",  # cost centers should not collide
+                tags=list(src.tags or []),
+                description=src.description,
+                inherent_likelihood=src.inherent_likelihood,
+                inherent_impact=src.inherent_impact,
+                parent=src.parent,
+            )
+            # A clone is a first-class create: give it a revision + audit trail
+            # so its provenance (cloned from which source) is recorded.
+            changes = self._record_revision(
+                clone, before=None, comment=f"Cloned from {src.name} ({src.id})."
+            )
+            self._audit_capture(
+                action=AuditLogEntry.ACTION_CREATE,
+                instance=clone,
+                changes=changes or {},
+            )
+        self._bump_metric("created")
         return Response(
             self.get_serializer(clone).data,
             status=status.HTTP_201_CREATED,
@@ -817,12 +956,39 @@ class AuditableEntityViewSet(ModuleGatedMixin, AuditedViewSetMixin, viewsets.Mod
                 status=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
             )
         name_lower = (uploaded.name or "").lower()
-        allowed = name_lower.endswith(".csv") or name_lower.endswith(".xlsx") or name_lower.endswith(".xlsm")
+        # Reject macro-enabled workbooks (.xlsm) — unnecessary attack surface;
+        # openpyxl won't run macros but we don't accept them at all.
+        allowed = name_lower.endswith(".csv") or name_lower.endswith(".xlsx")
         if not allowed:
             return Response(
                 {"detail": "Only .csv and .xlsx uploads are accepted."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+
+        # Content sniff: don't trust the extension alone. Verify the magic
+        # bytes match the declared type so a renamed binary (macro doc, PDF,
+        # executable) can't reach the parser as a .csv/.xlsx.
+        head = uploaded.read(8)
+        uploaded.seek(0)
+        is_xlsx = name_lower.endswith(".xlsx")
+        if is_xlsx and not head.startswith(b"PK\x03\x04"):
+            return Response(
+                {"detail": "File is not a valid .xlsx (Office Open XML) workbook."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if not is_xlsx:  # .csv must be text, not a container/binary
+            _BINARY_MAGICS = (
+                b"PK\x03\x04",       # zip / xlsx / docx
+                b"\xd0\xcf\x11\xe0",  # legacy OLE (.xls / .doc)
+                b"%PDF",              # pdf
+                b"\x7fELF",           # elf executable
+                b"MZ",               # windows executable
+            )
+            if any(head.startswith(m) for m in _BINARY_MAGICS):
+                return Response(
+                    {"detail": "CSV upload appears to be a binary file."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
 
         mode = request.data.get("mode") or BulkImportJob.MODE_LENIENT
         if mode not in (BulkImportJob.MODE_STRICT, BulkImportJob.MODE_LENIENT):
@@ -841,6 +1007,9 @@ class AuditableEntityViewSet(ModuleGatedMixin, AuditedViewSetMixin, viewsets.Mod
 
         # Dispatch async; tests run with CELERY_TASK_ALWAYS_EAGER so the
         # job completes inline. In production this hands off to a worker.
+        # (Content is validated up-front via the magic-byte sniff above; the
+        # parser never executes the file. A ClamAV pass would require adding
+        # scan_status/scanned_at to BulkImportJob — deferred.)
         from iams.tasks import process_bulk_import
         process_bulk_import.delay(str(job.id))
 
@@ -935,25 +1104,41 @@ class AuditableEntityViewSet(ModuleGatedMixin, AuditedViewSetMixin, viewsets.Mod
             return ""
         if isinstance(value, bool):
             return "true" if value else "false"
-        if isinstance(value, (int, float, str)):
+        if isinstance(value, (int, float)):
             return value
+        if isinstance(value, str):
+            return AuditableEntityViewSet._neutralize_formula(value)
         if hasattr(value, "isoformat"):
             return value.isoformat()
         if isinstance(value, (list, dict)):
             import json
-            return json.dumps(value)
-        return str(value)
+            return AuditableEntityViewSet._neutralize_formula(json.dumps(value))
+        return AuditableEntityViewSet._neutralize_formula(str(value))
+
+    # Leading characters that spreadsheet apps (Excel, Sheets, LibreOffice)
+    # treat as the start of a formula. A crafted cell like ``=cmd|'/c calc'!A0``
+    # would execute on open — CSV/formula injection. We prefix any such value
+    # with an apostrophe so it renders as literal text. Tab/CR/LF are also
+    # neutralized because they can smuggle a value into an adjacent cell.
+    _FORMULA_TRIGGERS = ("=", "+", "-", "@", "\t", "\r", "\n")
+
+    @classmethod
+    def _neutralize_formula(cls, value: str) -> str:
+        if value and value[0] in cls._FORMULA_TRIGGERS:
+            return "'" + value
+        return value
 
     @action(detail=False, methods=["post"], url_path="recompute-risk-scores")
     def recompute(self, request):
-        """Convenience action that delegates to the risk engine.
+        """Re-snapshot every entity scored against the active risk model.
 
-        Re-snapshots every entity scored against the active risk model.
-        Heavy work happens synchronously here; a future task migrates
-        this to a Celery job with a poll-able job id.
+        Dispatched to a Celery worker (``iams.tasks.risk_scores``) so a large
+        universe can't tie up the request thread; returns ``202 Accepted``.
+        Under the test settings Celery runs eagerly, so the work completes
+        inline before the response.
         """
         from iams.models import RiskScoringModel
-        from iams.risk_engine import recompute_all_scores_for_model
+        from iams.tasks.risk_scores import recompute_active_model_scores
 
         model = RiskScoringModel.objects.filter(is_active=True).first()
         if model is None:
@@ -961,8 +1146,15 @@ class AuditableEntityViewSet(ModuleGatedMixin, AuditedViewSetMixin, viewsets.Mod
                 {"detail": "No active risk-scoring model is configured."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        count = recompute_all_scores_for_model(model, by_user=request.user)
-        return Response({"recomputed": count, "modelId": str(model.id)})
+        async_result = recompute_active_model_scores.delay(str(request.user.pk))
+        return Response(
+            {
+                "status": "queued",
+                "modelId": str(model.id),
+                "taskId": str(getattr(async_result, "id", "")) or None,
+            },
+            status=status.HTTP_202_ACCEPTED,
+        )
 
     @action(detail=True, methods=["post"], url_path="reset-risk-overrides")
     def reset_risk_overrides(self, request, pk=None):
@@ -1013,26 +1205,22 @@ class EntityRiskViewSet(ModuleGatedMixin, AuditedViewSetMixin, viewsets.ModelVie
             qs = qs.filter(entity_id=entity_id)
         return qs
 
-    def _reroll(self, entity):
+    def _reroll_by_id(self, entity_id):
         from iams.risk_rollup import recompute_entity_risk_position
-        recompute_entity_risk_position(entity)
+        entity = AuditableEntity.all_objects.filter(pk=entity_id).first()
+        if entity is not None:
+            recompute_entity_risk_position(entity)
 
-    def perform_create(self, serializer):
-        risk = serializer.save()
-        self._reroll(risk.entity)
-
+    # NOTE: create/update/delete of a risk re-rolls the owning entity through
+    # the ``post_save``/``post_delete`` signal on ``EntityRisk`` (see
+    # ``iams/signals.py``) — which also covers admin/import/raw-ORM writes.
+    # We only handle the one case the signal can't: a risk *moved* to a
+    # different engagement leaves the OLD engagement needing a re-roll.
     def perform_update(self, serializer):
-        old_entity = serializer.instance.entity
+        old_entity_id = serializer.instance.entity_id
         risk = serializer.save()
-        # If the risk was moved to a different engagement, re-roll both.
-        if old_entity.id != risk.entity_id:
-            self._reroll(old_entity)
-        self._reroll(risk.entity)
-
-    def perform_destroy(self, instance):
-        entity = instance.entity
-        instance.delete()
-        self._reroll(entity)
+        if old_entity_id != risk.entity_id:
+            self._reroll_by_id(old_entity_id)
 
 
 class BusinessUnitViewSet(ModuleGatedMixin, AuditedViewSetMixin, viewsets.ModelViewSet):

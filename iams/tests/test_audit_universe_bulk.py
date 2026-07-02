@@ -80,6 +80,49 @@ def test_csv_import_creates_entities_with_lookups(sa_client, finance_dept):
 
 
 @pytest.mark.django_db
+def test_csv_import_upserts_idempotently_on_external_keys(sa_client, finance_dept):
+    """Re-importing the same (external source, id) updates the same row.
+
+    Regression guard: ``external_source`` / ``external_id`` used to be
+    read-only on the write serializer, so the importer silently dropped them
+    and every re-import created a duplicate. They must now persist and drive
+    the idempotent upsert.
+    """
+    header = ["Name", "Department", "Risk Rating", "External Source", "External ID"]
+    first = _csv_upload([header, ["Vendor Mgmt", "Finance", "Low", "erp", "V-100"]])
+    resp = sa_client.post(
+        "/api/auditable-entities/bulk-import/",
+        {"file": first, "mode": "lenient"},
+        format="multipart",
+    )
+    job = BulkImportJob.objects.get(pk=resp.json()["id"])
+    assert job.status == BulkImportJob.STATUS_COMPLETED, job.errors
+    assert job.created == 1
+
+    ent = AuditableEntity.objects.get(external_source="erp", external_id="V-100")
+    assert ent.name == "Vendor Mgmt"
+
+    # Re-import the SAME external key with a changed name + rating.
+    second = _csv_upload([header, ["Vendor Management", "Finance", "High", "erp", "V-100"]])
+    resp2 = sa_client.post(
+        "/api/auditable-entities/bulk-import/",
+        {"file": second, "mode": "lenient"},
+        format="multipart",
+    )
+    job2 = BulkImportJob.objects.get(pk=resp2.json()["id"])
+    assert job2.status == BulkImportJob.STATUS_COMPLETED, job2.errors
+    assert job2.created == 0
+    assert job2.updated == 1
+
+    # Exactly one row for that external key; it was updated in place.
+    matches = AuditableEntity.all_objects.filter(external_source="erp", external_id="V-100")
+    assert matches.count() == 1
+    ent.refresh_from_db()
+    assert ent.name == "Vendor Management"
+    assert ent.risk_rating == "High"
+
+
+@pytest.mark.django_db
 def test_csv_import_updates_existing_by_name(sa_client, finance_dept):
     AuditableEntity.objects.create(name="Treasury", department_entity=finance_dept, risk_rating="Medium")
     csv_file = _csv_upload([
@@ -152,6 +195,93 @@ def test_bulk_import_requires_a_file(sa_client):
 @pytest.mark.django_db
 def test_bulk_import_rejects_unknown_extension(sa_client):
     bad = SimpleUploadedFile("not_a_spreadsheet.txt", b"hello", content_type="text/plain")
+    resp = sa_client.post(
+        "/api/auditable-entities/bulk-import/",
+        {"file": bad, "mode": "lenient"},
+        format="multipart",
+    )
+    assert resp.status_code == status.HTTP_400_BAD_REQUEST
+
+
+def _xlsx_upload(rows: list[list[str]], name: str = "universe.xlsx") -> SimpleUploadedFile:
+    from openpyxl import Workbook
+
+    wb = Workbook()
+    ws = wb.active
+    for row in rows:
+        ws.append(row)
+    buf = io.BytesIO()
+    wb.save(buf)
+    return SimpleUploadedFile(
+        name,
+        buf.getvalue(),
+        content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+@pytest.mark.django_db
+def test_xlsx_import_creates_entities(sa_client, finance_dept):
+    xlsx = _xlsx_upload([
+        ["Name", "Department", "Risk Rating"],
+        ["Procurement", "Finance", "High"],
+        ["Treasury Ops", "Finance", "Medium"],
+    ])
+    resp = sa_client.post(
+        "/api/auditable-entities/bulk-import/",
+        {"file": xlsx, "mode": "lenient"},
+        format="multipart",
+    )
+    assert resp.status_code == status.HTTP_202_ACCEPTED, resp.content
+    job = BulkImportJob.objects.get(pk=resp.json()["id"])
+    assert job.status == BulkImportJob.STATUS_COMPLETED, job.errors
+    assert job.created == 2
+    assert AuditableEntity.objects.get(name="Procurement").risk_rating == "High"
+
+
+@pytest.mark.django_db
+def test_import_header_only_file_is_a_clean_noop(sa_client):
+    csv_file = _csv_upload([["Name", "Department", "Risk Rating"]])
+    resp = sa_client.post(
+        "/api/auditable-entities/bulk-import/",
+        {"file": csv_file, "mode": "lenient"},
+        format="multipart",
+    )
+    assert resp.status_code == status.HTTP_202_ACCEPTED, resp.content
+    job = BulkImportJob.objects.get(pk=resp.json()["id"])
+    assert job.total_rows == 0
+    assert job.created == 0
+    assert job.status == BulkImportJob.STATUS_COMPLETED
+
+
+@pytest.mark.django_db
+def test_bulk_import_rejects_macro_enabled_workbook(sa_client):
+    bad = SimpleUploadedFile("book.xlsm", b"PK\x03\x04junk", content_type="application/vnd.ms-excel.sheet.macroEnabled.12")
+    resp = sa_client.post(
+        "/api/auditable-entities/bulk-import/",
+        {"file": bad, "mode": "lenient"},
+        format="multipart",
+    )
+    assert resp.status_code == status.HTTP_400_BAD_REQUEST
+
+
+@pytest.mark.django_db
+def test_bulk_import_rejects_binary_renamed_as_csv(sa_client):
+    """A ZIP/PDF/executable renamed to .csv is caught by the magic-byte sniff."""
+    disguised = SimpleUploadedFile(
+        "payload.csv", b"PK\x03\x04\x14\x00\x00\x00", content_type="text/csv"
+    )
+    resp = sa_client.post(
+        "/api/auditable-entities/bulk-import/",
+        {"file": disguised, "mode": "lenient"},
+        format="multipart",
+    )
+    assert resp.status_code == status.HTTP_400_BAD_REQUEST
+    assert "binary" in resp.json()["detail"].lower()
+
+
+@pytest.mark.django_db
+def test_bulk_import_rejects_xlsx_that_is_not_a_zip(sa_client):
+    bad = SimpleUploadedFile("book.xlsx", b"not really xlsx", content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     resp = sa_client.post(
         "/api/auditable-entities/bulk-import/",
         {"file": bad, "mode": "lenient"},

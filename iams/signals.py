@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 
-from django.db.models.signals import post_save, pre_save
+from django.db.models.signals import post_delete, post_save, pre_save
 from django.dispatch import receiver
 from django.utils import timezone
 
@@ -20,8 +20,10 @@ from iams.models import (
     ApprovalStep,
     Audit,
     AuditAssignment,
+    AuditableEntity,
     AuditReport,
     CorrectiveAction,
+    EntityRisk,
     Finding,
     Notification,
 )
@@ -453,3 +455,40 @@ def _user_outbound_push(sender, instance, created: bool, **kwargs):
             "integration: outbound user push fan-out failed",
             extra={"user_id": str(instance.pk)},
         )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# EntityRisk change → re-roll the owning entity's risk position
+# ──────────────────────────────────────────────────────────────────────
+# The API viewset also re-rolls explicitly, but routing the roll-up through
+# a signal guarantees it happens no matter how the risk row was written —
+# Django admin, bulk import, a seed script, or a raw ORM ``.save()``. The
+# roll-up is idempotent (a no-op when nothing changed) so the double call on
+# the API path is harmless.
+def _reroll_entity_safe(entity_id) -> None:
+    if not entity_id:
+        return
+    from iams.risk_rollup import recompute_entity_risk_position
+
+    try:
+        entity = AuditableEntity.all_objects.get(pk=entity_id)
+    except AuditableEntity.DoesNotExist:
+        # The entity was hard-deleted and its risks cascaded — nothing to
+        # roll up. This is the common ``post_delete`` case during a cascade.
+        return
+    try:
+        recompute_entity_risk_position(entity)
+    except Exception:  # noqa: BLE001 — a roll-up failure must not break the write
+        logger.exception(
+            "risk roll-up failed for entity", extra={"entity_id": str(entity_id)}
+        )
+
+
+@receiver(post_save, sender=EntityRisk, dispatch_uid="iams_entity_risk_rollup_save")
+def _entity_risk_rollup_on_save(sender, instance, **kwargs):
+    _reroll_entity_safe(instance.entity_id)
+
+
+@receiver(post_delete, sender=EntityRisk, dispatch_uid="iams_entity_risk_rollup_delete")
+def _entity_risk_rollup_on_delete(sender, instance, **kwargs):
+    _reroll_entity_safe(instance.entity_id)

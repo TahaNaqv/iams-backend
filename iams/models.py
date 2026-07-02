@@ -821,8 +821,18 @@ class AuditableEntity(TimeStampedModel):
         choices=ComplianceStatusChoices.choices,
         default=ComplianceStatusChoices.NOT_ASSESSED,
     )
+    # Inherent (pre-control) position. Auto-rolled from the driving risk's
+    # INHERENT likelihood/impact unless the matching ``*_is_overridden`` flag
+    # is set. See ``iams.risk_rollup.recompute_entity_risk_position``.
     inherent_likelihood = models.PositiveSmallIntegerField(null=True, blank=True)
     inherent_impact = models.PositiveSmallIntegerField(null=True, blank=True)
+    # Residual (post-control) position. Always auto-rolled from the driving
+    # risk's RESIDUAL (effective) likelihood/impact — there is no manual
+    # override for residual; it reflects the current control environment.
+    # ``risk_rating`` is banded from this residual position (unless overridden
+    # or superseded by an active scoring model).
+    residual_likelihood = models.PositiveSmallIntegerField(null=True, blank=True)
+    residual_impact = models.PositiveSmallIntegerField(null=True, blank=True)
     # When False, the field is auto-computed by rolling up the entity's
     # ``EntityRisk`` line items (worst residual risk). When True, the value
     # was set manually and the roll-up leaves it untouched. See

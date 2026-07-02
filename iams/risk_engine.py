@@ -177,6 +177,7 @@ def record_score(
     factor_values: dict[str, Any],
     by_user: User | None = None,
     notes: str = "",
+    _skip_rank_rebuild: bool = False,
 ) -> EntityRiskScore:
     """Snapshot a new score row + flip ``is_current`` on the previous one.
 
@@ -213,8 +214,11 @@ def record_score(
         entity.risk_rating = "High"
         entity.save(update_fields=["risk_rating", "updated_at"])
 
-    # Rebuild ranks across all current scores for the model
-    recompute_ranks(model)
+    # Rebuild ranks across all current scores for the model. Skipped by the
+    # bulk recompute, which rebuilds once at the end instead of once per row
+    # (the per-row rebuild made ``recompute_all_scores_for_model`` O(n²)).
+    if not _skip_rank_rebuild:
+        recompute_ranks(model)
 
     return score
 
@@ -399,6 +403,9 @@ def recompute_all_scores_for_model(
             factor_values=row.factor_values,
             by_user=by_user,
             notes="Auto-recomputed after scoring-model update.",
+            _skip_rank_rebuild=True,
         )
         count += 1
+    # Rebuild ranks once for the whole set instead of once per row.
+    recompute_ranks(model)
     return count

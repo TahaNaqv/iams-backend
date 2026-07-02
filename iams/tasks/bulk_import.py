@@ -150,7 +150,7 @@ def _stream_rows(file_field) -> Iterable[dict]:
     name = (file_field.name or "").lower()
     file_field.open("rb")
     try:
-        if name.endswith(".xlsx") or name.endswith(".xlsm"):
+        if name.endswith(".xlsx"):
             from openpyxl import load_workbook
             wb = load_workbook(filename=file_field, read_only=True, data_only=True)
             ws = wb.active
@@ -260,6 +260,7 @@ def process_bulk_import(job_id: str) -> dict:
 
             serializer = AuditableEntitySerializer(
                 instance=instance, data=payload, partial=instance is not None,
+                context={"allow_external_write": True},
             )
             try:
                 if not serializer.is_valid():

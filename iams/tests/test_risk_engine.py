@@ -429,3 +429,23 @@ def test_api_recompute_endpoint(authed_client, super_admin, weighted_sum_model, 
     assert res.status_code == 200, res.content
     body = res.json()
     assert body["recomputed"] == 1
+
+
+@pytest.mark.django_db
+def test_audit_universe_recompute_is_async(authed_client, super_admin, weighted_sum_model, entity):
+    """The audit-universe recompute action queues a Celery task (202) and,
+    under eager mode, still re-snapshots the scored entities."""
+    from iams.models import EntityRiskScore
+
+    record_score(entity, model=weighted_sum_model, factor_values={"impact": 3, "likelihood": 3}, by_user=super_admin)
+    before = EntityRiskScore.objects.filter(entity=entity).count()
+
+    res = authed_client(super_admin).post("/api/auditable-entities/recompute-risk-scores/")
+    assert res.status_code == 202, res.content
+    body = res.json()
+    assert body["status"] == "queued"
+    assert body["modelId"] == str(weighted_sum_model.id)
+
+    # Eager Celery ran the task inline → a fresh snapshot exists.
+    assert EntityRiskScore.objects.filter(entity=entity).count() == before + 1
+    assert EntityRiskScore.objects.filter(entity=entity, is_current=True).count() == 1

@@ -310,6 +310,17 @@ def approval_request_approved_side_effects(sender, instance: ApprovalRequest, **
             # current schema — it just gates downstream operations. We
             # log it so the audit trail captures the transition.
             logger.info("workflow: audit plan %s approved", ref)
+        elif instance.type == "Risk Model Change":
+            # Governance gate: a scoring model only goes live once its change
+            # request is approved. Activating it (via model.save()) also
+            # deactivates any previously-active model — single global active.
+            from iams.models import RiskScoringModel
+
+            model = RiskScoringModel.objects.filter(pk=ref).first()
+            if model is not None and not model.is_active:
+                model.is_active = True
+                model.save(update_fields=["is_active", "updated_at"])
+                logger.info("workflow: risk scoring model %s activated via approval %s", ref, instance.pk)
     except Exception:  # noqa: BLE001
         logger.exception("workflow: post-approval side effect failed")
 

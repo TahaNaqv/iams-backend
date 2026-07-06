@@ -63,6 +63,16 @@ DEFAULT_CHAINS: list[dict] = [
             {"role": "Audit Manager", "sla_days": 7},
         ],
     },
+    {
+        "name": "Risk Model Change — default",
+        "request_type": "Risk Model Change",
+        "description": "CAE sign-off before a scoring model goes live (weights / "
+        "formula / activation change the whole risk-based plan).",
+        "chain": [
+            {"role": "Audit Manager", "sla_days": 3},
+            {"role": "CAE", "sla_days": 5},
+        ],
+    },
 ]
 
 

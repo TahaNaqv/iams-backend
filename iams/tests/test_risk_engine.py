@@ -109,23 +109,33 @@ def test_factor_scale_min_lt_max_constraint(db):
         RiskFactor.objects.create(code="x", name="X", scale_min=5, scale_max=5)
 
 
-def test_only_one_active_model_per_name(weighted_sum_model, factors):
-    from django.db import IntegrityError, transaction
-    with pytest.raises(IntegrityError), transaction.atomic():
-        RiskScoringModel.objects.create(
-            name="Default", version="1.1",
-            formula=RiskScoringModel.FORMULA_WEIGHTED_SUM,
-            is_active=True,
-        )
+def test_activating_a_model_deactivates_the_previous_same_name(weighted_sum_model, factors):
+    # Enterprise invariant: at most ONE active scoring model globally.
+    # Publishing a new version of the same model deactivates the old one
+    # instead of raising — the org always has a single deterministic model.
+    new = RiskScoringModel.objects.create(
+        name="Default", version="1.1",
+        formula=RiskScoringModel.FORMULA_WEIGHTED_SUM,
+        is_active=True,
+    )
+    weighted_sum_model.refresh_from_db()
+    assert new.is_active is True
+    assert weighted_sum_model.is_active is False
+    assert RiskScoringModel.objects.filter(is_active=True).count() == 1
 
 
-def test_different_name_active_allowed(weighted_sum_model):
-    # Same active flag, different name → OK
-    RiskScoringModel.objects.create(
+def test_activating_a_different_name_model_deactivates_the_other(weighted_sum_model):
+    # Global single-active: a different-name model going active must also
+    # deactivate the previously active one (not coexist).
+    other = RiskScoringModel.objects.create(
         name="Other", version="1.0",
         formula=RiskScoringModel.FORMULA_WEIGHTED_SUM,
         is_active=True,
     )
+    weighted_sum_model.refresh_from_db()
+    assert other.is_active is True
+    assert weighted_sum_model.is_active is False
+    assert RiskScoringModel.objects.filter(is_active=True).count() == 1
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -423,12 +433,29 @@ def test_api_endpoints_require_view_audits(authed_client, db, roles):
 
 def test_api_recompute_endpoint(authed_client, super_admin, weighted_sum_model, entity):
     record_score(entity, model=weighted_sum_model, factor_values={"impact": 3, "likelihood": 3}, by_user=super_admin)
+    # A recompute only re-snapshots rows whose composite / high-risk band
+    # actually changed (idempotent by design). Lower the threshold so the
+    # stored 50-composite row flips to high-risk and is genuinely re-scored.
+    RiskScoringModel.objects.filter(pk=weighted_sum_model.id).update(
+        high_risk_threshold=Decimal("40")
+    )
     res = authed_client(super_admin).post(
         f"/api/risk/models/{weighted_sum_model.id}/recompute/"
     )
     assert res.status_code == 200, res.content
     body = res.json()
     assert body["recomputed"] == 1
+
+
+def test_api_recompute_is_idempotent_when_unchanged(authed_client, super_admin, weighted_sum_model, entity):
+    # Re-running recompute with no model change re-snapshots nothing —
+    # history no longer doubles on every click.
+    record_score(entity, model=weighted_sum_model, factor_values={"impact": 3, "likelihood": 3}, by_user=super_admin)
+    res = authed_client(super_admin).post(
+        f"/api/risk/models/{weighted_sum_model.id}/recompute/"
+    )
+    assert res.status_code == 200, res.content
+    assert res.json()["recomputed"] == 0
 
 
 @pytest.mark.django_db
@@ -439,6 +466,11 @@ def test_audit_universe_recompute_is_async(authed_client, super_admin, weighted_
 
     record_score(entity, model=weighted_sum_model, factor_values={"impact": 3, "likelihood": 3}, by_user=super_admin)
     before = EntityRiskScore.objects.filter(entity=entity).count()
+    # Change the model so the recompute has real work to do (idempotent
+    # otherwise — see test_api_recompute_is_idempotent_when_unchanged).
+    RiskScoringModel.objects.filter(pk=weighted_sum_model.id).update(
+        high_risk_threshold=Decimal("40")
+    )
 
     res = authed_client(super_admin).post("/api/auditable-entities/recompute-risk-scores/")
     assert res.status_code == 202, res.content

@@ -17,6 +17,7 @@ from .notify import (
 )
 from .dashboards import refresh_dashboard_caches
 from .bulk_import import process_bulk_import
+from .risk_assessment_import import process_risk_assessment_import
 from .reports import generate_report
 from .scans import scan_uploaded_file
 from .workflows import escalate_overdue_steps
@@ -31,4 +32,5 @@ __all__ = [
     "generate_report",
     "refresh_dashboard_caches",
     "process_bulk_import",
+    "process_risk_assessment_import",
 ]

@@ -23,7 +23,7 @@ import django_filters
 from django.db import connection
 from django.db.models import Q
 
-from iams.models import AuditableEntity, BusinessUnit, Tag
+from iams.models import AuditableEntity, BusinessUnit, EntityRisk, Tag
 
 
 def _tag_match_q(tag: str) -> Q:
@@ -225,3 +225,30 @@ class TagFilter(django_filters.FilterSet):
     class Meta:
         model = Tag
         fields: list[str] = []
+
+
+class EntityRiskFilter(django_filters.FilterSet):
+    """Filter the discrete-risk register by its key dimensions.
+
+    ``entity`` keeps the original single-UUID contract; the multi-value
+    ``category``/``status``/``riskResponse`` filters accept a comma-separated
+    list (``?status=Open,Mitigated``). ``q`` searches title + description.
+    """
+
+    entity = django_filters.UUIDFilter(field_name="entity_id")
+    owner = django_filters.UUIDFilter(field_name="owner_id")
+    category = CSVCharFilter(field_name="category", lookup_expr="in")
+    status = CSVCharFilter(field_name="status", lookup_expr="in")
+    riskResponse = CSVCharFilter(field_name="risk_response", lookup_expr="in")
+    q = django_filters.CharFilter(method="filter_q")
+
+    class Meta:
+        model = EntityRisk
+        fields: list[str] = []
+
+    def filter_q(self, queryset, name, value):
+        if not value:
+            return queryset
+        return queryset.filter(
+            Q(title__icontains=value) | Q(description__icontains=value)
+        )

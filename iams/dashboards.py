@@ -213,6 +213,7 @@ def risk_heatmap_by_department() -> dict[str, Any]:
       - Low:        < 40
     """
     from iams.models import AuditableEntity, EntityRiskScore
+    from iams.risk_engine import band_for_composite
 
     rows = (
         EntityRiskScore.objects
@@ -223,15 +224,8 @@ def risk_heatmap_by_department() -> dict[str, Any]:
     buckets: dict[str, dict[str, int]] = {}
     for row in rows:
         dept = row["entity__department"] or "—"
-        score = float(row["composite_score"] or 0)
-        if score >= 80:
-            cat = "Critical"
-        elif score >= 60:
-            cat = "High"
-        elif score >= 40:
-            cat = "Medium"
-        else:
-            cat = "Low"
+        # Canonical composite banding (see risk_engine.COMPOSITE_BANDS).
+        cat = band_for_composite(row["composite_score"])
         buckets.setdefault(dept, {"Critical": 0, "High": 0, "Medium": 0, "Low": 0})
         buckets[dept][cat] += 1
 

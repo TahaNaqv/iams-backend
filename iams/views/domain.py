@@ -108,6 +108,7 @@ from iams.audit import AuditedViewSetMixin
 from iams.filters import (
     AuditableEntityFilter,
     BusinessUnitFilter,
+    EntityRiskFilter,
     TagFilter,
 )
 from iams.permissions import (
@@ -614,6 +615,19 @@ class AuditableEntityViewSet(ModuleGatedMixin, AuditedViewSetMixin, viewsets.Mod
                     action=AuditLogEntry.ACTION_UPDATE,
                     instance=instance,
                     changes=changes,
+                )
+            # A *manual* rating change (user override) must also land in the
+            # RiskHistoryEntry trail — otherwise history reflects only
+            # roll-up-driven changes and silently misses manual overrides.
+            if changes and "risk_rating" in changes:
+                rating_change = changes["risk_rating"]
+                RiskHistoryEntry.objects.create(
+                    entity=instance.name,
+                    entity_ref=instance,
+                    date=timezone.now().date(),
+                    previous_rating=rating_change.get("from") or "",
+                    current_rating=rating_change.get("to") or "",
+                    reason="Manual rating override",
                 )
             # Re-roll after the write so that clearing an override flag
             # (Manual → Auto) immediately recomputes the affected field from
@@ -1195,15 +1209,25 @@ class EntityRiskViewSet(ModuleGatedMixin, AuditedViewSetMixin, viewsets.ModelVie
     """
 
     serializer_class = EntityRiskSerializer
+    filterset_class = EntityRiskFilter
+    search_fields = ["title", "description"]
+    ordering_fields = [
+        "title",
+        "category",
+        "status",
+        "risk_response",
+        "target_date",
+        "created_at",
+        "updated_at",
+    ]
     ordering = ["-created_at"]
     module = "audit_universe"
 
     def get_queryset(self):
-        qs = EntityRisk.objects.select_related("entity", "owner").all()
-        entity_id = self.request.query_params.get("entity")
-        if entity_id:
-            qs = qs.filter(entity_id=entity_id)
-        return qs
+        # Filtering (incl. the original ``?entity=`` contract) is handled by
+        # ``EntityRiskFilter``; this method only sets up the base queryset and
+        # the select_related joins the serializer needs.
+        return EntityRisk.objects.select_related("entity", "owner").all()
 
     def _reroll_by_id(self, entity_id):
         from iams.risk_rollup import recompute_entity_risk_position
@@ -1217,9 +1241,12 @@ class EntityRiskViewSet(ModuleGatedMixin, AuditedViewSetMixin, viewsets.ModelVie
     # We only handle the one case the signal can't: a risk *moved* to a
     # different engagement leaves the OLD engagement needing a re-roll.
     def perform_update(self, serializer):
+        # Capture the pre-save owning entity, then delegate to the audited
+        # mixin so the edit is recorded in the AuditLogEntry trail (a bare
+        # ``serializer.save()`` here previously bypassed auditing entirely).
         old_entity_id = serializer.instance.entity_id
-        risk = serializer.save()
-        if old_entity_id != risk.entity_id:
+        super().perform_update(serializer)
+        if old_entity_id != serializer.instance.entity_id:
             self._reroll_by_id(old_entity_id)
 
 
@@ -1284,9 +1311,26 @@ class AuditableEntityRevisionViewSet(ModuleGatedMixin, viewsets.ReadOnlyModelVie
 
 
 class RiskHistoryViewSet(ModuleGatedMixin, viewsets.ReadOnlyModelViewSet):
-    queryset = RiskHistoryEntry.objects.all()
+    """Read-only rating-change history.
+
+    Filter by ``?entity=<uuid>`` (the owning entity) or ``?currentRating=`` /
+    ``?previousRating=``; order by ``date`` (default) or ``createdAt``.
+    """
+
+    queryset = RiskHistoryEntry.objects.select_related("entity_ref").all()
     serializer_class = RiskHistoryEntrySerializer
+    filterset_fields = ["current_rating", "previous_rating"]
+    ordering_fields = ["date", "created_at"]
+    ordering = ["-date"]
+    search_fields = ["entity", "reason"]
     module = "audit_universe"
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        entity_id = self.request.query_params.get("entity")
+        if entity_id:
+            qs = qs.filter(entity_ref_id=entity_id)
+        return qs
 
 
 class NotificationViewSet(viewsets.ReadOnlyModelViewSet):
@@ -1533,6 +1577,111 @@ class RiskAssessmentViewSet(ModuleGatedMixin, AuditedViewSetMixin, viewsets.Mode
         if department:
             qs = qs.filter(department=department)
         return qs
+
+    @action(
+        detail=False,
+        methods=["post"],
+        url_path="import",
+        parser_classes=[MultiPartParser, FormParser],
+    )
+    def import_workbook(self, request):
+        """Kick off an async Risk-Assessment-Workbook import (CSV / XLSX).
+
+        Form fields: ``file`` (≤25 MB), ``mode`` (strict|lenient),
+        ``linkToEngine`` (bool — also create/update EntityRisk rows).
+        Returns a ``RiskAssessmentImportJob``; poll
+        ``/api/risk-assessment-import-jobs/{id}/`` for status + issues.
+        """
+        from iams.models import RiskAssessmentImportJob
+        from iams.domain_serializers import RiskAssessmentImportJobSerializer
+
+        uploaded = request.FILES.get("file")
+        if not uploaded:
+            return Response({"detail": "Missing required `file` upload."}, status=status.HTTP_400_BAD_REQUEST)
+        if uploaded.size > 25 * 1024 * 1024:
+            return Response({"detail": "Upload exceeds the 25 MB limit."}, status=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE)
+        name_lower = (uploaded.name or "").lower()
+        if not (name_lower.endswith(".csv") or name_lower.endswith(".xlsx")):
+            return Response({"detail": "Only .csv and .xlsx uploads are accepted."}, status=status.HTTP_400_BAD_REQUEST)
+        # Magic-byte sniff — don't trust the extension (mirrors bulk-import).
+        head = uploaded.read(8)
+        uploaded.seek(0)
+        is_xlsx = name_lower.endswith(".xlsx")
+        if is_xlsx and not head.startswith(b"PK\x03\x04"):
+            return Response({"detail": "File is not a valid .xlsx workbook."}, status=status.HTTP_400_BAD_REQUEST)
+        if not is_xlsx and any(head.startswith(m) for m in (b"PK\x03\x04", b"\xd0\xcf\x11\xe0", b"%PDF", b"\x7fELF", b"MZ")):
+            return Response({"detail": "CSV upload appears to be a binary file."}, status=status.HTTP_400_BAD_REQUEST)
+
+        mode = request.data.get("mode") or RiskAssessmentImportJob.MODE_LENIENT
+        if mode not in (RiskAssessmentImportJob.MODE_STRICT, RiskAssessmentImportJob.MODE_LENIENT):
+            return Response({"detail": "Invalid mode; expected 'strict' or 'lenient'."}, status=status.HTTP_400_BAD_REQUEST)
+        link = str(request.data.get("linkToEngine", "")).strip().lower() in ("1", "true", "yes", "on")
+
+        job = RiskAssessmentImportJob.objects.create(
+            file=uploaded, file_name=uploaded.name or "", mode=mode, link_to_engine=link,
+            requested_by=request.user if request.user.is_authenticated else None,
+            status=RiskAssessmentImportJob.STATUS_PENDING,
+        )
+        from iams.tasks import process_risk_assessment_import
+        process_risk_assessment_import.delay(str(job.id))
+        return Response(RiskAssessmentImportJobSerializer(job).data, status=status.HTTP_202_ACCEPTED)
+
+    @action(detail=False, methods=["get"], url_path="export")
+    def export(self, request):
+        """Stream the filtered records as CSV (formula-injection-safe)."""
+        import csv as _csv
+        from django.http import StreamingHttpResponse
+
+        qs = self.get_queryset()
+        columns = [
+            ("department", "department"), ("risk_area", "riskArea"),
+            ("risk_description", "riskDescription"), ("likelihood", "likelihood"),
+            ("impact", "impact"), ("inherent_risk", "inherentRisk"),
+            ("residual_risk", "residualRisk"), ("control_effectiveness", "controlEffectiveness"),
+            ("inclusion_status", "inclusionStatus"), ("planned_man_days", "plannedManDays"),
+        ]
+
+        class Echo:
+            def write(self, value):
+                return value
+
+        writer = _csv.writer(Echo())
+
+        def rows():
+            yield writer.writerow([c[1] for c in columns])
+            for rec in qs.iterator(chunk_size=500):
+                yield writer.writerow([
+                    AuditableEntityViewSet._neutralize_formula(str(getattr(rec, c[0]) or ""))
+                    for c in columns
+                ])
+
+        resp = StreamingHttpResponse(rows(), content_type="text/csv")
+        resp["Content-Disposition"] = 'attachment; filename="risk-assessment.csv"'
+        return resp
+
+
+class RiskAssessmentImportJobViewSet(ModuleGatedMixin, viewsets.ReadOnlyModelViewSet):
+    """Poll-only viewset for workbook-import progress + issues.
+
+    Users see their own jobs; staff / super-admin see all.
+    """
+
+    module = "risk_assessment"
+
+    def get_serializer_class(self):
+        from iams.domain_serializers import RiskAssessmentImportJobSerializer
+        return RiskAssessmentImportJobSerializer
+
+    def get_queryset(self):
+        from iams.models import RiskAssessmentImportJob
+        qs = RiskAssessmentImportJob.objects.prefetch_related("issues").select_related("requested_by").all()
+        u = self.request.user
+        if getattr(u, "is_superuser", False) or getattr(u, "is_staff", False):
+            return qs
+        profile = getattr(u, "profile", None)
+        if profile and profile.role and profile.role.is_super_admin:
+            return qs
+        return qs.filter(requested_by=u)
 
 
 class RiskAssessmentSheetsViewSet(ModuleGatedMixin, viewsets.ReadOnlyModelViewSet):
@@ -2551,6 +2700,58 @@ class RiskScoringModelViewSet(ModuleGatedMixin, AuditedViewSetMixin, viewsets.Mo
         )
         return Response({"recomputed": n})
 
+    @action(detail=True, methods=["post"], url_path="publish")
+    def publish(self, request, pk=None):
+        """Raise a governance approval to take this scoring model live.
+
+        The model does NOT activate here — it flips ``is_active`` only when the
+        "Risk Model Change" approval chain completes (see
+        ``iams/signals.py::approval_request_approved_side_effects``). This is
+        the single sanctioned path to activation; direct ``isActive`` writes
+        are rejected by the serializer.
+        """
+        from iams.audit import record_audit_event
+        from iams.risk_engine import next_model_version
+
+        model = self.get_object()
+        if model.is_active:
+            return Response(
+                {"detail": "Model is already active."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        # A model that already produced scores becomes a new version on
+        # re-publish — historical composites remain reproducible via
+        # ``EntityRiskScore.model_snapshot``.
+        if model.entity_scores.filter(is_current=True).exists():
+            model.version = next_model_version(model.version)
+            model.save(update_fields=["version", "updated_at"])
+        submitter = getattr(request.user, "email", "") or request.user.get_username()
+        req = ApprovalRequest.objects.create(
+            title=f"Activate risk scoring model: {model.name} v{model.version}",
+            type="Risk Model Change",
+            reference_id=str(model.id),
+            department="Internal Audit",
+            submitted_by=submitter,
+            submitted_date=timezone.now().date(),
+            current_step=0,
+            priority="High",
+            description=(
+                f"Requesting activation of scoring model '{model.name}' "
+                f"v{model.version} ({model.formula}, high-risk threshold "
+                f"{model.high_risk_threshold}). Approving it takes the model "
+                f"live and deactivates the current one."
+            ),
+            status="Pending",
+        )
+        record_audit_event(
+            action=AuditLogEntry.ACTION_OTHER,
+            actor=request.user,
+            target=model,
+            details={"event": "risk_model_publish_requested", "approvalRequestId": str(req.id)},
+            request=request,
+        )
+        return Response(ApprovalRequestSerializer(req).data, status=status.HTTP_201_CREATED)
+
 
 class RiskFactorWeightViewSet(ModuleGatedMixin, AuditedViewSetMixin, viewsets.ModelViewSet):
     """Per-model factor weights, attached via the through-model."""
@@ -2721,11 +2922,18 @@ class GenerateAuditPlanView(APIView):
         from iams.risk_engine import RiskEngineError, generate_audit_plan_draft
 
         model_id = request.data.get("scoringModelId")
-        year = request.data.get("year")
-        top_n = int(request.data.get("topN") or 20)
-        if not model_id or not year:
+        if not model_id or request.data.get("year") in (None, ""):
             return Response(
                 {"detail": "scoringModelId and year are required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        # Coerce numeric inputs defensively — bad input is a 400, not a 500.
+        try:
+            year = int(request.data.get("year"))
+            top_n = int(request.data.get("topN") or 20)
+        except (TypeError, ValueError):
+            return Response(
+                {"detail": "year and topN must be integers."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
         try:
@@ -2734,7 +2942,7 @@ class GenerateAuditPlanView(APIView):
             return Response({"detail": "scoring model not found."}, status=status.HTTP_404_NOT_FOUND)
         try:
             req = generate_audit_plan_draft(
-                model=model, year=int(year), top_n=top_n,
+                model=model, year=year, top_n=top_n,
                 requested_by=request.user,
             )
         except RiskEngineError as exc:

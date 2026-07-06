@@ -987,6 +987,47 @@ class EntityRisk(TimeStampedModel):
         indexes = [
             models.Index(fields=["entity", "status"], name="entity_risk_status_idx"),
         ]
+        constraints = [
+            # 1–5 bounds enforced at the DB level (validators only fire on
+            # ``full_clean`` — admin / import / raw ORM writes bypass them).
+            models.CheckConstraint(
+                condition=models.Q(inherent_likelihood__gte=1, inherent_likelihood__lte=5),
+                name="iams_entity_risk_inherent_l_1_5",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(inherent_impact__gte=1, inherent_impact__lte=5),
+                name="iams_entity_risk_inherent_i_1_5",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(residual_likelihood__isnull=True)
+                    | models.Q(residual_likelihood__gte=1, residual_likelihood__lte=5)
+                ),
+                name="iams_entity_risk_residual_l_1_5",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(residual_impact__isnull=True)
+                    | models.Q(residual_impact__gte=1, residual_impact__lte=5)
+                ),
+                name="iams_entity_risk_residual_i_1_5",
+            ),
+            # Residual (post-control) risk never exceeds inherent (pre-control).
+            models.CheckConstraint(
+                condition=(
+                    models.Q(residual_likelihood__isnull=True)
+                    | models.Q(residual_likelihood__lte=models.F("inherent_likelihood"))
+                ),
+                name="iams_entity_risk_residual_l_lte_inherent",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(residual_impact__isnull=True)
+                    | models.Q(residual_impact__lte=models.F("inherent_impact"))
+                ),
+                name="iams_entity_risk_residual_i_lte_inherent",
+            ),
+        ]
 
     # ── Derived helpers ────────────────────────────────────────────────
     @property
@@ -1143,6 +1184,15 @@ class AuditableEntityRevision(TimeStampedModel):
 
 
 class RiskHistoryEntry(TimeStampedModel):
+    """Append-only trail of an entity's risk-rating changes.
+
+    Written by the roll-up (``iams.risk_rollup.recompute_entity_risk_position``)
+    and by manual rating overrides. Like :class:`AuditableEntityRevision`, rows
+    are immutable once written — ``save`` (post-insert) and ``delete`` are
+    rejected to preserve audit-trail integrity, and a DB trigger enforces the
+    same on Postgres for non-ORM writers.
+    """
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     entity = models.CharField(max_length=255)
     entity_ref = models.ForeignKey(
@@ -1155,6 +1205,23 @@ class RiskHistoryEntry(TimeStampedModel):
 
     class Meta:
         ordering = ["-date"]
+        indexes = [
+            models.Index(fields=["entity_ref", "-date"], name="risk_hist_entity_date_idx"),
+        ]
+
+    def save(self, *args, **kwargs):
+        # UUID PKs are populated by ``default=`` before save, so guard on
+        # ``_state.adding`` rather than ``pk is not None``.
+        if not self._state.adding:
+            raise PermissionError(
+                "RiskHistoryEntry is append-only; updates are not permitted."
+            )
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise PermissionError(
+            "RiskHistoryEntry is append-only; deletes are not permitted."
+        )
 
 
 class Notification(TimeStampedModel):
@@ -1466,6 +1533,18 @@ class RiskAssessmentRecord(TimeStampedModel):
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     sheet = models.ForeignKey(RiskAssessmentSheet, on_delete=models.SET_NULL, null=True, blank=True, related_name="records")
+    # ── Engine integration (Phase 8) ──────────────────────────────────
+    # Optional links into the live risk engine so a workbook row can drive a
+    # real ``EntityRisk`` (and thus the entity roll-up) instead of being a
+    # standalone island. Resolved from ``department`` on import.
+    entity = models.ForeignKey(
+        "AuditableEntity", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="risk_assessment_records",
+    )
+    entity_risk = models.ForeignKey(
+        "EntityRisk", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="risk_assessment_records",
+    )
     source_sheet = models.CharField(max_length=255, blank=True)
     source_row = models.PositiveIntegerField(default=0)
     department = models.CharField(max_length=200)
@@ -1508,10 +1587,72 @@ class RiskAssessmentSummaryItem(TimeStampedModel):
     planned_man_days = models.DecimalField(max_digits=6, decimal_places=2, default=0)
 
 
+class RiskAssessmentImportJob(TimeStampedModel):
+    """One async Risk-Assessment-Workbook import request.
+
+    Mirrors :class:`BulkImportJob` (same status / mode / counter contract) but
+    is workbook-shaped: a single upload fans out across many worksheets and
+    produces sheets, records, matrix cells and summary items rather than a flat
+    entity list. Per-row problems are captured as scoped
+    :class:`RiskAssessmentImportIssue` rows (FK ``job``).
+    """
+
+    STATUS_PENDING = "Pending"
+    STATUS_IMPORTING = "Importing"
+    STATUS_COMPLETED = "Completed"
+    STATUS_PARTIAL = "PartialSuccess"
+    STATUS_FAILED = "Failed"
+    STATUS_CHOICES = [
+        (STATUS_PENDING, "Pending"),
+        (STATUS_IMPORTING, "Importing"),
+        (STATUS_COMPLETED, "Completed"),
+        (STATUS_PARTIAL, "Partial success"),
+        (STATUS_FAILED, "Failed"),
+    ]
+
+    MODE_STRICT = "strict"
+    MODE_LENIENT = "lenient"
+    MODE_CHOICES = [(MODE_STRICT, "Strict"), (MODE_LENIENT, "Lenient")]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    file = models.FileField(upload_to="risk_assessment/imports/%Y/%m/%d/")
+    file_name = models.CharField(max_length=255, blank=True)
+    mode = models.CharField(max_length=12, choices=MODE_CHOICES, default=MODE_LENIENT)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_PENDING, db_index=True)
+    requested_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="risk_assessment_imports",
+    )
+    # Link imported records into the live engine (create/update EntityRisk).
+    link_to_engine = models.BooleanField(default=False)
+    sheets_created = models.PositiveIntegerField(default=0)
+    records_created = models.PositiveIntegerField(default=0)
+    records_updated = models.PositiveIntegerField(default=0)
+    matrix_cells = models.PositiveIntegerField(default=0)
+    summary_items = models.PositiveIntegerField(default=0)
+    skipped = models.PositiveIntegerField(default=0)
+    finished_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["status", "-created_at"], name="raij_status_created_idx"),
+        ]
+
+    def __str__(self):
+        return f"RiskAssessmentImportJob {self.id} ({self.status})"
+
+
 class RiskAssessmentImportIssue(TimeStampedModel):
     SEVERITY_CHOICES = [("error", "error"), ("warning", "warning"), ("info", "info")]
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    # Scope each issue to the import run that produced it (null for legacy /
+    # manually-created rows).
+    job = models.ForeignKey(
+        RiskAssessmentImportJob, on_delete=models.CASCADE, null=True, blank=True,
+        related_name="issues",
+    )
     severity = models.CharField(max_length=20, choices=SEVERITY_CHOICES, default="warning")
     # Matches the FE contract `{ sheet, cell }`. ``cell`` is a free-form
     # Excel-style reference (e.g. "B14") so renderers can deep-link straight to
@@ -1525,7 +1666,7 @@ class RiskAssessmentImportIssue(TimeStampedModel):
 
 class ApprovalRequest(TimeStampedModel):
     STATUS_CHOICES = [("Pending", "Pending"), ("Approved", "Approved"), ("Rejected", "Rejected"), ("Returned", "Returned")]
-    TYPE_CHOICES = [("Audit Plan", "Audit Plan"), ("Finding", "Finding"), ("CAP Closure", "CAP Closure"), ("Report", "Report"), ("Risk Assessment", "Risk Assessment")]
+    TYPE_CHOICES = [("Audit Plan", "Audit Plan"), ("Finding", "Finding"), ("CAP Closure", "CAP Closure"), ("Report", "Report"), ("Risk Assessment", "Risk Assessment"), ("Risk Model Change", "Risk Model Change")]
     PRIORITY_CHOICES = [("High", "High"), ("Medium", "Medium"), ("Low", "Low")]
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -2803,6 +2944,22 @@ class RiskScoringModel(TimeStampedModel):
             ),
         ]
 
+    def save(self, *args, **kwargs):
+        # Enforce a single GLOBAL active scoring model. Every consumer resolves
+        # the applicable model via ``filter(is_active=True).first()``
+        # (risk_rollup._engine_is_high_risk, tasks/risk_scores), so two active
+        # models — even with different names — would make scoring
+        # non-deterministic. Activating this model deactivates all others,
+        # regardless of write path (API, admin, import, raw ORM create).
+        from django.db import transaction
+
+        with transaction.atomic():
+            if self.is_active:
+                RiskScoringModel.objects.filter(is_active=True).exclude(
+                    pk=self.pk
+                ).update(is_active=False)
+            super().save(*args, **kwargs)
+
 
 class RiskFactorWeight(TimeStampedModel):
     """Per-scoring-model weight on a factor.
@@ -2851,6 +3008,11 @@ class EntityRiskScore(TimeStampedModel):
         RiskScoringModel, on_delete=models.PROTECT, related_name="entity_scores",
     )
     factor_values = models.JSONField(default=dict)
+    # Frozen copy of the scoring model (formula, high-risk threshold, and each
+    # participating factor's weight + scale) as it stood when this score was
+    # taken. Keeps historical composites fully reproducible/auditable even
+    # after the model's weights or formula are later edited.
+    model_snapshot = models.JSONField(default=dict, blank=True)
     composite_score = models.DecimalField(max_digits=6, decimal_places=2, default=0)
     rank = models.PositiveIntegerField(null=True, blank=True, db_index=True)
     is_high_risk = models.BooleanField(default=False, db_index=True)

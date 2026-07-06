@@ -29,6 +29,7 @@ from iams.models import (
     Notification,
     NotificationPreference,
     RiskAssessmentImportIssue,
+    RiskAssessmentImportJob,
     WorkingPaper,
     RiskAssessmentMatrixCell,
     RiskAssessmentRecord,
@@ -378,6 +379,20 @@ class EntityRiskSerializer(serializers.ModelSerializer):
         if (rl is None) != (ri is None):
             raise serializers.ValidationError(
                 {"residualImpact": "Set residual likelihood and impact together, or leave both blank."}
+            )
+        # Residual (post-control) risk cannot exceed inherent (pre-control) on
+        # either axis — controls reduce risk, they don't increase it. Enforced
+        # here for friendly per-field errors and by a DB CheckConstraint for
+        # non-API writers (admin / import / raw ORM).
+        il = attrs.get("inherent_likelihood", getattr(inst, "inherent_likelihood", None))
+        ii = attrs.get("inherent_impact", getattr(inst, "inherent_impact", None))
+        if rl is not None and il is not None and rl > il:
+            raise serializers.ValidationError(
+                {"residualLikelihood": "Residual likelihood cannot exceed inherent likelihood."}
+            )
+        if ri is not None and ii is not None and ri > ii:
+            raise serializers.ValidationError(
+                {"residualImpact": "Residual impact cannot exceed inherent impact."}
             )
         return attrs
 
@@ -1103,20 +1118,33 @@ class RiskAssessmentSheetSerializer(serializers.ModelSerializer):
 
 
 class RiskAssessmentRecordSerializer(serializers.ModelSerializer):
-    sourceSheet = serializers.CharField(source="source_sheet")
-    sourceRow = serializers.IntegerField(source="source_row")
+    # NOTE: re-declaring a model field explicitly (for a camelCase alias) drops
+    # its ``blank``/``default``/``choices`` — DRF then treats it as
+    # ``required=True, allow_blank=False``. Every blank-allowed text field is
+    # restored to ``required=False, allow_blank=True`` and every choice field
+    # keeps its choices + becomes optional (model default applies on create).
+    sourceSheet = serializers.CharField(source="source_sheet", required=False, allow_blank=True)
+    sourceRow = serializers.IntegerField(source="source_row", required=False)
     riskArea = serializers.CharField(source="risk_area")
-    riskDescription = serializers.CharField(source="risk_description")
-    inherentRisk = serializers.CharField(source="inherent_risk")
-    existingControls = serializers.CharField(source="existing_controls")
-    controlEffectiveness = serializers.CharField(source="control_effectiveness")
-    residualRisk = serializers.CharField(source="residual_risk")
-    auditObjective = serializers.CharField(source="audit_objective")
-    auditSteps = serializers.CharField(source="audit_steps")
-    documentsRequired = serializers.CharField(source="documents_required")
-    inclusionStatus = serializers.CharField(source="inclusion_status")
-    auditScope = serializers.CharField(source="audit_scope")
-    plannedManDays = serializers.DecimalField(source="planned_man_days", max_digits=6, decimal_places=2)
+    riskDescription = serializers.CharField(source="risk_description", required=False, allow_blank=True)
+    inherentRisk = serializers.ChoiceField(
+        source="inherent_risk", choices=RiskAssessmentRecord.LEVEL_CHOICES, required=False,
+    )
+    existingControls = serializers.CharField(source="existing_controls", required=False, allow_blank=True)
+    controlEffectiveness = serializers.CharField(source="control_effectiveness", required=False, allow_blank=True)
+    residualRisk = serializers.ChoiceField(
+        source="residual_risk", choices=RiskAssessmentRecord.LEVEL_CHOICES, required=False,
+    )
+    auditObjective = serializers.CharField(source="audit_objective", required=False, allow_blank=True)
+    auditSteps = serializers.CharField(source="audit_steps", required=False, allow_blank=True)
+    documentsRequired = serializers.CharField(source="documents_required", required=False, allow_blank=True)
+    inclusionStatus = serializers.ChoiceField(
+        source="inclusion_status", choices=RiskAssessmentRecord.INCLUSION_CHOICES, required=False,
+    )
+    auditScope = serializers.CharField(source="audit_scope", required=False, allow_blank=True)
+    plannedManDays = serializers.DecimalField(
+        source="planned_man_days", max_digits=6, decimal_places=2, required=False,
+    )
 
     class Meta:
         model = RiskAssessmentRecord
@@ -1128,7 +1156,7 @@ class RiskAssessmentRecordSerializer(serializers.ModelSerializer):
 
 
 class RiskAssessmentMatrixCellSerializer(serializers.ModelSerializer):
-    residualRisk = serializers.CharField(source="residual_risk")
+    residualRisk = serializers.CharField(source="residual_risk", required=False)
 
     class Meta:
         model = RiskAssessmentMatrixCell
@@ -1137,9 +1165,13 @@ class RiskAssessmentMatrixCellSerializer(serializers.ModelSerializer):
 
 class RiskAssessmentSummaryItemSerializer(serializers.ModelSerializer):
     recordId = serializers.UUIDField(source="record_id", read_only=True)
-    inclusionStatus = serializers.CharField(source="inclusion_status")
-    auditScope = serializers.CharField(source="audit_scope")
-    plannedManDays = serializers.DecimalField(source="planned_man_days", max_digits=6, decimal_places=2)
+    inclusionStatus = serializers.ChoiceField(
+        source="inclusion_status", choices=RiskAssessmentSummaryItem.INCLUSION_CHOICES, required=False,
+    )
+    auditScope = serializers.CharField(source="audit_scope", required=False, allow_blank=True)
+    plannedManDays = serializers.DecimalField(
+        source="planned_man_days", max_digits=6, decimal_places=2, required=False,
+    )
 
     class Meta:
         model = RiskAssessmentSummaryItem
@@ -1147,9 +1179,35 @@ class RiskAssessmentSummaryItemSerializer(serializers.ModelSerializer):
 
 
 class RiskAssessmentImportIssueSerializer(serializers.ModelSerializer):
+    jobId = serializers.UUIDField(source="job_id", read_only=True)
+    sourceRow = serializers.IntegerField(source="row_number", read_only=True)
+
     class Meta:
         model = RiskAssessmentImportIssue
-        fields = ["id", "severity", "sheet", "cell", "message"]
+        fields = ["id", "jobId", "severity", "sheet", "cell", "sourceRow", "message"]
+
+
+class RiskAssessmentImportJobSerializer(serializers.ModelSerializer):
+    fileName = serializers.CharField(source="file_name", read_only=True)
+    linkToEngine = serializers.BooleanField(source="link_to_engine", read_only=True)
+    sheetsCreated = serializers.IntegerField(source="sheets_created", read_only=True)
+    recordsCreated = serializers.IntegerField(source="records_created", read_only=True)
+    recordsUpdated = serializers.IntegerField(source="records_updated", read_only=True)
+    matrixCells = serializers.IntegerField(source="matrix_cells", read_only=True)
+    summaryItems = serializers.IntegerField(source="summary_items", read_only=True)
+    finishedAt = serializers.DateTimeField(source="finished_at", read_only=True)
+    requestedBy = UserSummarySerializer(source="requested_by", read_only=True)
+    issues = RiskAssessmentImportIssueSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = RiskAssessmentImportJob
+        fields = [
+            "id", "fileName", "mode", "status", "linkToEngine",
+            "sheetsCreated", "recordsCreated", "recordsUpdated",
+            "matrixCells", "summaryItems", "skipped",
+            "requestedBy", "finishedAt", "issues",
+        ]
+        read_only_fields = fields
 
 
 class ApprovalStepSerializer(serializers.ModelSerializer):
@@ -1944,7 +2002,10 @@ class RiskScoringModelSerializer(serializers.ModelSerializer):
     highRiskThreshold = serializers.DecimalField(
         source="high_risk_threshold", max_digits=5, decimal_places=2, min_value=Decimal("0"), max_value=Decimal("100"),
     )
-    isActive = serializers.BooleanField(source="is_active")
+    # Activation is governance-gated: a model goes live only via the
+    # ``publish`` action → "Risk Model Change" approval → activation on
+    # approval. It cannot be flipped by a direct write here.
+    isActive = serializers.BooleanField(source="is_active", read_only=True)
     factorWeights = RiskFactorWeightSerializer(source="factor_weights", many=True, read_only=True)
 
     class Meta:
@@ -1953,7 +2014,7 @@ class RiskScoringModelSerializer(serializers.ModelSerializer):
             "id", "name", "version", "description", "formula",
             "highRiskThreshold", "isActive", "factorWeights",
         ]
-        read_only_fields = ["factorWeights"]
+        read_only_fields = ["factorWeights", "isActive"]
 
 
 class EntityRiskScoreSerializer(serializers.ModelSerializer):
@@ -1964,6 +2025,7 @@ class EntityRiskScoreSerializer(serializers.ModelSerializer):
     )
     scoringModelName = serializers.CharField(source="scoring_model.name", read_only=True)
     factorValues = serializers.JSONField(source="factor_values")
+    modelSnapshot = serializers.JSONField(source="model_snapshot", read_only=True)
     compositeScore = serializers.DecimalField(
         source="composite_score", max_digits=6, decimal_places=2, read_only=True,
     )
@@ -1977,7 +2039,7 @@ class EntityRiskScoreSerializer(serializers.ModelSerializer):
         fields = [
             "id", "entityId", "entityName",
             "scoringModelId", "scoringModelName",
-            "factorValues", "compositeScore",
+            "factorValues", "modelSnapshot", "compositeScore",
             "rank", "isHighRisk", "isCurrent",
             "snapshotAt", "snapshotById", "notes",
         ]

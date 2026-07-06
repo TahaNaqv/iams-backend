@@ -95,6 +95,20 @@ def _worst_rating(*ratings: str | None) -> str | None:
     return max(present, key=lambda r: _RATING_SEVERITY.get(r, 0))
 
 
+def _active_engine_score(entity: AuditableEntity):
+    """The active scoring model's current snapshot for ``entity``, or None."""
+    from .models import EntityRiskScore, RiskScoringModel
+
+    model = RiskScoringModel.objects.filter(is_active=True).first()
+    if model is None:
+        return None
+    return (
+        EntityRiskScore.objects
+        .filter(entity=entity, scoring_model=model, is_current=True)
+        .first()
+    )
+
+
 def _engine_is_high_risk(entity: AuditableEntity) -> bool:
     """True when the active scoring model's current snapshot is high-risk.
 
@@ -103,39 +117,47 @@ def _engine_is_high_risk(entity: AuditableEntity) -> bool:
     escalate the headline rating. Returns False when no active model has
     scored this entity.
     """
-    from .models import EntityRiskScore, RiskScoringModel
-
-    model = RiskScoringModel.objects.filter(is_active=True).first()
-    if model is None:
-        return False
-    return EntityRiskScore.objects.filter(
-        entity=entity, scoring_model=model, is_current=True, is_high_risk=True
-    ).exists()
+    score = _active_engine_score(entity)
+    return bool(score and score.is_high_risk)
 
 
 def resolve_entity_risk_rating(entity: AuditableEntity, residual_rating: str | None) -> str:
-    """Single authority for ``risk_rating`` (escalate-only reconciliation).
+    """Single authority for ``risk_rating``.
 
     Order of resolution:
 
     1. Manual override (``risk_rating_is_overridden``) — the existing value
        always wins.
-    2. Base rating = the residual worst-risk band, or (when there are no open
-       risks) the entity's current rating — never silently downgraded to a
-       default.
-    3. If the active scoring model flags the entity high-risk, escalate the
-       base to at least ``High`` (mirrors ``risk_engine.record_score``).
-    4. ``Critical`` is never downgraded by the engine step (``_worst_rating``
-       keeps the most severe).
+    2. If the active scoring model flags the entity high-risk, escalate the
+       base (residual band, or the current rating) to at least ``High``.
+       ``Critical`` is preserved (``_worst_rating`` keeps the most severe).
+    3. If the entity carries a *stale engine-driven* ``High`` — it has an
+       active-model current score that is no longer high-risk, and no
+       line-item residual holds it at/above ``High`` — de-escalate it to the
+       residual band (or the engine's own composite band). This lets a lower
+       snapshot walk the rating back down instead of sticking at ``High``.
+    4. Otherwise the base is the residual band, or the current rating when
+       there are no open risks (never silently downgraded on risk close).
 
-    This ends the two-writer conflict: the engine and the line-item roll-up
-    now feed a single resolver instead of both writing ``risk_rating``.
+    This is the single reconciliation point: the engine and the line-item
+    roll-up both feed it rather than writing ``risk_rating`` directly.
     """
     if entity.risk_rating_is_overridden:
         return entity.risk_rating
     base = residual_rating or entity.risk_rating
-    if _engine_is_high_risk(entity):
+    score = _active_engine_score(entity)
+    if score is not None and score.is_high_risk:
         return _worst_rating(base, "High") or "High"
+    # Unwind a stale engine ``High`` when the engine has stopped flagging it
+    # and nothing else justifies High.
+    if (
+        score is not None
+        and entity.risk_rating == "High"
+        and _RATING_SEVERITY.get(residual_rating or "", 0) < _RATING_SEVERITY["High"]
+    ):
+        from .risk_engine import band_for_composite
+
+        return residual_rating or band_for_composite(score.composite_score)
     return base
 
 
@@ -229,5 +251,5 @@ def _record_system_revision(entity: AuditableEntity, previous_rating: str) -> No
                 },
                 comment="Rating recomputed from entity risks.",
             )
-    except Exception:  # noqa: BLE001 — a revision failure must not break the roll-up
+    except Exception:
         pass

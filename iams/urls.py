@@ -33,6 +33,7 @@ from iams.views import (
     NotificationViewSet,
     PermissionViewSet,
     RiskAssessmentImportIssuesViewSet,
+    RiskAssessmentImportJobViewSet,
     RiskAssessmentMatrixViewSet,
     RiskAssessmentSheetsViewSet,
     RiskAssessmentSummaryViewSet,
@@ -128,6 +129,7 @@ router.register("risk-assessments", RiskAssessmentViewSet, basename="risk-assess
 router.register("risk-assessment-sheets", RiskAssessmentSheetsViewSet, basename="risk-assessment-sheet")
 router.register("risk-assessment-matrix", RiskAssessmentMatrixViewSet, basename="risk-assessment-matrix")
 router.register("risk-assessment-summary", RiskAssessmentSummaryViewSet, basename="risk-assessment-summary")
+router.register("risk-assessment-import-jobs", RiskAssessmentImportJobViewSet, basename="risk-assessment-import-job")
 router.register("approval-requests", ApprovalRequestViewSet, basename="approval-request")
 router.register("approval-chain-templates", ApprovalChainTemplateViewSet, basename="approval-chain-template")
 router.register("work-programs", WorkProgramViewSet, basename="work-program")

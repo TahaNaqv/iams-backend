@@ -29,8 +29,8 @@ Public verbs:
 from __future__ import annotations
 
 import logging
-from decimal import Decimal, ROUND_HALF_UP
-from typing import Any, Iterable
+from decimal import ROUND_HALF_UP, Decimal
+from typing import Any
 
 from django.contrib.auth import get_user_model
 from django.db import transaction
@@ -41,7 +41,6 @@ from iams.models import (
     AuditableEntity,
     EntityRiskScore,
     RiskFactor,
-    RiskFactorWeight,
     RiskScoringModel,
 )
 
@@ -57,17 +56,80 @@ _ZERO = Decimal("0")
 _HUNDRED = Decimal("100")
 _Q = Decimal("0.01")
 
+# ── Canonical composite (0..100) qualitative bands ─────────────────────
+# Single source of truth for turning a normalized composite score into a
+# Critical/High/Medium/Low label. Consumed by the dashboard heat-map and the
+# frontend (mirror these exact cutoffs in ``src/lib/risk-score.ts``). Distinct
+# from ``score_to_rating`` in ``risk_rollup``, which bands the 1..25 L×I space.
+COMPOSITE_BANDS = (
+    (Decimal("80"), "Critical"),
+    (Decimal("60"), "High"),
+    (Decimal("40"), "Medium"),
+)
+
+
+def band_for_composite(score) -> str:
+    """Return the qualitative band for a 0..100 composite score."""
+    value = score if isinstance(score, Decimal) else Decimal(str(score or 0))
+    for threshold, label in COMPOSITE_BANDS:
+        if value >= threshold:
+            return label
+    return "Low"
+
 
 def _quantize(value: Decimal) -> Decimal:
     return value.quantize(_Q, rounding=ROUND_HALF_UP)
 
 
 def _factor_lookup(model: RiskScoringModel) -> dict[str, tuple[RiskFactor, Decimal]]:
-    """Build ``{factor_code: (factor, weight)}`` for the model."""
+    """Build ``{factor_code: (factor, weight)}`` for the model.
+
+    Only **active** factors participate — deactivating a ``RiskFactor`` removes
+    it from every model's composite without needing to unlink each weight row.
+    """
     out: dict[str, tuple[RiskFactor, Decimal]] = {}
-    for fw in model.factor_weights.select_related("factor").all():
+    for fw in model.factor_weights.select_related("factor").filter(factor__is_active=True):
         out[fw.factor.code] = (fw.factor, Decimal(fw.weight))
     return out
+
+
+def next_model_version(current: str) -> str:
+    """Return the next minor version string (``"1.0"`` → ``"1.1"``).
+
+    Falls back to appending ``.1`` when the current value isn't a dotted
+    numeric version.
+    """
+    parts = (current or "").split(".")
+    if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+        return f"{parts[0]}.{int(parts[1]) + 1}"
+    if len(parts) == 1 and parts[0].isdigit():
+        return f"{parts[0]}.1"
+    return f"{current}.1" if current else "1.1"
+
+
+def _model_snapshot(model: RiskScoringModel) -> dict[str, Any]:
+    """Freeze the scoring model's config for storage on a score row.
+
+    Captures formula, high-risk threshold, and every active factor's weight +
+    scale so a historical composite can be re-derived exactly, even after the
+    live model is edited.
+    """
+    return {
+        "modelId": str(model.id),
+        "name": model.name,
+        "version": model.version,
+        "formula": model.formula,
+        "highRiskThreshold": str(model.high_risk_threshold),
+        "factors": [
+            {
+                "code": code,
+                "weight": str(weight),
+                "scaleMin": factor.scale_min,
+                "scaleMax": factor.scale_max,
+            }
+            for code, (factor, weight) in _factor_lookup(model).items()
+        ],
+    }
 
 
 def _validate_values(
@@ -201,6 +263,7 @@ def record_score(
         entity=entity,
         scoring_model=model,
         factor_values=factor_values,
+        model_snapshot=_model_snapshot(model),
         composite_score=composite,
         is_high_risk=is_high,
         is_current=True,
@@ -209,10 +272,16 @@ def record_score(
         notes=notes,
     )
 
-    # Bump entity risk_rating (preserve Critical; never stomp a manual override)
-    if is_high and entity.risk_rating != "Critical" and not entity.risk_rating_is_overridden:
-        entity.risk_rating = "High"
-        entity.save(update_fields=["risk_rating", "updated_at"])
+    # Reconcile the entity's headline rating through the SINGLE authority
+    # (``resolve_entity_risk_rating``) instead of writing ``risk_rating``
+    # directly here. That path:
+    #   * escalates to High only when the *active* model flags high-risk
+    #     (so scoring against a non-active model can't bump the rating),
+    #   * preserves Critical and manual overrides,
+    #   * lets a subsequent lower snapshot de-escalate a prior engine High,
+    #   * writes a RiskHistoryEntry + system revision and bumps ``version``.
+    from iams.risk_rollup import recompute_entity_risk_position
+    recompute_entity_risk_position(entity)
 
     # Rebuild ranks across all current scores for the model. Skipped by the
     # bulk recompute, which rebuilds once at the end instead of once per row
@@ -241,15 +310,19 @@ def recompute_ranks(model: RiskScoringModel) -> int:
     # (1, 1, 2, 3 — not the "standard" 1, 1, 3, 4 with gaps for ties).
     rank = 0
     last_score = None
-    updated = 0
+    to_update: list[EntityRiskScore] = []
     for row in current:
         if last_score is None or row.composite_score != last_score:
             rank += 1
             last_score = row.composite_score
         if row.rank != rank:
-            EntityRiskScore.objects.filter(pk=row.pk).update(rank=rank)
-            updated += 1
-    return updated
+            row.rank = rank
+            to_update.append(row)
+    if to_update:
+        # One bulk UPDATE instead of one query per changed row (the loop was
+        # O(n) queries on large universes).
+        EntityRiskScore.objects.bulk_update(to_update, ["rank"])
+    return len(to_update)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -353,11 +426,21 @@ def generate_audit_plan_draft(
         + "\n".join(lines)
     )
 
+    # Collision-safe reference: a re-generated plan for the same year gets a
+    # ``-r2``/``-r3`` suffix instead of silently duplicating ``PLAN-<year>``.
+    base_ref = f"PLAN-{year}"
+    reference_id = base_ref
+    existing = ApprovalRequest.objects.filter(
+        reference_id__startswith=base_ref
+    ).count()
+    if existing:
+        reference_id = f"{base_ref}-r{existing + 1}"
+
     submitter_email = getattr(requested_by, "email", "") or requested_by.get_username()
     req = ApprovalRequest.objects.create(
         title=f"{year} Annual Audit Plan",
         type="Audit Plan",
-        reference_id=f"PLAN-{year}",
+        reference_id=reference_id,
         department="Internal Audit",
         submitted_by=submitter_email,
         submitted_date=timezone.now().date(),
@@ -390,22 +473,30 @@ def recompute_all_scores_for_model(
     admins fix a typo'd weight and have it propagate without forcing
     every business unit to re-submit factor values.
     """
-    current_rows = list(
-        EntityRiskScore.objects
-        .filter(scoring_model=model, is_current=True)
-        .select_related("entity")
-    )
-    count = 0
-    for row in current_rows:
-        record_score(
-            row.entity,
-            model=model,
-            factor_values=row.factor_values,
-            by_user=by_user,
-            notes="Auto-recomputed after scoring-model update.",
-            _skip_rank_rebuild=True,
+    with transaction.atomic():
+        current_rows = list(
+            EntityRiskScore.objects
+            .filter(scoring_model=model, is_current=True)
+            .select_related("entity")
         )
-        count += 1
-    # Rebuild ranks once for the whole set instead of once per row.
-    recompute_ranks(model)
+        count = 0
+        for row in current_rows:
+            # Idempotent: only re-snapshot when the recompute actually changes
+            # the composite or the high-risk band. Re-running with no model
+            # change is now a no-op instead of doubling history every pass.
+            new_composite = compute_composite(model, row.factor_values)
+            new_is_high = new_composite >= model.high_risk_threshold
+            if new_composite == row.composite_score and new_is_high == row.is_high_risk:
+                continue
+            record_score(
+                row.entity,
+                model=model,
+                factor_values=row.factor_values,
+                by_user=by_user,
+                notes="Auto-recomputed after scoring-model update.",
+                _skip_rank_rebuild=True,
+            )
+            count += 1
+        # Rebuild ranks once for the whole set instead of once per row.
+        recompute_ranks(model)
     return count

@@ -1,6 +1,6 @@
 # Audit Universe — Entity Form Specification
 
-**Status:** Approved; PRs 1-2 implemented on `feat/audit-universe-v2`
+**Status:** Approved; PRs 1-5 implemented on `feat/audit-universe-v2`. Only PR 6 (the breaking column drops, migrations `0054`-`0055`) remains, and it is deliberately held to release *N+1*.
 **Author:** Engineering (with Claude)
 **Date:** 2026-09-16
 **Applies to:** `iams-backend` (`iams.models.AuditableEntity` and friends), `iams-frontend` (`src/components/audit-universe/*`, `src/pages/AuditableEntity*`)
@@ -528,6 +528,15 @@ Verified against `iams/rbac_matrix.py` (role names below are the exact seeded st
 | Read-only stakeholder | none | none |
 | External auditor / regulator | none | none |
 
+> **This trap was real.** The first implementation walked straight into it:
+> `ModuleGatedMixin.get_permissions()` overrode everything unconditionally, so
+> the `permission_classes` set on the override `@action` were silently ignored
+> and the action ran on the `audit_universe` gate — locking out the CAE exactly
+> as predicted. Action-level `permission_classes` now take precedence
+> (`iams/permissions.py`), with the reason recorded at the call site. Any future
+> `@action` that belongs to a different module than its viewset depends on that
+> fix.
+>
 > **Trap — read this before writing the gate.** The Chief audit executive has
 > `audit_universe=(READ, False)`. If the rating-override action is gated on `audit_universe` edit,
 > **the CAE — the one person who most needs to override a rating — is locked out.** This is why the

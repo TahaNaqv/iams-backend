@@ -499,6 +499,21 @@ class AuditableEntityViewSet(ModuleGatedMixin, AuditedViewSetMixin, viewsets.Mod
         )
         if wants_full:
             qs = qs.prefetch_related("risks")
+        # Readiness asks "is there a current score from the *active* model?"
+        # for every row. Prefetching it into ``_prefetched_current_scores``
+        # turns a query per entity into one query for the page — see
+        # ``iams.readiness._has_current_risk_score``.
+        from django.db.models import Prefetch
+        from iams.models import EntityRiskScore
+        qs = qs.prefetch_related(
+            Prefetch(
+                "risk_scores",
+                queryset=EntityRiskScore.objects.filter(
+                    is_current=True, scoring_model__is_active=True,
+                ),
+                to_attr="_prefetched_current_scores",
+            ),
+        )
         return qs
 
     def get_serializer_class(self):
@@ -965,7 +980,38 @@ class AuditableEntityViewSet(ModuleGatedMixin, AuditedViewSetMixin, viewsets.Mod
             "withoutRiskScore": qs.filter(
                 Q(inherent_likelihood__isnull=True) | Q(inherent_impact__isnull=True)
             ).count(),
+            # ── Audit Universe v2 ──
+            # The gaps that stop an entity being planned: no stated objectives,
+            # no scope boundary, no effort estimate, or a risk assessment that
+            # is missing or stale.
+            "withoutObjectives": qs.filter(audit_objectives="").count(),
+            "withoutScope": qs.filter(scope_inclusions="").count(),
+            "withoutEffortEstimate": qs.filter(
+                estimated_ia_days__isnull=True,
+                estimated_cosource_days__isnull=True,
+                estimated_man_days__isnull=True,
+            ).count(),
+            "withoutCurrentFactorScore": qs.exclude(
+                risk_scores__is_current=True,
+                risk_scores__scoring_model__is_active=True,
+            ).count(),
+            "staleAssessmentOver12Months": qs.filter(
+                risk_scores__is_current=True,
+                risk_scores__scoring_model__is_active=True,
+                risk_scores__snapshot_at__lt=timezone.now() - timedelta(days=365),
+            ).distinct().count(),
         })
+
+    @action(detail=True, methods=["get"], url_path="readiness")
+    def readiness(self, request, pk=None):
+        """Per-criterion readiness breakdown for one entity.
+
+        The list projection carries only the number; this is what the form
+        uses to tell someone *which* three things are still missing.
+        """
+        from iams import readiness as readiness_service
+
+        return Response(readiness_service.compute(self.get_object()))
 
     # ─── Bulk import / export ─────────────────────────────────────────
     @action(

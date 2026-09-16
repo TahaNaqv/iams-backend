@@ -102,8 +102,11 @@ def test_coverage_endpoint_uses_aggregates(sa_client, universe):
     with CaptureQueriesContext(connection) as ctx:
         resp = sa_client.get("/api/auditable-entities/coverage/")
         assert resp.status_code == status.HTTP_200_OK
-    # 8 counters → at most ~12 queries with auth/profile setup.
-    assert len(ctx.captured_queries) < 15
+    # 13 counters (8 original + the 5 v2 gap tiles) → at most ~17 queries with
+    # auth/profile setup. Each counter is one flat aggregate; the ceiling is
+    # here to catch a counter that starts walking rows, not to cap how many
+    # questions the page asks.
+    assert len(ctx.captured_queries) < 20
 
 
 @pytest.mark.django_db

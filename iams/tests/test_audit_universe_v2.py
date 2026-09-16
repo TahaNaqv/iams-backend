@@ -427,3 +427,140 @@ def test_v2_field_changes_land_in_the_revision_diff(sa_client, entity):
     assert "audit_objectives" in revision.changes
     assert revision.changes["audit_objectives"]["to"].startswith("Establish that claims")
     assert "estimated_ia_days" in revision.changes
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Readiness
+# ══════════════════════════════════════════════════════════════════════
+@pytest.fixture
+def active_model(db):
+    from iams.models import RiskFactor, RiskFactorWeight, RiskScoringModel
+
+    model = RiskScoringModel.objects.create(
+        name="Active", version="1.0",
+        formula=RiskScoringModel.FORMULA_IMPACT_LIKELIHOOD, is_active=True,
+    )
+    for code, group, weight in (
+        ("exposure", "impact", 100), ("controls", "likelihood", 100),
+    ):
+        factor = RiskFactor.objects.create(
+            code=code, name=code.title(), group=group, scale_min=1, scale_max=5,
+        )
+        RiskFactorWeight.objects.create(scoring_model=model, factor=factor, weight=weight)
+    return model
+
+
+def _make_assessed(entity, user, metric, model):
+    """Satisfy every readiness criterion."""
+    from iams.risk_engine import record_score
+
+    entity.primary_owner = user
+    entity.audit_objectives = "Establish that claims are settled within policy terms."
+    entity.scope_inclusions = "FNOL through settlement."
+    entity.frequency_source = "RiskBased"
+    entity.estimated_ia_days = Decimal("18")
+    entity.save()
+    EntityMaterialityValue.objects.create(
+        entity=entity, definition=metric, value=Decimal("1"), as_of=date.today(),
+    )
+    refresh_materiality_cache(entity)
+    entity.refresh_from_db()
+    record_score(entity, model=model, factor_values={"exposure": 4, "controls": 4})
+    return entity
+
+
+def test_readiness_starts_in_draft(sa_client, entity):
+    """A brand-new entity scores zero.
+
+    No criterion may be satisfiable by a model default, or an empty record
+    would advertise progress nobody made.
+    """
+    from iams import readiness
+
+    result = readiness.compute(entity)
+    assert result["score"] == 0
+    assert result["band"] == readiness.BAND_DRAFT
+    assert result["isPlanEligible"] is False
+    assert "hasObjectives" in result["missing"]
+
+
+def test_a_complete_entity_reaches_assessed(entity, super_admin, revenue_metric, active_model):
+    from iams import readiness
+
+    _make_assessed(entity, super_admin, revenue_metric, active_model)
+    entity.refresh_from_db()
+
+    result = readiness.compute(entity)
+    assert result["score"] == readiness.MAX_SCORE
+    assert result["band"] == readiness.BAND_ASSESSED
+    assert result["isPlanEligible"] is True
+    assert result["missing"] == []
+
+
+def test_a_score_from_an_inactive_model_does_not_count(entity, active_model):
+    """A snapshot against a superseded model is history, not an assessment.
+
+    Counting it would let the plan quietly rest on last year's weights.
+    """
+    from iams import readiness
+    from iams.models import RiskScoringModel
+    from iams.risk_engine import record_score
+
+    def scored(e):
+        by_key = {c["key"]: c for c in readiness.compute(e)["criteria"]}
+        return by_key["hasCurrentRiskScore"]["met"]
+
+    record_score(entity, model=active_model, factor_values={"exposure": 3, "controls": 3})
+    assert scored(entity) is True
+
+    RiskScoringModel.objects.filter(pk=active_model.pk).update(is_active=False)
+    entity.refresh_from_db()
+    assert scored(entity) is False
+
+
+def test_readiness_endpoint_returns_the_breakdown(sa_client, entity):
+    """The breakdown is what makes the number actionable."""
+    resp = sa_client.get(f"/api/auditable-entities/{entity.id}/readiness/")
+
+    assert resp.status_code == status.HTTP_200_OK
+    assert resp.data["band"] == "Draft"
+    keys = {c["key"] for c in resp.data["criteria"]}
+    assert "hasEffortEstimate" in keys
+    assert all("hint" in c for c in resp.data["criteria"])
+
+
+def test_readiness_appears_on_the_list_projection(sa_client, entity):
+    resp = sa_client.get("/api/auditable-entities/")
+    row = next(r for r in resp.data["results"] if r["name"] == entity.name)
+    assert row["readinessScore"] == 0
+    assert row["readinessBand"] == "Draft"
+
+
+def test_list_readiness_does_not_issue_a_query_per_row(
+    sa_client, django_assert_max_num_queries, revenue_metric, active_model, super_admin,
+):
+    """Readiness on the register must not be N+1.
+
+    The active-model score lookup is prefetched into
+    ``_prefetched_current_scores``; without that this grows a query per entity.
+    """
+    from iams.risk_engine import record_score
+
+    for i in range(12):
+        e = AuditableEntity.objects.create(name=f"Entity {i}", entity_type="Process")
+        record_score(e, model=active_model, factor_values={"exposure": 3, "controls": 3})
+
+    with django_assert_max_num_queries(15):
+        resp = sa_client.get("/api/auditable-entities/?page_size=50")
+    assert resp.status_code == status.HTTP_200_OK
+    assert all(r["readinessScore"] > 0 for r in resp.data["results"])
+
+
+def test_coverage_reports_the_v2_gaps(sa_client, entity):
+    resp = sa_client.get("/api/auditable-entities/coverage/")
+
+    assert resp.status_code == status.HTTP_200_OK
+    assert resp.data["withoutObjectives"] == 1
+    assert resp.data["withoutScope"] == 1
+    assert resp.data["withoutEffortEstimate"] == 1
+    assert resp.data["withoutCurrentFactorScore"] == 1

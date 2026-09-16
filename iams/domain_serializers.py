@@ -541,6 +541,13 @@ class AuditableEntitySerializer(serializers.ModelSerializer):
         source="suggested_audit_frequency", read_only=True,
     )
     materialityCache = serializers.JSONField(source="materiality_cache", read_only=True)
+    readiness = serializers.SerializerMethodField()
+
+    def get_readiness(self, obj):
+        """Completeness of this entity's record, and whether it can be planned."""
+        from iams import readiness as readiness_service
+
+        return readiness_service.compute(obj)
     costCenterId = serializers.CharField(source="cost_center_id", required=False, allow_blank=True)
     inherentLikelihood = serializers.IntegerField(
         source="inherent_likelihood",
@@ -733,6 +740,7 @@ class AuditableEntitySerializer(serializers.ModelSerializer):
             "monthsSinceLastAudit",
             "suggestedFrequency",
             "materialityCache",
+            "readiness",
         ]
         # ``status`` is lifecycle-controlled: it may only change through the
         # dedicated archive/restore actions (which record a revision + metric),
@@ -993,6 +1001,27 @@ class AuditableEntityListSerializer(serializers.ModelSerializer):
     inherentScore = serializers.SerializerMethodField()
     childCount = serializers.IntegerField(source="_child_count", read_only=True, default=0)
     riskCount = serializers.IntegerField(source="_risk_count", read_only=True, default=0)
+    # ── Audit Universe v2 register columns ──
+    universeCategory = serializers.CharField(source="universe_category", allow_blank=True)
+    frequencySource = serializers.CharField(source="frequency_source", allow_blank=True)
+    totalEstimatedDays = serializers.DecimalField(
+        source="total_estimated_days", max_digits=7, decimal_places=2, allow_null=True,
+    )
+    monthsSinceLastAudit = serializers.IntegerField(
+        source="months_since_last_audit", allow_null=True,
+    )
+    readinessScore = serializers.SerializerMethodField()
+    readinessBand = serializers.SerializerMethodField()
+
+    def get_readinessScore(self, obj):
+        from iams import readiness as readiness_service
+
+        return readiness_service.score_only(obj)
+
+    def get_readinessBand(self, obj):
+        from iams import readiness as readiness_service
+
+        return readiness_service.band_for(readiness_service.score_only(obj))
 
     class Meta:
         model = AuditableEntity
@@ -1028,6 +1057,14 @@ class AuditableEntityListSerializer(serializers.ModelSerializer):
             "inherentScore",
             "childCount",
             "riskCount",
+            # ── Audit Universe v2 ──
+            "code",
+            "universeCategory",
+            "frequencySource",
+            "totalEstimatedDays",
+            "monthsSinceLastAudit",
+            "readinessScore",
+            "readinessBand",
             "version",
         ]
         read_only_fields = fields

@@ -7,6 +7,12 @@ Three formulas, picked per ``RiskScoringModel.formula``:
   - multiplicative       designed for two factors (``likelihood`` and
                          ``impact``). Returns ``v_l · v_i`` rescaled to
                          0..100 across the product space.
+  - impact_likelihood    the IIA risk-factor approach: weight the
+                         impact-group factors into one subtotal and the
+                         likelihood-group factors into another, then combine.
+                         Native scale is 2..10 (see
+                         ``impact_likelihood_detail``); the composite is
+                         normalized like the rest.
 
 All composites are returned in **normalized 0..100 space** so the
 high-risk threshold + ranking are formula-agnostic. The original
@@ -41,6 +47,7 @@ from iams.models import (
     AuditableEntity,
     EntityRiskScore,
     RiskFactor,
+    RiskFactorGroupChoices,
     RiskScoringModel,
 )
 
@@ -225,7 +232,109 @@ def compute_composite(
             return _ZERO
         return _quantize((likelihood * impact / max_product) * _HUNDRED)
 
+    if formula == RiskScoringModel.FORMULA_IMPACT_LIKELIHOOD:
+        detail = _impact_likelihood_detail(factors, values)
+        return detail["normalized"]
+
     raise RiskEngineError(f"Unknown formula '{formula}'.")
+
+
+# ──────────────────────────────────────────────────────────────────────
+# IIA risk-factor approach
+# ──────────────────────────────────────────────────────────────────────
+def _group_subtotals(
+    factors: dict[str, tuple[RiskFactor, Decimal]],
+    values: dict[str, Decimal],
+    group: str,
+) -> tuple[Decimal | None, Decimal | None]:
+    """Weighted average of one factor group, in native scale and 0..1.
+
+    Returns ``(native, normalized)`` — ``(None, None)`` when the group has no
+    active factors. Dividing by the group's own total weight means an admin
+    can express weights as percentages (50 / 35 / 20 / 10) or as fractions
+    (0.5 / 0.35 / 0.2 / 0.1) and get the same answer.
+    """
+    native = _ZERO
+    normalized = _ZERO
+    total_weight = _ZERO
+    for code, (factor, weight) in factors.items():
+        if factor.group != group:
+            continue
+        value = values[code]
+        span = Decimal(factor.scale_max - factor.scale_min)
+        native += value * weight
+        if span > 0:
+            normalized += ((value - factor.scale_min) / span) * weight
+        total_weight += weight
+    if total_weight <= 0:
+        return None, None
+    return native / total_weight, normalized / total_weight
+
+
+def _impact_likelihood_detail(
+    factors: dict[str, tuple[RiskFactor, Decimal]],
+    values: dict[str, Decimal],
+) -> dict[str, Any]:
+    """Impact and likelihood subtotals plus the combined score.
+
+    Implements the risk-factor approach set out in the IIA Global Practice
+    Guide *Developing a Risk-Based Internal Audit Plan* (2nd ed.),
+    Appendix F, Figure F.2: each auditable unit is rated on every factor,
+    the impact-related and likelihood-related factors are weighted into two
+    subtotals, and the subtotals are summed into a total risk score.
+
+    Two numbers come back because they serve different readers:
+
+    * ``raw_composite`` is on the guide's native 2..10 scale. Auditors
+      recognise it, and it is what the scoring UI shows.
+    * ``normalized`` is 0..100, matching every other formula in this engine,
+      so ``high_risk_threshold``, ranking and ``band_for_composite`` stay
+      formula-agnostic.
+
+    Both are kept in step: across the guide's own five worked examples the
+    normalized band and the guide's stated band agree on every row.
+    """
+    impact_native, impact_norm = _group_subtotals(
+        factors, values, RiskFactorGroupChoices.IMPACT,
+    )
+    likelihood_native, likelihood_norm = _group_subtotals(
+        factors, values, RiskFactorGroupChoices.LIKELIHOOD,
+    )
+    present = [p for p in (impact_norm, likelihood_norm) if p is not None]
+    if not present:
+        raise RiskEngineError(
+            "The impact_likelihood formula needs at least one active factor "
+            "in the 'impact' or 'likelihood' group. Set RiskFactor.group on "
+            "this model's factors.",
+        )
+    normalized = (sum(present) / Decimal(len(present))) * _HUNDRED
+    raw_parts = [p for p in (impact_native, likelihood_native) if p is not None]
+    return {
+        "impact_subtotal": _quantize(impact_native) if impact_native is not None else None,
+        "likelihood_subtotal": (
+            _quantize(likelihood_native) if likelihood_native is not None else None
+        ),
+        "raw_composite": _quantize(sum(raw_parts)),
+        "normalized": _quantize(normalized),
+    }
+
+
+def impact_likelihood_detail(
+    model: RiskScoringModel,
+    factor_values: dict[str, Any],
+) -> dict[str, Any]:
+    """Public wrapper: subtotals + raw + normalized for a set of values.
+
+    Used by the scoring UI to show the live impact/likelihood breakdown while
+    an assessor is still filling the form, without writing a snapshot row.
+    """
+    factors = _factor_lookup(model)
+    if not factors:
+        raise RiskEngineError(
+            f"Scoring model '{model.name}' has no factors; cannot score.",
+        )
+    values = _validate_values(factors, factor_values)
+    return _impact_likelihood_detail(factors, values)
 
 
 # ──────────────────────────────────────────────────────────────────────

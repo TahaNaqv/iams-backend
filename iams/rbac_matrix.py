@@ -121,7 +121,12 @@ ROLE_MATRIX = {
     "Audit manager": _row(
         audit_plan=(EDIT, False),
         audit_universe=(EDIT, False),
-        risk_assessment=(EDIT, False),
+        # Approve (not merely Edit) on risk_assessment: the rating-override
+        # action is gated at ModuleAccess("risk_assessment", "approve") so
+        # that Senior auditor — who holds Edit here in order to enter factor
+        # scores — cannot overrule a rating that feeds the board-facing plan.
+        # APPROVE outranks EDIT in ACCESS_RANK, so this is a widening only.
+        risk_assessment=(APPROVE, False),
         engagements=(EDIT, False),
         workpapers=(EDIT, False),
         findings=(EDIT, False),

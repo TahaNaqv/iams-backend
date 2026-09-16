@@ -1,3 +1,4 @@
+import datetime
 import uuid
 from decimal import Decimal
 from django.conf import settings
@@ -299,6 +300,16 @@ class EntityTypeChoices(models.TextChoices):
     FUNCTION = "Function", "Function"
     PROJECT = "Project", "Project"
     COMPLIANCE_AREA = "ComplianceArea", "Compliance Area"
+    # Audit Universe v2 — the remaining unit kinds named by the IIA GPG
+    # (p.10): "business units, risk areas, regulatory requirements, legal
+    # entities, branches, processes, programs, projects, systems, supply
+    # chains... critical third parties".
+    LEGAL_ENTITY = "LegalEntity", "Legal entity"
+    BRANCH = "Branch", "Branch / site"
+    PROGRAM = "Program", "Program"
+    RISK_AREA = "RiskArea", "Risk area"
+    THIRD_PARTY = "ThirdParty", "Third party"
+    APPLICATION = "Application", "Application"
 
 
 class AuditFrequencyChoices(models.TextChoices):
@@ -307,6 +318,13 @@ class AuditFrequencyChoices(models.TextChoices):
     QUARTERLY = "Quarterly", "Quarterly"
     AD_HOC = "AdHoc", "Ad hoc"
     CONTINUOUS = "Continuous", "Continuous"
+    # Audit Universe v2 — the longer cycles the IIA GPG (p.20) attaches to
+    # moderate and low-risk units ("every 19 to 24 months", "once every 25 to
+    # 36 months"). Without these there was no way to express a risk-based
+    # cadence slower than annual, which forced every low-risk unit to look
+    # like an annual commitment.
+    BIENNIAL = "Biennial", "Every 2 years"
+    TRIENNIAL = "Triennial", "Every 3 years"
 
 
 class LastAuditRatingChoices(models.TextChoices):
@@ -321,6 +339,93 @@ class ComplianceStatusChoices(models.TextChoices):
     NON_COMPLIANT = "NonCompliant", "Non-compliant"
     IN_REVIEW = "InReview", "In review"
     NOT_ASSESSED = "NotAssessed", "Not assessed"
+
+
+class UniverseCategoryChoices(models.TextChoices):
+    """Top-level audit-universe taxonomy.
+
+    Mirrors the example universe in the IIA Global Practice Guide
+    *Developing a Risk-Based Internal Audit Plan* (2nd ed.), Appendix D,
+    Figure D.1. Distinct from ``EntityTypeChoices``: the *category* says
+    which branch of the universe a unit hangs off (for board-facing
+    coverage reporting), the *type* says what kind of thing it is.
+    """
+
+    GOVERNANCE = "Governance", "Governance"
+    OPERATIONS = "Operations", "Operations"
+    FINANCE = "Finance", "Finance"
+    IT = "IT", "IT"
+    COMPLIANCE = "Compliance", "Compliance"
+    SUPPORT = "Support", "Support"
+    PROCESS = "Process", "Process"
+    ADVISORY = "Advisory", "Advisory"
+    THIRD_PARTY = "ThirdParty", "Third party"
+
+
+class FrequencySourceChoices(models.TextChoices):
+    """Why an entity has the audit frequency it has.
+
+    A cyclical engagement mandated by a regulator competes for the same
+    resources as a risk-ranked one but is not a risk-based choice, and the
+    plan must be able to say so (IIA GPG, "Cyclical Frequency in Highly
+    Regulated Industries", p.20).
+    """
+
+    RISK_BASED = "RiskBased", "Risk-based"
+    MANDATED = "Mandated", "Mandated by law or regulation"
+    POLICY = "Policy", "Internal policy"
+
+
+class RiskFactorGroupChoices(models.TextChoices):
+    """Whether a risk factor drives impact or likelihood.
+
+    The IIA risk-factor approach (GPG Appendix F, Figure F.2) subtotals
+    impact-related and likelihood-related factors separately, then sums the
+    two subtotals into the total risk score.
+    """
+
+    IMPACT = "impact", "Impact-related"
+    LIKELIHOOD = "likelihood", "Likelihood-related"
+    STANDALONE = "standalone", "Standalone"
+
+
+class MaterialityUnitChoices(models.TextChoices):
+    CURRENCY = "currency", "Currency"
+    COUNT = "count", "Count"
+    PERCENT = "percent", "Percent"
+    FTE = "fte", "Full-time equivalents"
+
+
+class AssuranceProviderTypeChoices(models.TextChoices):
+    """Who else provides assurance over an entity (Standard 9.5)."""
+
+    EXTERNAL_AUDIT = "external_audit", "External audit"
+    REGULATOR = "regulator", "Regulator"
+    SECOND_LINE = "second_line", "Second line (risk / compliance)"
+    SOC_REPORT = "soc_report", "SOC / service-organisation report"
+    CONSULTANT = "consultant", "Consultant"
+    MANAGEMENT_TESTING = "management_testing", "Management self-testing"
+    OTHER = "other", "Other"
+
+
+class RelianceLevelChoices(models.TextChoices):
+    FULL = "full", "Full reliance"
+    PARTIAL = "partial", "Partial reliance"
+    NONE = "none", "No reliance"
+
+
+class SystemCriticalityChoices(models.TextChoices):
+    LOW = "Low", "Low"
+    MEDIUM = "Medium", "Medium"
+    HIGH = "High", "High"
+    CRITICAL = "Critical", "Critical"
+
+
+class SystemHostingChoices(models.TextChoices):
+    ON_PREM = "OnPrem", "On-premises"
+    CLOUD = "Cloud", "Cloud (IaaS/PaaS)"
+    SAAS = "SaaS", "SaaS"
+    HYBRID = "Hybrid", "Hybrid"
 
 
 class TagCategoryChoices(models.TextChoices):
@@ -720,6 +825,129 @@ class TimelineEvent(TimeStampedModel):
         ordering = ["-timestamp"]
 
 
+class StrategicObjective(TimeStampedModel):
+    """A corporate objective the audit plan can be mapped against.
+
+    Standard 9.4 requires the internal audit plan to "support the achievement
+    of the organization's objectives" and to rest on a documented assessment
+    of the organization's *strategies, objectives, and risks*. Linking
+    auditable entities to objectives is what lets the plan report coverage
+    per objective (IIA GPG Appendix D, Figure D.2).
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    code = models.SlugField(max_length=50, unique=True, db_index=True)
+    title = models.CharField(max_length=255)
+    description = models.TextField(blank=True)
+    owner = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="owned_strategic_objectives",
+    )
+    period = models.CharField(
+        max_length=32,
+        blank=True,
+        help_text='Planning horizon the objective belongs to, e.g. "FY2027" or "2026-2028".',
+    )
+    is_active = models.BooleanField(default=True, db_index=True)
+
+    class Meta:
+        ordering = ["code"]
+
+    def __str__(self):
+        return f"{self.code} — {self.title}"
+
+
+class KeySystem(TimeStampedModel):
+    """An application or platform an auditable entity depends on.
+
+    Standard 9.4 requires the plan to "consider coverage of information
+    technology governance". Recording the systems behind a process is what
+    makes IT-dependency visible at planning time rather than at fieldwork.
+    Also feeds the ``complexity`` risk factor (degree of automation,
+    complexity of architecture).
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    name = models.CharField(max_length=200, unique=True)
+    vendor = models.CharField(max_length=200, blank=True)
+    criticality = models.CharField(
+        max_length=16,
+        choices=SystemCriticalityChoices.choices,
+        default=SystemCriticalityChoices.MEDIUM,
+    )
+    hosting = models.CharField(
+        max_length=16,
+        choices=SystemHostingChoices.choices,
+        default=SystemHostingChoices.ON_PREM,
+    )
+    description = models.TextField(blank=True)
+    is_active = models.BooleanField(default=True, db_index=True)
+
+    class Meta:
+        ordering = ["name"]
+
+    def __str__(self):
+        return self.name
+
+
+class MaterialityMetricDefinition(TimeStampedModel):
+    """An admin-configurable size/materiality measure.
+
+    FR-AU-02 asks entities to carry Revenue, Payroll cost, Staff count,
+    Premiums, Claims, Expenses and Assets. Those are sector-specific
+    (premiums and claims mean nothing to a telco), so they live in a
+    registry rather than as columns — the same install then serves an
+    insurer, a bank, or a manufacturer by toggling ``is_active``.
+
+    The figures are not decoration: they are the raw input to the
+    "Loss / material exposure" risk factor, which the IIA example weights
+    at 50% of impact (GPG Appendix F, Figure F.2). ``feeds_factor`` records
+    that relationship so the scoring step can auto-suggest a rating.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    code = models.SlugField(max_length=50, unique=True, db_index=True)
+    label = models.CharField(max_length=120)
+    description = models.TextField(blank=True)
+    unit = models.CharField(
+        max_length=16,
+        choices=MaterialityUnitChoices.choices,
+        default=MaterialityUnitChoices.CURRENCY,
+    )
+    currency = models.CharField(
+        max_length=3,
+        blank=True,
+        help_text="ISO-4217 code; required when unit is 'currency'.",
+    )
+    applies_to = models.JSONField(
+        default=list,
+        blank=True,
+        help_text=(
+            "Entity types and/or universe categories this metric is offered "
+            "for. Empty list = offered for every entity."
+        ),
+    )
+    feeds_factor = models.ForeignKey(
+        "RiskFactor",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="materiality_metrics",
+        help_text="Risk factor this metric informs, for scoring auto-suggestions.",
+    )
+    display_order = models.PositiveSmallIntegerField(default=0)
+    is_active = models.BooleanField(default=True, db_index=True)
+
+    class Meta:
+        ordering = ["display_order", "label"]
+
+    def __str__(self):
+        return self.label
+
+
 class AuditableEntity(TimeStampedModel):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     name = models.CharField(max_length=255)
@@ -865,6 +1093,152 @@ class AuditableEntity(TimeStampedModel):
     external_source = models.CharField(max_length=64, blank=True, db_index=True)
     external_id = models.CharField(max_length=128, blank=True, db_index=True)
 
+    # ═════════════════════════════════════════════════════════════════
+    # Audit Universe v2 — see docs/AUDIT-UNIVERSE-FORM-SPEC.md
+    #
+    # Every column below is nullable/blank on arrival so this migration is
+    # additive and the pre-v2 frontend keeps working. ``code`` and
+    # ``universe_category`` are tightened to required in the finalize
+    # migration, after the backfills have run in production.
+    # ═════════════════════════════════════════════════════════════════
+
+    # ── Identity ──────────────────────────────────────────────────────
+    code = models.CharField(
+        max_length=32,
+        blank=True,
+        db_index=True,
+        help_text=(
+            "Human-readable register reference, e.g. OPS-0042. Preferred "
+            "bulk-import upsert key. Becomes unique + required in the v2 "
+            "finalize migration."
+        ),
+    )
+    universe_category = models.CharField(
+        max_length=24,
+        choices=UniverseCategoryChoices.choices,
+        blank=True,
+        db_index=True,
+        help_text="Top-level universe taxonomy (IIA GPG Appendix D).",
+    )
+
+    # ── Mandate: the IIA triad ────────────────────────────────────────
+    # "the objectives, initial scope, and resources for each auditable unit
+    # should be clearly defined" — IIA GPG, Developing a Risk-Based Internal
+    # Audit Plan (2nd ed.), p.10. Objectives and scope are here; resources
+    # are ``estimated_ia_days`` / ``estimated_cosource_days`` below.
+    audit_objectives = models.TextField(
+        blank=True,
+        help_text="What an engagement over this unit would set out to establish.",
+    )
+    scope_inclusions = models.TextField(
+        blank=True,
+        help_text="What this unit covers. Keeps neighbouring entities from overlapping.",
+    )
+    scope_exclusions = models.TextField(
+        blank=True,
+        help_text="Explicitly out of scope — drives coverage-gap analysis.",
+    )
+    strategic_objectives = models.ManyToManyField(
+        StrategicObjective,
+        related_name="auditable_entities",
+        blank=True,
+    )
+    executive_sponsor = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="sponsored_entities",
+        help_text="Senior accountable stakeholder (distinct from the process owner).",
+    )
+
+    # ── Cadence ───────────────────────────────────────────────────────
+    frequency_source = models.CharField(
+        max_length=16,
+        choices=FrequencySourceChoices.choices,
+        default=FrequencySourceChoices.RISK_BASED,
+        help_text="Whether the frequency is a risk-based choice or compelled.",
+    )
+    mandate_reference = models.CharField(
+        max_length=200,
+        blank=True,
+        help_text="Which law, regulation or policy compels coverage.",
+    )
+
+    # ── Resources (third leg of the IIA triad) ────────────────────────
+    # Split IA / co-source mirrors the plan summary in GPG Appendix G,
+    # which budgets "Service Provider / IA / Total" staff hours per unit.
+    estimated_ia_days = models.DecimalField(
+        max_digits=6,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        validators=[MinValueValidator(Decimal("0"))],
+        help_text="Estimated in-house internal-audit effort, in days.",
+    )
+    estimated_cosource_days = models.DecimalField(
+        max_digits=6,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        validators=[MinValueValidator(Decimal("0"))],
+        help_text="Estimated co-source / service-provider effort, in days.",
+    )
+    required_skills = models.JSONField(
+        default=list,
+        blank=True,
+        help_text=(
+            "Specialist skills an engagement here needs, e.g. "
+            '["it_general_controls", "actuarial"]. Standard 9.4 requires the '
+            "plan to identify the necessary human resources."
+        ),
+    )
+
+    # ── Classification ────────────────────────────────────────────────
+    applicable_frameworks = models.JSONField(
+        default=list,
+        blank=True,
+        help_text=(
+            'Regulatory / control frameworks this unit is subject to, e.g. '
+            '["SOX", "IFRS 17"]. Replaces the retired ``compliance_status`` '
+            "with an input rather than a self-declared verdict."
+        ),
+    )
+    key_systems = models.ManyToManyField(
+        KeySystem,
+        related_name="auditable_entities",
+        blank=True,
+    )
+    is_third_party = models.BooleanField(
+        default=False,
+        help_text=(
+            "A critical third party carried in the universe. The IIA GPG (p.10) "
+            "admits these where the organization has audit rights."
+        ),
+    )
+    third_party_name = models.CharField(max_length=200, blank=True)
+    audit_rights_confirmed = models.BooleanField(
+        default=False,
+        help_text="Contractual right to audit has been confirmed with legal.",
+    )
+    is_fraud_risk_relevant = models.BooleanField(
+        default=False,
+        db_index=True,
+        help_text="Standard 9.4 requires the plan to consider fraud-risk coverage.",
+    )
+
+    # ── Denormalised materiality sort cache ───────────────────────────
+    # Source of truth is ``EntityMaterialityValue``; this mirror exists so
+    # the register can sort and range-filter on a metric without a subquery
+    # per row. Written by ``iams.materiality.refresh_materiality_cache`` and
+    # rebuildable from scratch via ``manage.py rebuild_materiality_cache``,
+    # so drift is recoverable without a migration.
+    materiality_cache = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="{metric_code: numeric value} for the latest as_of. Derived — do not edit.",
+    )
+
     # Default manager hides Archived rows; use ``all_objects`` to include them.
     objects = AuditableEntityActiveManager()
     all_objects = models.Manager()
@@ -885,6 +1259,9 @@ class AuditableEntity(TimeStampedModel):
             models.Index(fields=["next_audit_date"], name="ae_next_audit_idx"),
             models.Index(fields=["primary_owner"], name="ae_primary_owner_idx"),
             models.Index(fields=["compliance_status"], name="ae_compliance_idx"),
+            # Audit Universe v2
+            models.Index(fields=["universe_category", "status"], name="ae_category_status_idx"),
+            models.Index(fields=["frequency_source"], name="ae_freq_source_idx"),
         ]
 
     def __str__(self):
@@ -912,6 +1289,52 @@ class AuditableEntity(TimeStampedModel):
                 return node
             node = node.parent
         return None
+
+    # ── Audit Universe v2 derived helpers ─────────────────────────────
+    @property
+    def total_estimated_days(self):
+        """In-house + co-source effort, or ``None`` when neither is set.
+
+        ``estimated_man_days`` stays the stored column for one release so
+        pre-v2 API consumers keep reading it; this property is what the v2
+        serializer emits and what capacity-based planning consumes.
+        """
+        ia = self.estimated_ia_days
+        co = self.estimated_cosource_days
+        if ia is None and co is None:
+            return self.estimated_man_days
+        return (ia or Decimal("0")) + (co or Decimal("0"))
+
+    @property
+    def months_since_last_audit(self):
+        """Whole months since ``last_audit_date``, or ``None`` if never audited.
+
+        Feeds the ``assurance_coverage`` risk factor, whose IIA rating anchors
+        are recency bands, and the staleness tiles on the Coverage page.
+        """
+        if not self.last_audit_date:
+            return None
+        today = datetime.date.today()
+        return (
+            (today.year - self.last_audit_date.year) * 12
+            + today.month
+            - self.last_audit_date.month
+            - (1 if today.day < self.last_audit_date.day else 0)
+        )
+
+    def suggested_audit_frequency(self):
+        """Risk-based frequency implied by the current rating.
+
+        Bands from the IIA GPG (p.20): units ranked high risk are audited at
+        least annually, moderate every 19-24 months, low every 25-36 months or
+        not at all. Advisory only — the stored ``audit_frequency`` always wins;
+        the form surfaces a hint when the two disagree.
+        """
+        if self.risk_rating in (RiskRatingChoices.CRITICAL, RiskRatingChoices.HIGH):
+            return AuditFrequencyChoices.ANNUAL
+        if self.risk_rating == RiskRatingChoices.MEDIUM:
+            return AuditFrequencyChoices.BIENNIAL
+        return AuditFrequencyChoices.TRIENNIAL
 
 
 class EntityRisk(TimeStampedModel):
@@ -1045,6 +1468,115 @@ class EntityRisk(TimeStampedModel):
 
     def __str__(self):
         return f"{self.title} ({self.entity_id})"
+
+
+class EntityMaterialityValue(TimeStampedModel):
+    """One size/materiality figure for one entity, for one period.
+
+    Kept as rows rather than columns so the metric set is configurable per
+    install (see :class:`MaterialityMetricDefinition`). The ``as_of`` date
+    makes the series auditable: "revenue was 4.1bn as at FY2025" survives
+    the FY2026 refresh instead of being overwritten.
+
+    ``AuditableEntity.materiality_cache`` mirrors the latest value per metric
+    for sorting; this table stays the source of truth.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    entity = models.ForeignKey(
+        AuditableEntity,
+        on_delete=models.CASCADE,
+        related_name="materiality_values",
+    )
+    definition = models.ForeignKey(
+        MaterialityMetricDefinition,
+        on_delete=models.PROTECT,
+        related_name="values",
+    )
+    value = models.DecimalField(max_digits=20, decimal_places=2, null=True, blank=True)
+    as_of = models.DateField(help_text="Period the figure refers to.")
+    source = models.CharField(
+        max_length=120,
+        blank=True,
+        help_text='Where the figure came from, e.g. "GL extract FY25".',
+    )
+
+    class Meta:
+        ordering = ["definition__display_order", "-as_of"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["entity", "definition", "as_of"],
+                name="iams_entity_materiality_unique_period",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["entity", "definition", "-as_of"], name="ent_mat_lookup_idx"),
+        ]
+
+    def __str__(self):
+        return f"{self.definition_id}={self.value} @ {self.as_of}"
+
+
+class AssuranceCoverage(TimeStampedModel):
+    """Assurance provided over an entity by someone other than internal audit.
+
+    Standard 9.5 Coordination and Reliance requires the chief audit executive
+    to coordinate with, and where appropriate rely on, other assurance
+    providers so that risk coverage is maximised and effort is not duplicated.
+    Recording who else covers a unit is what makes that decision reviewable —
+    and it feeds the ``assurance_coverage`` risk factor, whose IIA rating
+    anchors key off how recently the unit was last reviewed by anyone.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    entity = models.ForeignKey(
+        AuditableEntity,
+        on_delete=models.CASCADE,
+        related_name="assurance_coverage",
+    )
+    provider_name = models.CharField(max_length=200)
+    provider_type = models.CharField(
+        max_length=24,
+        choices=AssuranceProviderTypeChoices.choices,
+        default=AssuranceProviderTypeChoices.SECOND_LINE,
+    )
+    scope = models.TextField(blank=True)
+    last_review_date = models.DateField(null=True, blank=True)
+    next_review_date = models.DateField(null=True, blank=True)
+    reliance_level = models.CharField(
+        max_length=8,
+        choices=RelianceLevelChoices.choices,
+        default=RelianceLevelChoices.NONE,
+    )
+    reliance_rationale = models.TextField(
+        blank=True,
+        help_text=(
+            "Why internal audit considers this provider's work reliable. "
+            "Required whenever reliance is full or partial — a reliance "
+            "decision without a documented basis is not defensible under "
+            "Standard 9.5."
+        ),
+    )
+
+    class Meta:
+        ordering = ["entity_id", "provider_name"]
+        indexes = [
+            models.Index(fields=["entity", "-last_review_date"], name="assurance_recency_idx"),
+        ]
+        constraints = [
+            # A reliance decision must carry its basis. Enforced at the DB
+            # level so admin / import / raw ORM writers cannot bypass it.
+            models.CheckConstraint(
+                condition=(
+                    models.Q(reliance_level=RelianceLevelChoices.NONE)
+                    | ~models.Q(reliance_rationale="")
+                ),
+                name="iams_assurance_reliance_needs_rationale",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.provider_name} over {self.entity_id}"
 
 
 class BulkImportJob(TimeStampedModel):
@@ -2886,8 +3418,40 @@ class RiskFactor(TimeStampedModel):
     scale_max = models.PositiveSmallIntegerField(default=5)
     is_active = models.BooleanField(default=True, db_index=True)
 
+    # ── Audit Universe v2 ─────────────────────────────────────────────
+    group = models.CharField(
+        max_length=12,
+        choices=RiskFactorGroupChoices.choices,
+        default=RiskFactorGroupChoices.STANDALONE,
+        db_index=True,
+        help_text=(
+            "Whether this factor drives impact or likelihood. The "
+            "``impact_likelihood`` formula subtotals the two groups "
+            "separately before summing them (IIA GPG Appendix F)."
+        ),
+    )
+    guidance = models.TextField(
+        blank=True,
+        help_text=(
+            "The considerations an assessor rates against, one per line. "
+            'For "Loss / material exposure": dollar value at risk, annual '
+            "operating expenses, number of transactions, impact on other "
+            "areas, degree of reliance on IT."
+        ),
+    )
+    rating_anchors = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text=(
+            'What each point on the scale means, as {"1": "...", "5": "..."}. '
+            "Rendered beside each option so two assessors reading the same "
+            "unit land on the same number."
+        ),
+    )
+    display_order = models.PositiveSmallIntegerField(default=0)
+
     class Meta:
-        ordering = ["name"]
+        ordering = ["display_order", "name"]
         constraints = [
             models.CheckConstraint(
                 condition=models.Q(scale_max__gt=models.F("scale_min")),
@@ -2907,10 +3471,17 @@ class RiskScoringModel(TimeStampedModel):
     FORMULA_WEIGHTED_SUM = "weighted_sum"
     FORMULA_WEIGHTED_AVG = "weighted_avg"
     FORMULA_MULTIPLICATIVE = "multiplicative"
+    # IIA risk-factor approach: weight the impact-group factors into one
+    # subtotal, the likelihood-group factors into another, then sum the two
+    # (GPG Appendix F, Figure F.2). Native range is 2..10; the engine
+    # normalizes to 0..100 like every other formula so thresholds and ranking
+    # stay formula-agnostic.
+    FORMULA_IMPACT_LIKELIHOOD = "impact_likelihood"
     FORMULA_CHOICES = [
         (FORMULA_WEIGHTED_SUM, "Weighted sum"),
         (FORMULA_WEIGHTED_AVG, "Weighted average"),
         (FORMULA_MULTIPLICATIVE, "Multiplicative (likelihood × impact)"),
+        (FORMULA_IMPACT_LIKELIHOOD, "Impact + likelihood subtotals (IIA risk-factor approach)"),
     ]
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)

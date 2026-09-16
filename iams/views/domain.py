@@ -400,6 +400,7 @@ class AuditableEntityViewSet(ModuleGatedMixin, AuditedViewSetMixin, viewsets.Mod
     filterset_class = AuditableEntityFilter
     search_fields = [
         "name",
+        "code",
         "description",
         "cost_center_id",
         "department",
@@ -416,6 +417,12 @@ class AuditableEntityViewSet(ModuleGatedMixin, AuditedViewSetMixin, viewsets.Mod
         "operating_budget",
         "created_at",
         "updated_at",
+        # ── Audit Universe v2 ──
+        "code",
+        "universe_category",
+        "frequency_source",
+        "estimated_ia_days",
+        "estimated_cosource_days",
     ]
     ordering = ["name", "id"]
 
@@ -533,6 +540,26 @@ class AuditableEntityViewSet(ModuleGatedMixin, AuditedViewSetMixin, viewsets.Mod
         "primary_owner_id",
         "secondary_owner_id",
         "parent_id",
+        # ── Audit Universe v2 ──
+        # Objectives, scope and the effort estimate are the fields a QA
+        # reviewer is most likely to ask "who changed this, and when?" about,
+        # so they belong in the immutable diff alongside the risk fields.
+        "code",
+        "universe_category",
+        "audit_objectives",
+        "scope_inclusions",
+        "scope_exclusions",
+        "frequency_source",
+        "mandate_reference",
+        "estimated_ia_days",
+        "estimated_cosource_days",
+        "required_skills",
+        "applicable_frameworks",
+        "is_third_party",
+        "third_party_name",
+        "audit_rights_confirmed",
+        "is_fraud_risk_relevant",
+        "executive_sponsor_id",
     )
 
     @staticmethod
@@ -3193,3 +3220,190 @@ class DashboardRoleView(APIView):
             key, lambda: role_bundle(role=role, user_email=user_email)
         )
         return Response(payload)
+
+
+# ═════════════════════════════════════════════════════════════════════
+# Audit Universe v2 — lookups, materiality, assurance coverage
+#
+# See docs/AUDIT-UNIVERSE-FORM-SPEC.md §12.
+# ═════════════════════════════════════════════════════════════════════
+from django.db.models import Count as _Count  # noqa: E402
+
+from iams.models import (  # noqa: E402
+    AssuranceCoverage,
+    EntityMaterialityValue,
+    KeySystem,
+    MaterialityMetricDefinition,
+    StrategicObjective,
+)
+from iams.domain_serializers import (  # noqa: E402
+    AssuranceCoverageSerializer,
+    EntityMaterialityValueSerializer,
+    KeySystemSerializer,
+    MaterialityMetricDefinitionSerializer,
+    StrategicObjectiveSerializer,
+)
+
+
+class StrategicObjectiveViewSet(ModuleGatedMixin, AuditedViewSetMixin, viewsets.ModelViewSet):
+    """Corporate objectives that auditable entities can be mapped against.
+
+    Standard 9.4 requires the internal audit plan to support the achievement
+    of the organization's objectives. ``entityCount`` on each row is what makes
+    an uncovered objective visible.
+    """
+
+    serializer_class = StrategicObjectiveSerializer
+    search_fields = ["code", "title", "description"]
+    ordering_fields = ["code", "title", "period", "created_at"]
+    ordering = ["code"]
+    module = "audit_universe"
+
+    def get_queryset(self):
+        qs = (
+            StrategicObjective.objects
+            .select_related("owner")
+            .annotate(_entity_count=_Count("auditable_entities", distinct=True))
+        )
+        if self.request.query_params.get("activeOnly", "").lower() in ("1", "true", "yes"):
+            qs = qs.filter(is_active=True)
+        return qs
+
+
+class KeySystemViewSet(ModuleGatedMixin, AuditedViewSetMixin, viewsets.ModelViewSet):
+    """Applications and platforms auditable entities depend on."""
+
+    serializer_class = KeySystemSerializer
+    search_fields = ["name", "vendor", "description"]
+    ordering_fields = ["name", "criticality", "created_at"]
+    ordering = ["name"]
+    module = "audit_universe"
+
+    def get_queryset(self):
+        qs = KeySystem.objects.all()
+        if self.request.query_params.get("activeOnly", "").lower() in ("1", "true", "yes"):
+            qs = qs.filter(is_active=True)
+        return qs
+
+
+class MaterialityMetricDefinitionViewSet(
+    ModuleGatedMixin, AuditedViewSetMixin, viewsets.ModelViewSet,
+):
+    """The configurable size / materiality metric registry (FR-AU-02).
+
+    Reading is part of filling in an entity — anyone who can see the universe
+    can see which metrics exist. Changing the registry is configuration: it
+    alters what every entity in the organization is asked for, so writes are
+    gated at administration level rather than at audit_universe edit.
+
+    ``?entityType=`` / ``?universeCategory=`` narrow the list to the metrics
+    offered for a given entity, honouring each definition's ``applies_to``.
+    """
+
+    serializer_class = MaterialityMetricDefinitionSerializer
+    search_fields = ["code", "label", "description"]
+    ordering_fields = ["display_order", "label", "code"]
+    ordering = ["display_order", "label"]
+    module = "audit_universe"
+
+    def get_permissions(self):
+        if self.action in ("list", "retrieve"):
+            return [ModuleAccess("audit_universe", "read")]
+        # Same gate as manage_settings (see rbac_matrix.LEGACY_PERMISSION_MAP).
+        return [ModuleAccess("users_roles", "full")]
+
+    def get_queryset(self):
+        qs = MaterialityMetricDefinition.objects.select_related("feeds_factor")
+        params = self.request.query_params
+        if params.get("activeOnly", "").lower() in ("1", "true", "yes"):
+            qs = qs.filter(is_active=True)
+        # ``applies_to`` is an opt-in narrowing: an empty list means the metric
+        # is offered everywhere, so those rows must survive the filter.
+        #
+        # Evaluated in Python because applies_to is a JSON list and SQLite
+        # (dev / tests) has no containment operator, then narrowed back to a
+        # queryset by pk — returning the list itself would break the search
+        # and ordering filter backends downstream.
+        scope = [
+            v for v in (params.get("entityType"), params.get("universeCategory")) if v
+        ]
+        if scope:
+            keep = [
+                d.pk for d in qs
+                if not d.applies_to or any(tok in d.applies_to for tok in scope)
+            ]
+            qs = MaterialityMetricDefinition.objects.select_related(
+                "feeds_factor",
+            ).filter(pk__in=keep)
+        return qs
+
+
+class EntityMaterialityValueViewSet(
+    ModuleGatedMixin, AuditedViewSetMixin, viewsets.ModelViewSet,
+):
+    """Size / materiality figures captured against an entity.
+
+    Filter by ``?entity=<uuid>``. Every write refreshes the owning entity's
+    ``materiality_cache`` so the register's sorting stays in step with the
+    rows people actually edited.
+    """
+
+    serializer_class = EntityMaterialityValueSerializer
+    ordering_fields = ["as_of", "value"]
+    ordering = ["definition__display_order", "-as_of"]
+    module = "audit_universe"
+
+    def get_queryset(self):
+        qs = EntityMaterialityValue.objects.select_related("definition", "entity")
+        entity_id = self.request.query_params.get("entity")
+        if entity_id:
+            qs = qs.filter(entity_id=entity_id)
+        return qs
+
+    def _refresh_cache(self, entity_id):
+        from iams.materiality import refresh_materiality_cache
+        entity = AuditableEntity.all_objects.filter(pk=entity_id).first()
+        if entity is not None:
+            refresh_materiality_cache(entity)
+
+    def perform_create(self, serializer):
+        super().perform_create(serializer)
+        self._refresh_cache(serializer.instance.entity_id)
+
+    def perform_update(self, serializer):
+        # A value can be moved between entities; both caches then need work.
+        old_entity_id = serializer.instance.entity_id
+        super().perform_update(serializer)
+        self._refresh_cache(serializer.instance.entity_id)
+        if old_entity_id != serializer.instance.entity_id:
+            self._refresh_cache(old_entity_id)
+
+    def perform_destroy(self, instance):
+        entity_id = instance.entity_id
+        super().perform_destroy(instance)
+        self._refresh_cache(entity_id)
+
+
+class AssuranceCoverageViewSet(ModuleGatedMixin, AuditedViewSetMixin, viewsets.ModelViewSet):
+    """Assurance over an entity provided by someone other than internal audit.
+
+    Filter by ``?entity=<uuid>``. Gated at risk_assessment rather than
+    audit_universe: deciding to rely on another provider's work is a risk
+    judgement (Standard 9.5), not a bookkeeping edit to the register.
+    """
+
+    serializer_class = AssuranceCoverageSerializer
+    search_fields = ["provider_name", "scope"]
+    ordering_fields = ["provider_name", "last_review_date", "next_review_date"]
+    ordering = ["provider_name"]
+    module = "risk_assessment"
+
+    def get_queryset(self):
+        qs = AssuranceCoverage.objects.select_related("entity")
+        entity_id = self.request.query_params.get("entity")
+        if entity_id:
+            qs = qs.filter(entity_id=entity_id)
+        provider_type = self.request.query_params.get("providerType")
+        if provider_type:
+            qs = qs.filter(provider_type=provider_type)
+        return qs

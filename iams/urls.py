@@ -76,6 +76,11 @@ from iams.views import (
     EntityRiskScoreViewSet,
     RiskHeatMapView,
     GenerateAuditPlanView,
+    StrategicObjectiveViewSet,
+    KeySystemViewSet,
+    MaterialityMetricDefinitionViewSet,
+    EntityMaterialityValueViewSet,
+    AssuranceCoverageViewSet,
     ReportJobViewSet,
     GenerateReportView,
     TimeEntryViewSet,
@@ -109,6 +114,24 @@ router.register(
     basename="audit-universe-revision",
 )
 router.register("business-units", BusinessUnitViewSet, basename="business-unit")
+# Audit Universe v2 — see docs/AUDIT-UNIVERSE-FORM-SPEC.md
+router.register("strategic-objectives", StrategicObjectiveViewSet, basename="strategic-objective")
+router.register("key-systems", KeySystemViewSet, basename="key-system")
+router.register(
+    "materiality-metrics",
+    MaterialityMetricDefinitionViewSet,
+    basename="materiality-metric",
+)
+router.register(
+    "entity-materiality",
+    EntityMaterialityValueViewSet,
+    basename="entity-materiality",
+)
+router.register(
+    "assurance-coverage",
+    AssuranceCoverageViewSet,
+    basename="assurance-coverage",
+)
 router.register("tags", TagViewSet, basename="tag")
 router.register(
     "audit-universe-import-jobs",

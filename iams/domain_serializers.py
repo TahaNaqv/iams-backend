@@ -1,9 +1,21 @@
 from decimal import Decimal
 
 from django.contrib.auth import get_user_model
+from django.utils import timezone
 from rest_framework import serializers
 
 User = get_user_model()
+
+# Audit Universe v2 models. Imported up here rather than beside the v2
+# serializers at the foot of the file because AuditableEntitySerializer
+# references StrategicObjective and KeySystem in its field declarations.
+from iams.models import (  # noqa: E402
+    AssuranceCoverage,
+    EntityMaterialityValue,
+    KeySystem,
+    MaterialityMetricDefinition,
+    StrategicObjective,
+)
 
 from iams.models import (
     ActivityItem,
@@ -452,6 +464,83 @@ class AuditableEntitySerializer(serializers.ModelSerializer):
         allow_null=True,
     )
     isMandatoryToAudit = serializers.BooleanField(source="is_mandatory_to_audit", required=False)
+
+    # ── Audit Universe v2 (docs/AUDIT-UNIVERSE-FORM-SPEC.md) ──────────
+    universeCategory = serializers.ChoiceField(
+        source="universe_category",
+        choices=AuditableEntity._meta.get_field("universe_category").choices,
+        required=False,
+        allow_blank=True,
+    )
+    # The IIA triad: objectives, initial scope, resources.
+    auditObjectives = serializers.CharField(
+        source="audit_objectives", required=False, allow_blank=True,
+    )
+    scopeInclusions = serializers.CharField(
+        source="scope_inclusions", required=False, allow_blank=True,
+    )
+    scopeExclusions = serializers.CharField(
+        source="scope_exclusions", required=False, allow_blank=True,
+    )
+    strategicObjectiveIds = serializers.PrimaryKeyRelatedField(
+        source="strategic_objectives",
+        queryset=StrategicObjective.objects.all(),
+        many=True,
+        required=False,
+    )
+    executiveSponsorId = serializers.PrimaryKeyRelatedField(
+        source="executive_sponsor",
+        queryset=User.objects.all(),
+        required=False,
+        allow_null=True,
+    )
+    frequencySource = serializers.ChoiceField(
+        source="frequency_source",
+        choices=AuditableEntity._meta.get_field("frequency_source").choices,
+        required=False,
+    )
+    mandateReference = serializers.CharField(
+        source="mandate_reference", required=False, allow_blank=True,
+    )
+    estimatedIaDays = serializers.DecimalField(
+        source="estimated_ia_days", max_digits=6, decimal_places=2,
+        min_value=Decimal("0"), required=False, allow_null=True,
+    )
+    estimatedCosourceDays = serializers.DecimalField(
+        source="estimated_cosource_days", max_digits=6, decimal_places=2,
+        min_value=Decimal("0"), required=False, allow_null=True,
+    )
+    requiredSkills = serializers.JSONField(source="required_skills", required=False)
+    applicableFrameworks = serializers.JSONField(
+        source="applicable_frameworks", required=False,
+    )
+    keySystemIds = serializers.PrimaryKeyRelatedField(
+        source="key_systems",
+        queryset=KeySystem.objects.all(),
+        many=True,
+        required=False,
+    )
+    isThirdParty = serializers.BooleanField(source="is_third_party", required=False)
+    thirdPartyName = serializers.CharField(
+        source="third_party_name", required=False, allow_blank=True,
+    )
+    auditRightsConfirmed = serializers.BooleanField(
+        source="audit_rights_confirmed", required=False,
+    )
+    isFraudRiskRelevant = serializers.BooleanField(
+        source="is_fraud_risk_relevant", required=False,
+    )
+    # ── Derived, read-only ──
+    totalEstimatedDays = serializers.DecimalField(
+        source="total_estimated_days", max_digits=7, decimal_places=2, read_only=True,
+    )
+    monthsSinceLastAudit = serializers.IntegerField(
+        source="months_since_last_audit", read_only=True,
+    )
+    suggestedFrequency = serializers.CharField(
+        source="suggested_audit_frequency", read_only=True,
+    )
+    materialityCache = serializers.JSONField(source="materiality_cache", read_only=True)
     costCenterId = serializers.CharField(source="cost_center_id", required=False, allow_blank=True)
     inherentLikelihood = serializers.IntegerField(
         source="inherent_likelihood",
@@ -620,6 +709,30 @@ class AuditableEntitySerializer(serializers.ModelSerializer):
             "currentRiskScore",
             "lastRevisionAt",
             "version",
+            # ── Audit Universe v2 ──
+            "code",
+            "universeCategory",
+            "auditObjectives",
+            "scopeInclusions",
+            "scopeExclusions",
+            "strategicObjectiveIds",
+            "executiveSponsorId",
+            "frequencySource",
+            "mandateReference",
+            "estimatedIaDays",
+            "estimatedCosourceDays",
+            "requiredSkills",
+            "applicableFrameworks",
+            "keySystemIds",
+            "isThirdParty",
+            "thirdPartyName",
+            "auditRightsConfirmed",
+            "isFraudRiskRelevant",
+            # v2 derived (read-only)
+            "totalEstimatedDays",
+            "monthsSinceLastAudit",
+            "suggestedFrequency",
+            "materialityCache",
         ]
         # ``status`` is lifecycle-controlled: it may only change through the
         # dedicated archive/restore actions (which record a revision + metric),
@@ -1972,6 +2085,7 @@ class ControlTestSerializer(serializers.ModelSerializer):
 from iams.models import (  # noqa: E402
     EntityRiskScore,
     RiskFactor,
+    RiskFactorGroupChoices,
     RiskFactorWeight,
     RiskScoringModel,
 )
@@ -1981,10 +2095,47 @@ class RiskFactorSerializer(serializers.ModelSerializer):
     scaleMin = serializers.IntegerField(source="scale_min", min_value=0)
     scaleMax = serializers.IntegerField(source="scale_max", min_value=1)
     isActive = serializers.BooleanField(source="is_active")
+    # ── Audit Universe v2 ──
+    # ``group``, ``guidance`` and ``ratingAnchors`` are what let the scoring
+    # step render itself from the model rather than from hardcoded fields:
+    # the UI groups factors into impact/likelihood columns, shows the criteria
+    # an assessor rates against, and labels each point on the scale.
+    group = serializers.ChoiceField(
+        choices=RiskFactorGroupChoices.choices, required=False,
+    )
+    guidance = serializers.CharField(required=False, allow_blank=True)
+    ratingAnchors = serializers.JSONField(source="rating_anchors", required=False)
+    displayOrder = serializers.IntegerField(source="display_order", required=False)
 
     class Meta:
         model = RiskFactor
-        fields = ["id", "code", "name", "description", "scaleMin", "scaleMax", "isActive"]
+        fields = [
+            "id", "code", "name", "description", "scaleMin", "scaleMax",
+            "isActive", "group", "guidance", "ratingAnchors", "displayOrder",
+        ]
+
+    def validate_ratingAnchors(self, value):
+        """Anchors must be a flat ``{"<point>": "<label>"}`` map.
+
+        A malformed map would render as blank labels next to the radio
+        buttons, which is exactly the situation the anchors exist to prevent.
+        """
+        if value in (None, ""):
+            return {}
+        if not isinstance(value, dict):
+            raise serializers.ValidationError(
+                'Expected an object mapping scale points to labels, e.g. {"1": "Little exposure."}.'
+            )
+        for key, label in value.items():
+            if not str(key).strip().isdigit():
+                raise serializers.ValidationError(
+                    f"Anchor key {key!r} is not a scale point; use the number as the key."
+                )
+            if not isinstance(label, str):
+                raise serializers.ValidationError(
+                    f"Anchor {key} must be text describing what that rating means."
+                )
+        return value
 
 
 class RiskFactorWeightSerializer(serializers.ModelSerializer):
@@ -2083,3 +2234,179 @@ class ReportJobSerializer(serializers.ModelSerializer):
         if not obj.output_file or obj.status != ReportJob.STATUS_COMPLETED:
             return None
         return obj.output_file.name  # the download endpoint resolves to a URL
+
+
+# ═════════════════════════════════════════════════════════════════════
+# Audit Universe v2 — lookups, materiality, assurance coverage
+#
+# See docs/AUDIT-UNIVERSE-FORM-SPEC.md. These back the sections of the
+# entity form that were previously missing entirely: the mandate's
+# strategic-objective links, IT dependencies, the configurable size /
+# materiality registry (FR-AU-02), and other-assurance coordination
+# (Global Internal Audit Standard 9.5).
+# ═════════════════════════════════════════════════════════════════════
+
+
+class StrategicObjectiveSerializer(serializers.ModelSerializer):
+    ownerId = serializers.PrimaryKeyRelatedField(
+        source="owner",
+        queryset=User.objects.all(),
+        required=False,
+        allow_null=True,
+    )
+    ownerName = serializers.SerializerMethodField()
+    isActive = serializers.BooleanField(source="is_active", required=False)
+    entityCount = serializers.SerializerMethodField()
+
+    class Meta:
+        model = StrategicObjective
+        fields = [
+            "id", "code", "title", "description",
+            "ownerId", "ownerName", "period", "isActive", "entityCount",
+        ]
+
+    def get_ownerName(self, obj):
+        if not obj.owner_id:
+            return ""
+        owner = obj.owner
+        return (owner.get_full_name() or owner.email or owner.username).strip()
+
+    def get_entityCount(self, obj):
+        """How many auditable entities claim to support this objective.
+
+        Surfaced so the plan can show an objective with zero coverage, which
+        is the gap Standard 9.4 is really asking about.
+        """
+        count = getattr(obj, "_entity_count", None)
+        if count is not None:
+            return count
+        return obj.auditable_entities.count()
+
+
+class KeySystemSerializer(serializers.ModelSerializer):
+    isActive = serializers.BooleanField(source="is_active", required=False)
+
+    class Meta:
+        model = KeySystem
+        fields = [
+            "id", "name", "vendor", "criticality", "hosting",
+            "description", "isActive",
+        ]
+
+
+class MaterialityMetricDefinitionSerializer(serializers.ModelSerializer):
+    appliesTo = serializers.JSONField(source="applies_to", required=False)
+    feedsFactorId = serializers.PrimaryKeyRelatedField(
+        source="feeds_factor",
+        queryset=RiskFactor.objects.all(),
+        required=False,
+        allow_null=True,
+    )
+    feedsFactorCode = serializers.CharField(source="feeds_factor.code", read_only=True)
+    displayOrder = serializers.IntegerField(source="display_order", required=False)
+    isActive = serializers.BooleanField(source="is_active", required=False)
+
+    class Meta:
+        model = MaterialityMetricDefinition
+        fields = [
+            "id", "code", "label", "description", "unit", "currency",
+            "appliesTo", "feedsFactorId", "feedsFactorCode",
+            "displayOrder", "isActive",
+        ]
+
+    def validate(self, attrs):
+        """A currency metric without a currency is an ambiguous figure."""
+        unit = attrs.get("unit", getattr(self.instance, "unit", None))
+        currency = attrs.get("currency", getattr(self.instance, "currency", ""))
+        if unit == "currency" and not (currency or "").strip():
+            raise serializers.ValidationError({
+                "currency": "Set an ISO-4217 currency code for a currency metric.",
+            })
+        return attrs
+
+
+class EntityMaterialityValueSerializer(serializers.ModelSerializer):
+    entityId = serializers.PrimaryKeyRelatedField(
+        source="entity", queryset=AuditableEntity.all_objects.all(),
+    )
+    definitionId = serializers.PrimaryKeyRelatedField(
+        source="definition",
+        queryset=MaterialityMetricDefinition.objects.all(),
+    )
+    metricCode = serializers.CharField(source="definition.code", read_only=True)
+    metricLabel = serializers.CharField(source="definition.label", read_only=True)
+    unit = serializers.CharField(source="definition.unit", read_only=True)
+    currency = serializers.CharField(source="definition.currency", read_only=True)
+    asOf = serializers.DateField(source="as_of")
+
+    class Meta:
+        model = EntityMaterialityValue
+        fields = [
+            "id", "entityId", "definitionId", "metricCode", "metricLabel",
+            "unit", "currency", "value", "asOf", "source",
+        ]
+
+
+class AssuranceCoverageSerializer(serializers.ModelSerializer):
+    entityId = serializers.PrimaryKeyRelatedField(
+        source="entity", queryset=AuditableEntity.all_objects.all(),
+    )
+    providerName = serializers.CharField(source="provider_name")
+    providerType = serializers.ChoiceField(
+        source="provider_type",
+        choices=AssuranceCoverage._meta.get_field("provider_type").choices,
+        required=False,
+    )
+    lastReviewDate = serializers.DateField(
+        source="last_review_date", required=False, allow_null=True,
+    )
+    nextReviewDate = serializers.DateField(
+        source="next_review_date", required=False, allow_null=True,
+    )
+    relianceLevel = serializers.ChoiceField(
+        source="reliance_level",
+        choices=AssuranceCoverage._meta.get_field("reliance_level").choices,
+        required=False,
+    )
+    relianceRationale = serializers.CharField(
+        source="reliance_rationale", required=False, allow_blank=True,
+    )
+
+    class Meta:
+        model = AssuranceCoverage
+        fields = [
+            "id", "entityId", "providerName", "providerType", "scope",
+            "lastReviewDate", "nextReviewDate",
+            "relianceLevel", "relianceRationale",
+        ]
+
+    def validate(self, attrs):
+        """Placing reliance on someone else's work requires a stated basis.
+
+        Standard 9.5 lets internal audit rely on other assurance providers,
+        but the decision has to be defensible. The DB carries the same rule as
+        a check constraint; this raises it as a field error instead of an
+        IntegrityError so the form can point at the right box.
+        """
+        level = attrs.get(
+            "reliance_level", getattr(self.instance, "reliance_level", "none"),
+        )
+        rationale = attrs.get(
+            "reliance_rationale", getattr(self.instance, "reliance_rationale", ""),
+        )
+        if level != "none" and not (rationale or "").strip():
+            raise serializers.ValidationError({
+                "relianceRationale": (
+                    "Explain why this provider's work is considered reliable "
+                    "before placing full or partial reliance on it."
+                ),
+            })
+        # A review date in the future is almost always a next-review date
+        # typed into the wrong box; it would also feed the assurance-coverage
+        # risk factor a recency it has not earned.
+        last = attrs.get("last_review_date", getattr(self.instance, "last_review_date", None))
+        if last and last > timezone.now().date():
+            raise serializers.ValidationError({
+                "lastReviewDate": "The last review cannot be in the future.",
+            })
+        return attrs

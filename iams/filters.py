@@ -26,6 +26,18 @@ from django.db.models import Q
 from iams.models import AuditableEntity, BusinessUnit, EntityRisk, Tag
 
 
+def _json_list_contains_q(field: str, token: str) -> Q:
+    """Vendor-aware predicate for "this JSON list column contains ``token``".
+
+    Postgres / MySQL / Oracle get the native containment operator; SQLite
+    (tests / dev) falls back to a substring search of the JSON text, which is
+    correct for the well-formed lists of plain strings we always write.
+    """
+    if connection.vendor == "sqlite":
+        return Q(**{f"{field}__icontains": f'"{token}"'})
+    return Q(**{f"{field}__contains": [token]})
+
+
 def _tag_match_q(tag: str) -> Q:
     """Vendor-aware predicate to match an entity whose ``tags`` JSON array
     contains ``tag``.
@@ -90,6 +102,23 @@ class AuditableEntityFilter(django_filters.FilterSet):
     mandatoryWithoutPlan = django_filters.BooleanFilter(method="filter_mandatory_without_plan")
     withoutRiskScore = django_filters.BooleanFilter(method="filter_without_risk_score")
 
+    # ── Audit Universe v2 ─────────────────────────────────────────────
+    universeCategory = CSVCharFilter(field_name="universe_category", lookup_expr="in")
+    frequencySource = CSVCharFilter(field_name="frequency_source", lookup_expr="in")
+    isThirdParty = django_filters.BooleanFilter(field_name="is_third_party")
+    isFraudRiskRelevant = django_filters.BooleanFilter(field_name="is_fraud_risk_relevant")
+    strategicObjective = django_filters.UUIDFilter(field_name="strategic_objectives__id")
+    keySystem = django_filters.UUIDFilter(field_name="key_systems__id")
+    executiveSponsor = django_filters.UUIDFilter(field_name="executive_sponsor_id")
+    applicableFramework = django_filters.CharFilter(method="filter_framework")
+    requiredSkill = django_filters.CharFilter(method="filter_required_skill")
+    # Data-quality predicates backing the new Coverage tiles.
+    withoutObjectives = django_filters.BooleanFilter(method="filter_without_objectives")
+    withoutScope = django_filters.BooleanFilter(method="filter_without_scope")
+    withoutEffortEstimate = django_filters.BooleanFilter(
+        method="filter_without_effort_estimate",
+    )
+
     q = django_filters.CharFilter(method="filter_q")
 
     class Meta:
@@ -116,6 +145,50 @@ class AuditableEntityFilter(django_filters.FilterSet):
         for t in tokens:
             queryset = queryset.filter(_tag_match_q(t))
         return queryset
+
+    # ── Audit Universe v2 ─────────────────────────────────────────────
+    def filter_framework(self, queryset, name, value):
+        """Entities subject to a given regulatory / control framework."""
+        if not value:
+            return queryset
+        return queryset.filter(_json_list_contains_q("applicable_frameworks", value))
+
+    def filter_required_skill(self, queryset, name, value):
+        """Entities whose engagements need a given specialist skill.
+
+        Answers resourcing questions like "which planned work needs an
+        actuary?" — Standard 9.4 requires the plan to identify the human
+        resources it depends on.
+        """
+        if not value:
+            return queryset
+        return queryset.filter(_json_list_contains_q("required_skills", value))
+
+    def filter_without_objectives(self, queryset, name, value):
+        if not value:
+            return queryset
+        return queryset.filter(audit_objectives="")
+
+    def filter_without_scope(self, queryset, name, value):
+        if not value:
+            return queryset
+        return queryset.filter(scope_inclusions="")
+
+    def filter_without_effort_estimate(self, queryset, name, value):
+        """Entities carrying no effort estimate at all.
+
+        Such an entity cannot be fitted into a capacity-constrained plan, so
+        Coverage surfaces them as work to do before planning season. The
+        legacy ``estimated_man_days`` counts: entities predating the IA /
+        co-source split still carry their figure there.
+        """
+        if not value:
+            return queryset
+        return queryset.filter(
+            Q(estimated_ia_days__isnull=True)
+            & Q(estimated_cosource_days__isnull=True)
+            & Q(estimated_man_days__isnull=True)
+        )
 
     def filter_mine(self, queryset, name, value):
         request = getattr(self, "request", None)

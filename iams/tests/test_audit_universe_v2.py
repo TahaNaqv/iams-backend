@@ -40,6 +40,52 @@ def sa_client(super_admin, authed_client):
 
 
 @pytest.fixture
+def matrix_user(db):
+    """Build a user holding one of the nine canonical matrix roles.
+
+    The shared ``roles`` fixture still seeds the legacy six-role names; the
+    RBAC questions here are specifically about the matrix roles and the exact
+    levels they hold on ``audit_universe`` and ``risk_assessment``, so the cells
+    come straight from ROLE_MATRIX rather than from a legacy key set.
+    """
+    from django.contrib.auth import get_user_model
+
+    from iams.models import Role, RoleModuleAccess, UserProfile
+    from iams.rbac_matrix import ROLE_MATRIX
+    from iams.tests._rbac import ensure_modules
+
+    User = get_user_model()
+    modules = ensure_modules()
+
+    def _make(role_name: str):
+        cells = ROLE_MATRIX[role_name]
+        role, _ = Role.objects.get_or_create(
+            name=role_name,
+            defaults={"is_super_admin": role_name == "System administrator"},
+        )
+        for module_key, (level, scoped) in cells.items():
+            module = modules.get(module_key)
+            if module is None:
+                continue
+            RoleModuleAccess.objects.update_or_create(
+                role=role, module=module,
+                defaults={"level": level, "scoped": scoped},
+            )
+        slug = role_name.lower().replace(" ", "_").replace("/", "_")
+        user = User.objects.create_user(
+            username=f"matrix_{slug}",
+            email=f"matrix_{slug}@iams.test",
+            password="MatrixPass123!",
+        )
+        UserProfile.objects.create(
+            user=user, role=role, department="Audit", status="Active",
+        )
+        return user
+
+    return _make
+
+
+@pytest.fixture
 def entity(db) -> AuditableEntity:
     return AuditableEntity.objects.create(
         name="Claims handling",
@@ -564,3 +610,163 @@ def test_coverage_reports_the_v2_gaps(sa_client, entity):
     assert resp.data["withoutScope"] == 1
     assert resp.data["withoutEffortEstimate"] == 1
     assert resp.data["withoutCurrentFactorScore"] == 1
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Rating override
+# ══════════════════════════════════════════════════════════════════════
+def test_rating_cannot_be_written_through_the_entity_api(sa_client, entity):
+    """The hole the v2 work exists to close.
+
+    The frontend no longer sends riskRating, but bulk import and any external
+    client still could. Locking it at the serializer is what actually shuts it.
+    """
+    resp = sa_client.patch(
+        f"/api/auditable-entities/{entity.id}/",
+        {"riskRating": "Critical", "version": entity.version},
+        format="json",
+    )
+    assert resp.status_code == status.HTTP_200_OK
+    entity.refresh_from_db()
+    assert entity.risk_rating == "Medium"
+    assert entity.risk_rating_is_overridden is False
+
+
+def test_override_requires_a_real_rationale(sa_client, entity):
+    """"n/a" and "per CAE" are exactly what this is here to stop."""
+    resp = sa_client.post(
+        f"/api/auditable-entities/{entity.id}/override-rating/",
+        {"rating": "Critical", "rationale": "n/a"},
+        format="json",
+    )
+    assert resp.status_code == status.HTTP_400_BAD_REQUEST
+    assert "rationale" in resp.data
+    entity.refresh_from_db()
+    assert entity.risk_rating == "Medium"
+
+
+def test_override_rejects_an_unknown_rating(sa_client, entity):
+    resp = sa_client.post(
+        f"/api/auditable-entities/{entity.id}/override-rating/",
+        {"rating": "Extreme", "rationale": "Escalated after the Q2 incident review."},
+        format="json",
+    )
+    assert resp.status_code == status.HTTP_400_BAD_REQUEST
+    assert "rating" in resp.data
+
+
+def test_override_writes_history_and_a_revision(sa_client, entity):
+    from iams.models import AuditableEntityRevision, RiskHistoryEntry
+
+    resp = sa_client.post(
+        f"/api/auditable-entities/{entity.id}/override-rating/",
+        {
+            "rating": "Critical",
+            "rationale": "Escalated by the audit committee after the Q2 incident.",
+            "expiresOn": "2027-06-30",
+        },
+        format="json",
+    )
+    assert resp.status_code == status.HTTP_200_OK, resp.data
+
+    entity.refresh_from_db()
+    assert entity.risk_rating == "Critical"
+    assert entity.risk_rating_is_overridden is True
+
+    history = RiskHistoryEntry.objects.get(entity_ref=entity)
+    assert history.previous_rating == "Medium"
+    assert history.current_rating == "Critical"
+    assert "audit committee" in history.reason
+    assert "2027-06-30" in history.reason
+
+    revision = AuditableEntityRevision.objects.filter(entity=entity).order_by("-version").first()
+    assert "audit committee" in revision.comment
+
+
+def test_releasing_an_override_that_is_not_set_is_a_conflict(sa_client, entity):
+    resp = sa_client.delete(f"/api/auditable-entities/{entity.id}/override-rating/")
+    assert resp.status_code == status.HTTP_409_CONFLICT
+
+
+# ── RBAC: the trap from the spec, asserted both ways ──────────────────
+def test_senior_auditor_can_score_but_cannot_override(
+    authed_client, matrix_user, entity, active_model,
+):
+    """Senior auditor holds risk_assessment *edit* to enter factor scores.
+
+    Entering an assessment and overruling one are different acts, so the
+    override sits at approve. If they shared a gate, anyone who can score could
+    overrule the score.
+    """
+    client = authed_client(matrix_user("Senior auditor"))
+
+    scored = client.put(
+        f"/api/auditable-entities/{entity.id}/risk-factors/",
+        {"factorValues": {"exposure": 4, "controls": 4}},
+        format="json",
+    )
+    assert scored.status_code == status.HTTP_200_OK, scored.data
+
+    overridden = client.post(
+        f"/api/auditable-entities/{entity.id}/override-rating/",
+        {"rating": "Critical", "rationale": "Trying to overrule the engine directly."},
+        format="json",
+    )
+    assert overridden.status_code == status.HTTP_403_FORBIDDEN
+
+
+def test_cae_can_override_despite_read_only_universe_access(
+    authed_client, matrix_user, entity,
+):
+    """The Chief audit executive holds audit_universe=READ.
+
+    Gating the override on audit_universe edit would have locked out the one
+    person whose sign-off the action exists for.
+    """
+    client = authed_client(matrix_user("Chief audit executive"))
+
+    resp = client.post(
+        f"/api/auditable-entities/{entity.id}/override-rating/",
+        {"rating": "High", "rationale": "Carrying the prior year's committee decision forward."},
+        format="json",
+    )
+    assert resp.status_code == status.HTTP_200_OK, resp.data
+    entity.refresh_from_db()
+    assert entity.risk_rating == "High"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Factor scoring endpoint
+# ══════════════════════════════════════════════════════════════════════
+def test_scoring_defaults_to_the_active_model(sa_client, entity, active_model):
+    resp = sa_client.put(
+        f"/api/auditable-entities/{entity.id}/risk-factors/",
+        {"factorValues": {"exposure": 5, "controls": 5}, "notes": "Annual refresh."},
+        format="json",
+    )
+    assert resp.status_code == status.HTTP_200_OK, resp.data
+    assert resp.data["isHighRisk"] is True
+    # The IIA-native 2..10 reading travels alongside the normalized composite,
+    # because that is the number auditors recognise from the practice guide.
+    assert resp.data["detail"]["raw_composite"] == "10.00"
+    assert resp.data["entity"]["readiness"]["criteria"]
+
+
+def test_scoring_without_an_active_model_says_so(sa_client, entity):
+    resp = sa_client.put(
+        f"/api/auditable-entities/{entity.id}/risk-factors/",
+        {"factorValues": {"exposure": 3}},
+        format="json",
+    )
+    assert resp.status_code == status.HTTP_400_BAD_REQUEST
+    assert "Activate one in Settings" in resp.data["detail"]
+
+
+def test_scoring_rejects_an_out_of_range_rating(sa_client, entity, active_model):
+    resp = sa_client.put(
+        f"/api/auditable-entities/{entity.id}/risk-factors/",
+        {"factorValues": {"exposure": 9, "controls": 3}},
+        format="json",
+    )
+    assert resp.status_code == status.HTTP_400_BAD_REQUEST
+    assert "out of range" in resp.data["detail"]

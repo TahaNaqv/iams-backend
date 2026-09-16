@@ -75,7 +75,66 @@ COLUMN_ALIASES: dict[str, str] = {
     "impact": "inherentImpact",
     "external source": "external_source",
     "external id": "external_id",
+    # ── Audit Universe v2 ─────────────────────────────────────────────
+    "entity code": "code",
+    "code": "code",
+    "reference": "code",
+    "universe category": "universeCategory",
+    "category": "universeCategory",
+    "audit objectives": "auditObjectives",
+    "objectives": "auditObjectives",
+    "scope": "scopeInclusions",
+    "in scope": "scopeInclusions",
+    "scope inclusions": "scopeInclusions",
+    "out of scope": "scopeExclusions",
+    "scope exclusions": "scopeExclusions",
+    "frequency basis": "frequencySource",
+    "frequency source": "frequencySource",
+    "mandate reference": "mandateReference",
+    "estimated ia days": "estimatedIaDays",
+    "ia days": "estimatedIaDays",
+    "estimated cosource days": "estimatedCosourceDays",
+    "co-source days": "estimatedCosourceDays",
+    "cosource days": "estimatedCosourceDays",
+    "required skills": "requiredSkills",
+    "applicable frameworks": "applicableFrameworks",
+    "frameworks": "applicableFrameworks",
+    "third party": "isThirdParty",
+    "third party name": "thirdPartyName",
+    "audit rights confirmed": "auditRightsConfirmed",
+    "fraud risk relevant": "isFraudRiskRelevant",
+    "executive sponsor": "executiveSponsorEmail",
+    "rating override rationale": "ratingOverrideRationale",
 }
+
+# Columns the API refuses to accept as plain writes. Importing them silently
+# is how a spreadsheet re-introduces the very problem the v2 form removed: a
+# hand-typed rating that outranks the scoring engine, or a bare likelihood /
+# impact pair that never matches the badge it appears to drive.
+#
+# ``riskRating`` is the exception that proves the rule -- it *is* importable,
+# but only alongside a written rationale, exactly as the override endpoint
+# demands of a human.
+DERIVED_COLUMNS = {
+    "riskRating": (
+        "Risk rating is derived from the risk register and the active scoring "
+        "model. To set it by hand, add a 'Rating override rationale' column "
+        "explaining why (20 characters or more)."
+    ),
+    "inherentLikelihood": (
+        "Inherent likelihood is rolled up from the entity's risks. Import "
+        "risks instead, or leave this column out."
+    ),
+    "inherentImpact": (
+        "Inherent impact is rolled up from the entity's risks. Import risks "
+        "instead, or leave this column out."
+    ),
+    "complianceStatus": (
+        "Compliance status was retired. Use 'Applicable frameworks' to record "
+        "which rules apply here."
+    ),
+}
+MIN_OVERRIDE_RATIONALE = 20
 
 
 def _normalise_header(h: str) -> str:
@@ -119,15 +178,49 @@ def _row_to_payload(row: dict, *, lookups: dict) -> tuple[dict, str | None]:
                 payload[key] = [t.strip() for t in value.split(",") if t.strip()]
             elif isinstance(value, (list, tuple)):
                 payload[key] = [str(t).strip() for t in value if str(t).strip()]
+        elif key == "executiveSponsorEmail":
+            owner = lookups["users_by_email"].get(str(value).strip().lower())
+            if owner:
+                payload["executiveSponsorId"] = str(owner.pk)
+        elif key in ("isThirdParty", "auditRightsConfirmed", "isFraudRiskRelevant"):
+            payload[key] = str(value).strip().lower() in ("1", "true", "yes", "y", "x")
+        elif key in ("requiredSkills", "applicableFrameworks"):
+            if isinstance(value, str):
+                payload[key] = [v.strip() for v in value.split(",") if v.strip()]
+            elif isinstance(value, (list, tuple)):
+                payload[key] = [str(v).strip() for v in value if str(v).strip()]
         elif key in ("headcount", "inherentLikelihood", "inherentImpact"):
             try:
                 payload[key] = int(float(value))
             except (TypeError, ValueError):
                 pass
-        elif key in ("operatingBudget", "estimatedManDays"):
+        elif key in (
+            "operatingBudget", "estimatedManDays",
+            "estimatedIaDays", "estimatedCosourceDays",
+        ):
             payload[key] = str(value)
         else:
             payload[key] = str(value).strip() if isinstance(value, str) else value
+
+    # Derived columns never reach the serializer -- it would reject them as
+    # read-only anyway, failing the whole row over a column the author could
+    # not have known was off-limits. Dropping them with a warning keeps the
+    # rest of the row importable.
+    warnings: list[str] = []
+    rationale = str(payload.pop("ratingOverrideRationale", "") or "").strip()
+    for column, reason in DERIVED_COLUMNS.items():
+        if column not in payload:
+            continue
+        if column == "riskRating" and len(rationale) >= MIN_OVERRIDE_RATIONALE:
+            # Keep it; the caller applies it through the override path so the
+            # rationale lands in the immutable risk history.
+            payload["_ratingOverride"] = {
+                "rating": payload.pop("riskRating"),
+                "rationale": rationale,
+            }
+            continue
+        payload.pop(column)
+        warnings.append(f"{column}: {reason}")
 
     external_source = payload.pop("external_source", None)
     external_id = payload.pop("external_id", None)
@@ -139,7 +232,38 @@ def _row_to_payload(row: dict, *, lookups: dict) -> tuple[dict, str | None]:
     if external_source and external_id:
         payload["external_source"] = external_source
         payload["external_id"] = external_id
+    if warnings:
+        payload["_warnings"] = warnings
     return payload, external_key
+
+
+def _apply_rating_override(entity, override: dict, job) -> None:
+    """Pin an imported rating through the same path a human override takes.
+
+    A spreadsheet is allowed to set a rating, but only on the same terms as a
+    person: with a written reason, recorded in the immutable risk history. That
+    keeps "why is this High?" answerable regardless of how the value arrived.
+    """
+    from django.utils import timezone
+
+    from iams.models import RiskHistoryEntry, RiskRatingChoices
+
+    rating = str(override.get("rating") or "").strip()
+    if rating not in {c for c, _label in RiskRatingChoices.choices}:
+        return
+    previous = entity.risk_rating
+    entity.risk_rating = rating
+    entity.risk_rating_is_overridden = True
+    entity.save(update_fields=["risk_rating", "risk_rating_is_overridden", "updated_at"])
+    who = getattr(job.requested_by, "email", None) or "bulk import"
+    RiskHistoryEntry.objects.create(
+        entity=entity.name,
+        entity_ref=entity,
+        date=timezone.now().date(),
+        previous_rating=previous,
+        current_rating=rating,
+        reason=f"Imported override ({who}): {override.get('rationale', '')}",
+    )
 
 
 def _stream_rows(file_field) -> Iterable[dict]:
@@ -230,6 +354,20 @@ def process_bulk_import(job_id: str) -> dict:
             # Header is row 1; data starts at row 2.
             total += 1
             payload, _ = _row_to_payload(raw, lookups=lookups)
+            # Columns the API will not accept as plain writes are stripped by
+            # _row_to_payload and reported here, so an author with a stale
+            # template sees exactly which column was ignored and why rather
+            # than losing the whole row.
+            for warning in payload.pop("_warnings", []):
+                if len(errors) < 200:
+                    field, _, message = warning.partition(": ")
+                    errors.append({
+                        "row": row_index,
+                        "field": field,
+                        "message": f"Ignored. {message}",
+                        "severity": "warning",
+                    })
+            rating_override = payload.pop("_ratingOverride", None)
             if not payload.get("name"):
                 skipped += 1
                 if len(errors) < 200:
@@ -281,6 +419,8 @@ def process_bulk_import(job_id: str) -> dict:
                 sid = transaction.savepoint() if not strict else None
                 try:
                     obj = serializer.save()
+                    if rating_override:
+                        _apply_rating_override(obj, rating_override, job)
                     if instance is None:
                         created += 1
                     else:
@@ -342,8 +482,13 @@ def process_bulk_import(job_id: str) -> dict:
             pass
         return {"status": job.status, "errors": len(job.errors)}
 
+    # Only real failures degrade the outcome. A stale template that carries a
+    # retired column produces warnings on rows that imported perfectly well;
+    # reporting that as a partial success would send someone hunting for data
+    # that is not missing.
+    has_failures = any(e.get("severity") != "warning" for e in errors)
     job.status = (
-        BulkImportJob.STATUS_PARTIAL if errors else BulkImportJob.STATUS_COMPLETED
+        BulkImportJob.STATUS_PARTIAL if has_failures else BulkImportJob.STATUS_COMPLETED
     )
     job.total_rows = total
     job.processed = total

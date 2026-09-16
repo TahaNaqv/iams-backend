@@ -419,9 +419,19 @@ class AuditableEntitySerializer(serializers.ModelSerializer):
     """
 
     # ── Identity & legacy compatibility ──
+    # Read-only. The rating is resolved by a single authority
+    # (``risk_rollup.resolve_entity_risk_rating``): manual override -> active
+    # scoring model -> residual worst-risk band -> default. Accepting it as a
+    # write field is what made every new entity arrive rated "Medium" and stay
+    # there until someone added a risk. Locking it here rather than only in the
+    # frontend schema matters, because bulk import and external API clients
+    # never go through the form. To pin a rating deliberately, use
+    # ``POST /api/auditable-entities/{id}/override-rating/``, which requires a
+    # rationale and records it.
     riskRating = serializers.ChoiceField(
         source="risk_rating",
         choices=AuditableEntity._meta.get_field("risk_rating").choices,
+        read_only=True,
     )
     entityType = serializers.ChoiceField(
         source="entity_type",
@@ -549,19 +559,16 @@ class AuditableEntitySerializer(serializers.ModelSerializer):
 
         return readiness_service.compute(obj)
     costCenterId = serializers.CharField(source="cost_center_id", required=False, allow_blank=True)
+    # Read-only for the same reason: these are rolled up from the entity's
+    # ``EntityRisk`` line items. An assessment is entered as a risk with its
+    # controls and residual position, not as a bare pair of numbers on the
+    # parent — which also never matched the badge, since the rating bands off
+    # *residual* while these are *inherent*.
     inherentLikelihood = serializers.IntegerField(
-        source="inherent_likelihood",
-        required=False,
-        allow_null=True,
-        min_value=1,
-        max_value=5,
+        source="inherent_likelihood", read_only=True,
     )
     inherentImpact = serializers.IntegerField(
-        source="inherent_impact",
-        required=False,
-        allow_null=True,
-        min_value=1,
-        max_value=5,
+        source="inherent_impact", read_only=True,
     )
     # Residual (post-control) position — read-only; always auto-rolled from
     # the driving risk's residual likelihood/impact (no manual override).

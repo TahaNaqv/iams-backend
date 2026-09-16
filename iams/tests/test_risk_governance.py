@@ -122,15 +122,22 @@ def test_risk_history_is_append_only(entity):
 # ── D2: manual override writes RiskHistoryEntry ────────────────────────
 def test_manual_rating_override_writes_history(authed_client, super_admin, entity):
     client = authed_client(super_admin)
-    resp = client.patch(
-        f"/api/auditable-entities/{entity.id}/",
-        {"riskRating": "Critical", "riskRatingIsOverridden": True, "version": entity.version},
+    resp = client.post(
+        f"/api/auditable-entities/{entity.id}/override-rating/",
+        {
+            "rating": "Critical",
+            "rationale": "Escalated by the audit committee after the Q2 incident.",
+        },
         format="json",
     )
     assert resp.status_code == 200, resp.content
-    hist = RiskHistoryEntry.objects.filter(entity_ref=entity, reason="Manual rating override")
+    hist = RiskHistoryEntry.objects.filter(entity_ref=entity)
     assert hist.count() == 1
-    assert hist.first().current_rating == "Critical"
+    entry = hist.first()
+    assert entry.current_rating == "Critical"
+    # The reason travels with the entry: an override nobody can explain is the
+    # first thing a quality assessor pulls on.
+    assert "audit committee" in entry.reason
 
 
 # ── B1: engine de-escalation via the single authority ──────────────────

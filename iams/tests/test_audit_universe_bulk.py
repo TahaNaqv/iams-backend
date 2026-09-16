@@ -53,9 +53,9 @@ def _csv_upload(rows: list[list[str]], name: str = "universe.csv") -> SimpleUplo
 @pytest.mark.django_db
 def test_csv_import_creates_entities_with_lookups(sa_client, finance_dept):
     csv_file = _csv_upload([
-        ["Name", "Department", "Risk Rating", "Mandatory to audit", "Tags"],
-        ["Accounts Payable", "Finance", "High", "yes", "sox,critical"],
-        ["General Ledger", "Finance", "Medium", "false", "sox"],
+        ["Name", "Department", "Universe Category", "Mandatory to audit", "Tags"],
+        ["Accounts Payable", "Finance", "Finance", "yes", "sox,critical"],
+        ["General Ledger", "Finance", "Finance", "false", "sox"],
     ])
     resp = sa_client.post(
         "/api/auditable-entities/bulk-import/",
@@ -73,7 +73,8 @@ def test_csv_import_creates_entities_with_lookups(sa_client, finance_dept):
     assert job.errors == []
 
     ap = AuditableEntity.objects.get(name="Accounts Payable")
-    assert ap.risk_rating == "High"
+    # Risk rating is no longer importable as a plain column; the category is.
+    assert ap.universe_category == "Finance"
     assert ap.department_entity_id == finance_dept.id
     assert ap.is_mandatory_to_audit is True
     assert sorted(ap.tags) == ["critical", "sox"]
@@ -88,8 +89,8 @@ def test_csv_import_upserts_idempotently_on_external_keys(sa_client, finance_dep
     and every re-import created a duplicate. They must now persist and drive
     the idempotent upsert.
     """
-    header = ["Name", "Department", "Risk Rating", "External Source", "External ID"]
-    first = _csv_upload([header, ["Vendor Mgmt", "Finance", "Low", "erp", "V-100"]])
+    header = ["Name", "Department", "Universe Category", "External Source", "External ID"]
+    first = _csv_upload([header, ["Vendor Mgmt", "Finance", "Operations", "erp", "V-100"]])
     resp = sa_client.post(
         "/api/auditable-entities/bulk-import/",
         {"file": first, "mode": "lenient"},
@@ -103,7 +104,7 @@ def test_csv_import_upserts_idempotently_on_external_keys(sa_client, finance_dep
     assert ent.name == "Vendor Mgmt"
 
     # Re-import the SAME external key with a changed name + rating.
-    second = _csv_upload([header, ["Vendor Management", "Finance", "High", "erp", "V-100"]])
+    second = _csv_upload([header, ["Vendor Management", "Finance", "Finance", "erp", "V-100"]])
     resp2 = sa_client.post(
         "/api/auditable-entities/bulk-import/",
         {"file": second, "mode": "lenient"},
@@ -119,15 +120,15 @@ def test_csv_import_upserts_idempotently_on_external_keys(sa_client, finance_dep
     assert matches.count() == 1
     ent.refresh_from_db()
     assert ent.name == "Vendor Management"
-    assert ent.risk_rating == "High"
+    assert ent.universe_category == "Finance"
 
 
 @pytest.mark.django_db
 def test_csv_import_updates_existing_by_name(sa_client, finance_dept):
     AuditableEntity.objects.create(name="Treasury", department_entity=finance_dept, risk_rating="Medium")
     csv_file = _csv_upload([
-        ["Name", "Department", "Risk Rating"],
-        ["Treasury", "Finance", "Critical"],
+        ["Name", "Department", "Audit Objectives"],
+        ["Treasury", "Finance", "Establish that cash positions are reconciled daily."],
     ])
     resp = sa_client.post(
         "/api/auditable-entities/bulk-import/",
@@ -138,16 +139,18 @@ def test_csv_import_updates_existing_by_name(sa_client, finance_dept):
     job = BulkImportJob.objects.get(pk=resp.json()["id"])
     assert job.created == 0
     assert job.updated == 1
-    AuditableEntity.objects.get(name="Treasury").risk_rating == "Critical"
+    assert AuditableEntity.objects.get(name="Treasury").audit_objectives.startswith(
+        "Establish that cash positions"
+    )
 
 
 @pytest.mark.django_db
 def test_csv_import_skips_bad_rows_in_lenient_mode(sa_client, finance_dept):
     csv_file = _csv_upload([
-        ["Name", "Department", "Risk Rating"],
-        ["", "Finance", "High"],                  # missing name
-        ["Good Row", "Finance", "Extreme"],        # invalid choice
-        ["Another", "Finance", "Low"],             # good
+        ["Name", "Department", "Universe Category"],
+        ["", "Finance", "Finance"],          # missing name
+        ["Good Row", "Finance", "Nowhere"],  # invalid choice
+        ["Another", "Finance", "Finance"],   # good
     ])
     resp = sa_client.post(
         "/api/auditable-entities/bulk-import/",
@@ -161,16 +164,16 @@ def test_csv_import_skips_bad_rows_in_lenient_mode(sa_client, finance_dept):
     assert len(job.errors) == 2
     fields = {e["field"] for e in job.errors}
     assert "name" in fields
-    assert "riskRating" in fields
+    assert "universeCategory" in fields
 
 
 @pytest.mark.django_db
 def test_strict_mode_aborts_on_first_error(sa_client, finance_dept):
     csv_file = _csv_upload([
-        ["Name", "Department", "Risk Rating"],
-        ["First", "Finance", "Low"],
-        ["", "Finance", "High"],   # bad — name missing
-        ["Third", "Finance", "Medium"],
+        ["Name", "Department", "Universe Category"],
+        ["First", "Finance", "Finance"],
+        ["", "Finance", "Finance"],   # bad — name missing
+        ["Third", "Finance", "Finance"],
     ])
     resp = sa_client.post(
         "/api/auditable-entities/bulk-import/",
@@ -222,9 +225,9 @@ def _xlsx_upload(rows: list[list[str]], name: str = "universe.xlsx") -> SimpleUp
 @pytest.mark.django_db
 def test_xlsx_import_creates_entities(sa_client, finance_dept):
     xlsx = _xlsx_upload([
-        ["Name", "Department", "Risk Rating"],
-        ["Procurement", "Finance", "High"],
-        ["Treasury Ops", "Finance", "Medium"],
+        ["Name", "Department", "Universe Category"],
+        ["Procurement", "Finance", "Operations"],
+        ["Treasury Ops", "Finance", "Finance"],
     ])
     resp = sa_client.post(
         "/api/auditable-entities/bulk-import/",
@@ -235,7 +238,7 @@ def test_xlsx_import_creates_entities(sa_client, finance_dept):
     job = BulkImportJob.objects.get(pk=resp.json()["id"])
     assert job.status == BulkImportJob.STATUS_COMPLETED, job.errors
     assert job.created == 2
-    assert AuditableEntity.objects.get(name="Procurement").risk_rating == "High"
+    assert AuditableEntity.objects.get(name="Procurement").universe_category == "Operations"
 
 
 @pytest.mark.django_db

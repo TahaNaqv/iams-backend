@@ -493,12 +493,179 @@ def heat_map(model: RiskScoringModel) -> dict[str, Any]:
 # Annual plan generation (FR-PLAN-01)
 # ──────────────────────────────────────────────────────────────────────
 @transaction.atomic
+# ──────────────────────────────────────────────────────────────────────
+# Capacity
+# ──────────────────────────────────────────────────────────────────────
+def available_audit_days(capacity: dict) -> dict:
+    """Turn a team's shape into the days actually available for engagements.
+
+    ``auditors x working days x direct-audit ratio``, less a reserve. The
+    defaults follow the convention in the planning literature: ~230 working
+    days per auditor, 60-70% of that spent on direct audit work rather than
+    training, administration and QA, and a 10-15% reserve so an emerging risk
+    or a board request does not have to displace a planned engagement.
+
+    The reserve is deducted, never spent: what the planner may fill is what
+    comes back in ``available``.
+    """
+    auditors = Decimal(str(capacity.get("auditors", 0) or 0))
+    per_auditor = Decimal(str(capacity.get("workingDaysPerAuditor", 230) or 230))
+    direct_ratio = Decimal(str(capacity.get("directAuditRatio", "0.65") or "0.65"))
+    reserve_pct = Decimal(str(capacity.get("reservePercent", "0.15") or "0.15"))
+
+    if auditors <= 0:
+        raise RiskEngineError("capacity.auditors must be greater than zero.")
+    if not (0 < direct_ratio <= 1):
+        raise RiskEngineError("capacity.directAuditRatio must be between 0 and 1.")
+    if not (0 <= reserve_pct < 1):
+        raise RiskEngineError("capacity.reservePercent must be between 0 and 1.")
+
+    gross = auditors * per_auditor * direct_ratio
+    reserve = gross * reserve_pct
+    return {
+        "gross": _quantize(gross),
+        "reserve": _quantize(reserve),
+        "available": _quantize(gross - reserve),
+    }
+
+
+def _entity_effort(entity) -> Decimal:
+    """Estimated days for an entity, falling back to the legacy column.
+
+    An entity with no estimate at all is treated as zero rather than excluded:
+    excluding it would quietly drop a high-risk unit from the plan because
+    nobody had filled in a number yet. It appears in the plan and is reported
+    in ``unestimated`` so the gap is visible instead of silent.
+    """
+    total = getattr(entity, "total_estimated_days", None)
+    return Decimal(str(total)) if total is not None else _ZERO
+
+
+def _cycle_months(rating: str) -> int:
+    """Months a rating implies between engagements (IIA GPG, p.20)."""
+    return {"Critical": 12, "High": 12, "Medium": 24}.get(rating, 36)
+
+
+def select_plan_entities(
+    scored,
+    *,
+    capacity: dict | None = None,
+    top_n: int = 20,
+    min_readiness: int | None = None,
+    include_mandatory: bool = True,
+) -> dict:
+    """Choose which entities go into a plan, and say what did not fit.
+
+    Order of business, which is not the same as order of risk:
+
+    1. **Mandated engagements first.** A cyclical review required by law
+       competes for the same days as a risk-ranked one and has to happen even
+       when its inherent risk is low (IIA GPG, "Cyclical Frequency in Highly
+       Regulated Industries"). Dropping one to fit a higher-scoring entity is
+       a compliance failure, not a prioritisation call.
+    2. **Overdue cycles next.** An entity past the interval its own rating
+       implies is already outside the cadence the plan promised.
+    3. **Then risk rank**, filling until the available days run out.
+
+    Everything that did not fit comes back in ``spilled``. That is the output
+    the chief audit executive actually needs: a plan that silently drops what
+    it could not afford leaves no basis for asking the board for more resource.
+
+    ``min_readiness`` gates on record completeness. Planning off an entity with
+    no objectives, no effort estimate and no assessment is not risk-based
+    planning, so those are excluded and reported rather than quietly included.
+    """
+    budget = available_audit_days(capacity) if capacity else None
+    remaining = budget["available"] if budget else None
+
+    today = timezone.now().date()
+    candidates = []
+    excluded_unassessed = []
+
+    for row in scored:
+        entity = row.entity
+        if min_readiness is not None:
+            from iams import readiness as readiness_service
+
+            if readiness_service.score_only(entity) < min_readiness:
+                excluded_unassessed.append(entity)
+                continue
+
+        months_since = entity.months_since_last_audit
+        is_mandated = bool(
+            include_mandatory
+            and (entity.is_mandatory_to_audit or entity.frequency_source == "Mandated")
+        )
+        is_overdue = (
+            months_since is None or months_since >= _cycle_months(entity.risk_rating)
+        )
+        # Sort key: mandated first, then overdue, then by score. Negated so a
+        # plain ascending sort puts the most pressing first.
+        candidates.append({
+            "entity": entity,
+            "composite": row.composite_score,
+            "days": _entity_effort(entity),
+            "reason": (
+                "mandated" if is_mandated
+                else "overdue" if is_overdue
+                else "risk rank"
+            ),
+            "_order": (
+                0 if is_mandated else 1 if is_overdue else 2,
+                -Decimal(str(row.composite_score or 0)),
+                entity.name,
+            ),
+        })
+
+    candidates.sort(key=lambda c: c["_order"])
+
+    selected, spilled, unestimated = [], [], []
+    used = _ZERO
+    for candidate in candidates:
+        days = candidate["days"]
+        if days <= 0:
+            unestimated.append(candidate["entity"])
+        # A mandated engagement is never spilled: it is not ours to drop.
+        if remaining is not None and candidate["reason"] != "mandated":
+            if len(selected) >= top_n or days > remaining:
+                spilled.append(candidate)
+                continue
+        elif remaining is None and len(selected) >= top_n:
+            spilled.append(candidate)
+            continue
+        selected.append(candidate)
+        used += days
+        if remaining is not None:
+            remaining = max(_ZERO, remaining - days)
+
+    for candidate in (*selected, *spilled):
+        candidate.pop("_order", None)
+
+    result = {
+        "selected": selected,
+        "spilled": spilled,
+        "excluded_unassessed": excluded_unassessed,
+        "unestimated": unestimated,
+    }
+    if budget:
+        result["capacity"] = {
+            **budget,
+            "used": _quantize(used),
+            "remaining": _quantize(remaining if remaining is not None else _ZERO),
+            "overCommitted": used > budget["available"],
+        }
+    return result
+
+
 def generate_audit_plan_draft(
     *,
     model: RiskScoringModel,
     year: int,
     top_n: int = 20,
     requested_by: User,
+    capacity: dict | None = None,
+    min_readiness: int | None = None,
+    include_mandatory: bool = True,
 ) -> ApprovalRequest:
     """Pick top-N current scores; create a draft Audit Plan ApprovalRequest.
 
@@ -512,28 +679,62 @@ def generate_audit_plan_draft(
     if top_n <= 0:
         raise RiskEngineError("top_n must be a positive integer.")
 
-    top = list(
+    scored = list(
         EntityRiskScore.objects
         .filter(scoring_model=model, is_current=True)
         .select_related("entity")
         .order_by("-composite_score", "entity__name")
-        [:top_n]
     )
-    if not top:
+    if not scored:
         raise RiskEngineError(
             f"No current risk scores for model '{model.name}' — score some entities first.",
         )
 
+    selection = select_plan_entities(
+        scored,
+        capacity=capacity,
+        top_n=top_n,
+        min_readiness=min_readiness,
+        include_mandatory=include_mandatory,
+    )
+    top = selection["selected"]
+
     lines = [
-        f"{rank+1:>3}. {row.entity.name} — composite {row.composite_score} (rank {row.rank})"
+        f"{rank + 1:>3}. {row['entity'].name} — composite {row['composite']} "
+        f"({row['reason']}, {row['days']} days)"
         for rank, row in enumerate(top)
     ]
     description = (
-        f"Draft annual audit plan for {year}, top {len(top)} entities by "
-        f"composite risk score using scoring model "
-        f"'{model.name}' v{model.version} ({model.formula}).\n\n"
+        f"Draft annual audit plan for {year}: {len(top)} engagements using "
+        f"scoring model '{model.name}' v{model.version} ({model.formula}).\n\n"
         + "\n".join(lines)
     )
+    if capacity:
+        budget = selection["capacity"]
+        description += (
+            f"\n\nCapacity: {budget['used']} of {budget['available']} days used "
+            f"({budget['reserve']} held in reserve, {budget['gross']} gross)."
+        )
+    if selection["spilled"]:
+        # The point of the exercise. A plan that silently drops what did not
+        # fit leaves the CAE with no way to ask the board for more resource --
+        # Standard 10.1 is about exactly that conversation.
+        spill_lines = "\n".join(
+            f"     {row['entity'].name} — composite {row['composite']}, {row['days']} days"
+            for row in selection["spilled"]
+        )
+        spill_days = sum(Decimal(str(row["days"])) for row in selection["spilled"])
+        description += (
+            f"\n\nNot included for capacity reasons "
+            f"({len(selection['spilled'])} engagements, {spill_days} days):\n"
+            + spill_lines
+        )
+    if selection["excluded_unassessed"]:
+        description += (
+            f"\n\nExcluded as not yet assessed "
+            f"(readiness below {min_readiness}%): "
+            + ", ".join(e.name for e in selection["excluded_unassessed"])
+        )
 
     # Collision-safe reference: a re-generated plan for the same year gets a
     # ``-r2``/``-r3`` suffix instead of silently duplicating ``PLAN-<year>``.
@@ -561,9 +762,42 @@ def generate_audit_plan_draft(
     # Chain template auto-application is wired via the post_save signal
     # (iams/signals.py::approval_request_apply_chain) so the steps get
     # generated for us right after this row commits.
+    # Attach a machine-readable summary so the API can return what fitted,
+    # what spilled and how much capacity is left, rather than making the caller
+    # parse it back out of the description.
+    req._plan_summary = {
+        "selected": [
+            {
+                "entityId": str(row["entity"].id),
+                "name": row["entity"].name,
+                "composite": str(row["composite"]),
+                "days": str(row["days"]),
+                "reason": row["reason"],
+            }
+            for row in selection["selected"]
+        ],
+        "spilled": [
+            {
+                "entityId": str(row["entity"].id),
+                "name": row["entity"].name,
+                "composite": str(row["composite"]),
+                "days": str(row["days"]),
+            }
+            for row in selection["spilled"]
+        ],
+        "excludedUnassessed": [
+            {"entityId": str(e.id), "name": e.name}
+            for e in selection["excluded_unassessed"]
+        ],
+        "unestimated": [
+            {"entityId": str(e.id), "name": e.name} for e in selection["unestimated"]
+        ],
+        "capacity": {k: str(v) for k, v in selection.get("capacity", {}).items()},
+    }
     logger.info(
-        "risk_engine: generated audit plan draft for year=%s, top_n=%d, request=%s",
-        year, top_n, req.pk,
+        "risk_engine: generated audit plan draft for year=%s, selected=%d, "
+        "spilled=%d, request=%s",
+        year, len(selection["selected"]), len(selection["spilled"]), req.pk,
     )
     return req
 

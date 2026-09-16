@@ -90,6 +90,9 @@ class ModuleGatedMixin:
     (create/update/partial_update/custom @actions) -> edit. Use
     ``read_actions`` / ``approve_actions`` / ``action_levels`` to override
     (e.g. add a custom read-only @action to ``read_actions``).
+
+    An @action that belongs to a *different* module sets its own
+    ``permission_classes``; that wins over the viewset's module gate.
     """
 
     module = None
@@ -111,6 +114,19 @@ class ModuleGatedMixin:
         return "edit"
 
     def get_permissions(self):
+        # An @action may gate itself on a *different* module by passing
+        # ``permission_classes``. Without this check the mixin would override
+        # it silently and the action would run on the viewset's module instead
+        # — which is how the rating-override action ended up gated on
+        # audit_universe, locking out the Chief audit executive, who holds only
+        # Read there and is precisely the person the action exists for.
+        handler = getattr(self, getattr(self, "action", "") or "", None)
+        override = getattr(handler, "kwargs", {}).get("permission_classes")
+        if override:
+            return [
+                permission() if isinstance(permission, type) else permission
+                for permission in override
+            ]
         if self.module is None:
             return super().get_permissions()
         return [ModuleAccess(self.module, self._level_for_action())]

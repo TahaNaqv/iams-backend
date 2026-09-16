@@ -99,7 +99,6 @@ def test_create_entity_with_full_payload(sa_client, finance_dept, finance_bu, su
         "name": "General Ledger Process",
         "description": "End-of-month GL close.",
         "entityType": "Process",
-        "riskRating": "Medium",
         "complianceStatus": "Compliant",
         "auditFrequency": "Quarterly",
         "lastAuditRating": "Satisfactory",
@@ -112,8 +111,6 @@ def test_create_entity_with_full_payload(sa_client, finance_dept, finance_bu, su
         "operatingBudget": "150000.50",
         "estimatedManDays": "12.50",
         "costCenterId": "FIN-1234",
-        "inherentLikelihood": 3,
-        "inherentImpact": 4,
         "location": "EMEA",
         "primaryLanguage": "en",
     }
@@ -121,11 +118,14 @@ def test_create_entity_with_full_payload(sa_client, finance_dept, finance_bu, su
     assert resp.status_code == status.HTTP_201_CREATED, resp.content
     body = resp.json()
     assert body["name"] == "General Ledger Process"
+    # riskRating comes back at its default: it is derived, not supplied.
     assert body["riskRating"] == "Medium"
     assert body["complianceStatus"] == "Compliant"
     assert body["tags"] == ["sox", "high-volume"]
     assert body["estimatedManDays"] == "12.50"
-    assert body["inherentScore"] == 12
+    # Inherent likelihood / impact are roll-up outputs, so a create cannot
+    # seed them and there is no score until a risk is attached.
+    assert body["inherentScore"] is None
     assert body["primaryOwner"]["id"] == str(super_admin.id)
     assert body["version"] == 1
 
@@ -134,27 +134,27 @@ def test_create_entity_with_full_payload(sa_client, finance_dept, finance_bu, su
 def test_update_entity_bumps_version_and_records_revision(sa_client, entity_ap):
     resp = sa_client.patch(
         f"/api/auditable-entities/{entity_ap.id}/",
-        {"riskRating": "Critical", "version": entity_ap.version},
+        {"universeCategory": "Finance", "version": entity_ap.version},
         format="json",
     )
     assert resp.status_code == status.HTTP_200_OK, resp.content
     body = resp.json()
-    assert body["riskRating"] == "Critical"
+    assert body["universeCategory"] == "Finance"
     assert body["version"] == entity_ap.version + 1
 
     revs = AuditableEntityRevision.objects.filter(entity=entity_ap)
     assert revs.count() >= 1
     last = revs.order_by("-created_at").first()
-    assert "risk_rating" in last.changes
-    assert last.changes["risk_rating"]["from"] == "High"
-    assert last.changes["risk_rating"]["to"] == "Critical"
+    assert "universe_category" in last.changes
+    assert last.changes["universe_category"]["from"] == ""
+    assert last.changes["universe_category"]["to"] == "Finance"
 
 
 @pytest.mark.django_db
 def test_optimistic_lock_rejects_stale_version(sa_client, entity_ap):
     resp = sa_client.patch(
         f"/api/auditable-entities/{entity_ap.id}/",
-        {"riskRating": "Critical", "version": 99},
+        {"universeCategory": "Finance", "version": 99},
         format="json",
     )
     assert resp.status_code == status.HTTP_400_BAD_REQUEST
@@ -168,7 +168,6 @@ def test_optimistic_lock_rejects_stale_version(sa_client, entity_ap):
 @pytest.mark.parametrize(
     "field,bad_value",
     [
-        ("riskRating", "Extreme"),
         ("entityType", "NotAType"),
         ("complianceStatus", "Pending"),
         ("auditFrequency", "Sometimes"),
@@ -178,7 +177,6 @@ def test_choice_validation_rejects_unknown_values(sa_client, finance_dept, field
     payload = {
         "name": f"Bad-{field}",
         "departmentId": str(finance_dept.id),
-        "riskRating": "Medium",
         field: bad_value,
     }
     resp = sa_client.post("/api/auditable-entities/", payload, format="json")
@@ -195,7 +193,7 @@ def test_entity_writes_populate_global_audit_log(sa_client, finance_dept):
     """
     resp = sa_client.post(
         "/api/auditable-entities/",
-        {"name": "Trade Settlement", "departmentId": str(finance_dept.id), "riskRating": "Medium"},
+        {"name": "Trade Settlement", "departmentId": str(finance_dept.id)},
         format="json",
     )
     assert resp.status_code == status.HTTP_201_CREATED, resp.content
@@ -207,7 +205,7 @@ def test_entity_writes_populate_global_audit_log(sa_client, finance_dept):
 
     sa_client.patch(
         f"/api/auditable-entities/{eid}/",
-        {"riskRating": "High", "version": ver},
+        {"universeCategory": "Operations", "version": ver},
         format="json",
     )
     assert logs.filter(action=AuditLogEntry.ACTION_UPDATE).exists()
@@ -274,8 +272,7 @@ def test_status_is_read_only_and_lifecycle_controlled(sa_client, finance_dept):
         {
             "name": "Lifecycle",
             "departmentId": str(finance_dept.id),
-            "riskRating": "Medium",
-            "status": "Archived",
+                "status": "Archived",
         },
         format="json",
     )
@@ -305,7 +302,6 @@ def test_entity_type_accepts_org_scopes(sa_client, finance_dept, entity_type):
     payload = {
         "name": f"Scoped-{entity_type}",
         "departmentId": str(finance_dept.id),
-        "riskRating": "Medium",
         "entityType": entity_type,
     }
     resp = sa_client.post("/api/auditable-entities/", payload, format="json")
@@ -337,7 +333,6 @@ def test_estimated_man_days_rejects_overflow(sa_client, finance_dept):
     payload = {
         "name": "Effort overflow",
         "departmentId": str(finance_dept.id),
-        "riskRating": "Medium",
         "estimatedManDays": "1000000.00",  # exceeds max_digits=6
     }
     resp = sa_client.post("/api/auditable-entities/", payload, format="json")
@@ -350,7 +345,6 @@ def test_estimated_man_days_rejects_negative(sa_client, finance_dept):
     payload = {
         "name": "Negative effort",
         "departmentId": str(finance_dept.id),
-        "riskRating": "Medium",
         "estimatedManDays": "-1.00",
     }
     resp = sa_client.post("/api/auditable-entities/", payload, format="json")
@@ -359,16 +353,27 @@ def test_estimated_man_days_rejects_negative(sa_client, finance_dept):
 
 
 @pytest.mark.django_db
-def test_inherent_likelihood_range_validation(sa_client, finance_dept):
-    payload = {
-        "name": "Out of range",
-        "departmentId": str(finance_dept.id),
-        "riskRating": "Medium",
-        "inherentLikelihood": 9,
-    }
-    resp = sa_client.post("/api/auditable-entities/", payload, format="json")
-    assert resp.status_code == status.HTTP_400_BAD_REQUEST
-    assert "inherentLikelihood" in resp.json()
+def test_inherent_likelihood_is_read_only_on_write(sa_client, finance_dept):
+    """Inherent likelihood / impact cannot be set through the entity API.
+
+    They are rolled up from the entity's ``EntityRisk`` line items. A write is
+    ignored rather than rejected (DRF drops read-only keys), which is what lets
+    a pre-v2 client keep POSTing its old payload shape without failing.
+    """
+    resp = sa_client.post(
+        "/api/auditable-entities/",
+        {
+            "name": "Read-only check",
+            "departmentId": str(finance_dept.id),
+            "inherentLikelihood": 9,
+            "inherentImpact": 9,
+        },
+        format="json",
+    )
+    assert resp.status_code == status.HTTP_201_CREATED, resp.content
+    body = resp.json()
+    assert body["inherentLikelihood"] is None
+    assert body["inherentImpact"] is None
 
 
 @pytest.mark.django_db
@@ -590,7 +595,7 @@ def test_clone_creates_copy_with_new_name(sa_client, entity_ap):
 def test_revision_appended_on_create(sa_client, finance_dept):
     resp = sa_client.post(
         "/api/auditable-entities/",
-        {"name": "Test create", "departmentId": str(finance_dept.id), "riskRating": "Low"},
+        {"name": "Test create", "departmentId": str(finance_dept.id)},
         format="json",
     )
     entity_id = resp.json()["id"]
@@ -603,13 +608,13 @@ def test_revision_appended_on_create(sa_client, finance_dept):
 def test_revisions_endpoint_lists_per_entity(sa_client, entity_ap):
     sa_client.patch(
         f"/api/auditable-entities/{entity_ap.id}/",
-        {"riskRating": "Critical", "version": entity_ap.version}, format="json",
+        {"universeCategory": "Finance", "version": entity_ap.version}, format="json",
     )
     resp = sa_client.get(f"/api/auditable-entities/{entity_ap.id}/revisions/")
     assert resp.status_code == status.HTTP_200_OK
     body = resp.json()
     items = body.get("results", body)
-    assert any("risk_rating" in (r["changes"] or {}) for r in items)
+    assert any("universe_category" in (r["changes"] or {}) for r in items)
 
 
 @pytest.mark.django_db
@@ -639,7 +644,7 @@ def test_auditor_can_read_but_not_create(auditor_client, finance_dept):
     assert list_resp.status_code == status.HTTP_200_OK
     create_resp = auditor_client.post(
         "/api/auditable-entities/",
-        {"name": "Forbidden", "departmentId": str(finance_dept.id), "riskRating": "Low"},
+        {"name": "Forbidden", "departmentId": str(finance_dept.id)},
         format="json",
     )
     assert create_resp.status_code == status.HTTP_403_FORBIDDEN
@@ -649,7 +654,7 @@ def test_auditor_can_read_but_not_create(auditor_client, finance_dept):
 def test_manager_can_create_and_edit(manager_client, finance_dept):
     create_resp = manager_client.post(
         "/api/auditable-entities/",
-        {"name": "Mgr-created", "departmentId": str(finance_dept.id), "riskRating": "Medium"},
+        {"name": "Mgr-created", "departmentId": str(finance_dept.id)},
         format="json",
     )
     assert create_resp.status_code == status.HTTP_201_CREATED
@@ -878,8 +883,7 @@ def test_create_bumps_prometheus_counter(sa_client, finance_dept):
         {
             "name": "Counter target",
             "departmentId": str(finance_dept.id),
-            "riskRating": "Medium",
-        },
+            },
         format="json",
     )
     assert resp.status_code == status.HTTP_201_CREATED
@@ -968,9 +972,12 @@ def test_closed_risks_excluded_from_rollup(sa_client, finance_dept):
 def test_manual_override_survives_rollup(sa_client, finance_dept):
     e = AuditableEntity.objects.create(name="Treasury", department_entity=finance_dept)
     # Pin the rating manually.
-    resp = sa_client.patch(
-        f"/api/auditable-entities/{e.id}/",
-        {"riskRating": "Critical", "riskRatingIsOverridden": True, "version": e.version},
+    resp = sa_client.post(
+        f"/api/auditable-entities/{e.id}/override-rating/",
+        {
+            "rating": "Critical",
+            "rationale": "Board asked for continuous coverage after the 2026 incident.",
+        },
         format="json",
     )
     assert resp.status_code == status.HTTP_200_OK, resp.content
@@ -986,9 +993,12 @@ def test_reset_risk_overrides_recomputes(sa_client, finance_dept):
     e = AuditableEntity.objects.create(name="Payroll", department_entity=finance_dept)
     _add_risk(sa_client, e.id, inherentLikelihood=2, inherentImpact=2)
     e.refresh_from_db()
-    resp = sa_client.patch(
-        f"/api/auditable-entities/{e.id}/",
-        {"riskRating": "Critical", "riskRatingIsOverridden": True, "version": e.version},
+    resp = sa_client.post(
+        f"/api/auditable-entities/{e.id}/override-rating/",
+        {
+            "rating": "Critical",
+            "rationale": "Board asked for continuous coverage after the 2026 incident.",
+        },
         format="json",
     )
     assert resp.status_code == status.HTTP_200_OK, resp.content
@@ -1032,25 +1042,21 @@ def test_auditor_cannot_add_risk(auditor_client, finance_dept):
 
 
 @pytest.mark.django_db
-def test_clearing_override_via_entity_patch_recomputes(sa_client, finance_dept):
+def test_releasing_an_override_recomputes(sa_client, finance_dept):
     e = AuditableEntity.objects.create(name="Override clear", department_entity=finance_dept)
     _add_risk(sa_client, e.id, inherentLikelihood=2, inherentImpact=2)  # auto → Low
     e.refresh_from_db()
-    # Pin rating manually.
-    r = sa_client.patch(
-        f"/api/auditable-entities/{e.id}/",
-        {"riskRating": "Critical", "riskRatingIsOverridden": True, "version": e.version},
+    # Pin the rating through the override action.
+    r = sa_client.post(
+        f"/api/auditable-entities/{e.id}/override-rating/",
+        {"rating": "Critical", "rationale": "Pinned pending the remediation review."},
         format="json",
     )
     assert r.status_code == status.HTTP_200_OK, r.content
     e.refresh_from_db()
     assert e.risk_rating == "Critical"
-    # Flip back to Auto via the entity PATCH — must recompute, not stay stale.
-    r = sa_client.patch(
-        f"/api/auditable-entities/{e.id}/",
-        {"riskRatingIsOverridden": False, "version": e.version},
-        format="json",
-    )
+    # Releasing it must recompute from the register, not leave a stale value.
+    r = sa_client.delete(f"/api/auditable-entities/{e.id}/override-rating/")
     assert r.status_code == status.HTTP_200_OK, r.content
     e.refresh_from_db()
     assert e.risk_rating == "Low"
@@ -1082,7 +1088,6 @@ def test_custom_fields_round_trip_and_clean(sa_client, finance_dept):
     payload = {
         "name": "With custom fields",
         "departmentId": str(finance_dept.id),
-        "riskRating": "Medium",
         "customFields": [
             {"label": "  Regulator ", "value": " SECP "},
             {"label": "", "value": ""},  # blank row → dropped
@@ -1105,8 +1110,7 @@ def test_custom_fields_reject_label_only_missing(sa_client, finance_dept):
         {
             "name": "Bad custom",
             "departmentId": str(finance_dept.id),
-            "riskRating": "Medium",
-            "customFields": [{"value": "orphan value"}],  # no label
+                "customFields": [{"value": "orphan value"}],  # no label
         },
         format="json",
     )
@@ -1121,8 +1125,7 @@ def test_custom_fields_reject_over_cap(sa_client, finance_dept):
         {
             "name": "Too many custom",
             "departmentId": str(finance_dept.id),
-            "riskRating": "Medium",
-            "customFields": [{"label": f"L{i}", "value": str(i)} for i in range(51)],
+                "customFields": [{"label": f"L{i}", "value": str(i)} for i in range(51)],
         },
         format="json",
     )

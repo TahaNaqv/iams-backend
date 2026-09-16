@@ -439,7 +439,11 @@ class AuditableEntityViewSet(ModuleGatedMixin, AuditedViewSetMixin, viewsets.Mod
         "coverage",
         "kpis",
         "export",
+        "readiness",
     )
+    # ``override_rating`` and ``risk_factors`` set their own
+    # ``permission_classes`` (risk_assessment approve / edit) and so bypass the
+    # audit_universe gate entirely — see their docstrings for why.
 
     # Expensive actions ride a tighter rate bucket (audit_universe_heavy)
     # instead of the generic 300/min user throttle.
@@ -1001,6 +1005,199 @@ class AuditableEntityViewSet(ModuleGatedMixin, AuditedViewSetMixin, viewsets.Mod
                 risk_scores__snapshot_at__lt=timezone.now() - timedelta(days=365),
             ).distinct().count(),
         })
+
+    @action(
+        detail=True,
+        methods=["post", "delete"],
+        url_path="override-rating",
+        permission_classes=[ModuleAccess("risk_assessment", "approve")],
+    )
+    def override_rating(self, request, pk=None):
+        """Pin an entity's risk rating manually, or release it back to auto.
+
+        The rating is normally resolved by a single authority (manual override
+        -> active scoring model -> residual worst-risk band -> default). This
+        is the only way to set it by hand, and it costs a written reason:
+        an override that nobody can explain is the first thing a quality
+        assessor pulls on, and the plan it feeds is board-facing.
+
+        POST   ``{"rating": "High", "rationale": "...", "expiresOn": "2027-06-30"}``
+        DELETE clears the override and re-rolls from the risk register.
+
+        Gated at ``risk_assessment`` **approve**, not ``edit``: Senior auditor
+        holds Edit there in order to enter factor scores, and entering an
+        assessment is a different act from overruling one. It is deliberately
+        not gated on ``audit_universe`` — the Chief audit executive holds only
+        Read there, and would otherwise be locked out of the action their
+        sign-off exists for.
+        """
+        from iams.models import RiskHistoryEntry, RiskRatingChoices
+        from iams.risk_rollup import recompute_entity_risk_position
+
+        entity = self.get_object()
+        before = self._capture_field_values(entity)
+        previous = entity.risk_rating
+
+        if request.method == "DELETE":
+            if not entity.risk_rating_is_overridden:
+                return Response(
+                    {"detail": "This entity's rating is not overridden."},
+                    status=status.HTTP_409_CONFLICT,
+                )
+            entity.risk_rating_is_overridden = False
+            entity.version = (entity.version or 0) + 1
+            entity.save(update_fields=["risk_rating_is_overridden", "version", "updated_at"])
+            # Record the release at THIS version before re-rolling. The roll-up
+            # bumps the version again and writes its own revision for whatever
+            # rating the register now implies; writing ours afterwards would
+            # collide on the (entity, version) unique constraint and lose the
+            # release from the trail.
+            changes = self._record_revision(
+                entity,
+                before=before,
+                comment="Rating override released; re-rolled from the risk register.",
+            )
+            self._audit_capture(
+                action=AuditLogEntry.ACTION_UPDATE,
+                instance=entity,
+                changes=changes or {},
+            )
+            recompute_entity_risk_position(entity)
+            entity.refresh_from_db()
+            return Response(self.get_serializer(entity).data)
+        else:
+            rating = request.data.get("rating")
+            rationale = (request.data.get("rationale") or "").strip()
+            valid = {c for c, _label in RiskRatingChoices.choices}
+            if rating not in valid:
+                return Response(
+                    {"rating": [f"Must be one of: {', '.join(sorted(valid))}."]},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            # Long enough to be a reason rather than a shrug. "n/a" and "per
+            # CAE" are the two things this is here to stop.
+            if len(rationale) < 20:
+                return Response(
+                    {"rationale": [
+                        "Explain why this rating is being set by hand, in at "
+                        "least 20 characters. It is recorded against the entity "
+                        "and shown to reviewers.",
+                    ]},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            expires_on = request.data.get("expiresOn") or None
+
+            entity.risk_rating = rating
+            entity.risk_rating_is_overridden = True
+            entity.version = (entity.version or 0) + 1
+            entity.save(update_fields=[
+                "risk_rating", "risk_rating_is_overridden", "version", "updated_at",
+            ])
+            RiskHistoryEntry.objects.create(
+                entity=entity.name,
+                entity_ref=entity,
+                date=timezone.now().date(),
+                previous_rating=previous,
+                current_rating=rating,
+                reason=(
+                    f"Manual override by {request.user.get_username()}: {rationale}"
+                    + (f" (expires {expires_on})" if expires_on else "")
+                ),
+            )
+
+        changes = self._record_revision(entity, before=before, comment=rationale)
+        self._audit_capture(
+            action=AuditLogEntry.ACTION_UPDATE,
+            instance=entity,
+            changes=changes or {},
+        )
+        return Response(self.get_serializer(entity).data)
+
+    @action(
+        detail=True,
+        methods=["put"],
+        url_path="risk-factors",
+        permission_classes=[ModuleAccess("risk_assessment", "edit")],
+    )
+    def risk_factors(self, request, pk=None):
+        """Score this entity against a risk model's factors.
+
+        Body: ``{"scoringModelId": "...", "factorValues": {"loss_exposure": 4},
+        "notes": "..."}``. Creates a new ``EntityRiskScore`` snapshot and flips
+        ``is_current`` on the previous one, so the assessment history stays
+        intact and a historical composite can still be re-derived from its
+        frozen ``model_snapshot``.
+
+        Defaults to the active model when ``scoringModelId`` is omitted, since
+        that is the one readiness and planning actually consult.
+        """
+        from iams.risk_engine import RiskEngineError, impact_likelihood_detail, record_score
+
+        entity = self.get_object()
+        model_id = request.data.get("scoringModelId")
+        if model_id:
+            model = RiskScoringModel.objects.filter(pk=model_id).first()
+        else:
+            model = RiskScoringModel.objects.filter(is_active=True).first()
+        if model is None:
+            return Response(
+                {"detail": (
+                    "No scoring model to score against. Activate one in "
+                    "Settings, or pass scoringModelId explicitly."
+                )},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        factor_values = request.data.get("factorValues") or {}
+        if not isinstance(factor_values, dict):
+            return Response(
+                {"factorValues": ["Expected an object of {factorCode: rating}."]},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            score = record_score(
+                entity,
+                model=model,
+                factor_values=factor_values,
+                by_user=request.user if request.user.is_authenticated else None,
+                notes=request.data.get("notes", ""),
+            )
+        except RiskEngineError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        from iams.audit import record_audit_event
+
+        record_audit_event(
+            action=AuditLogEntry.ACTION_OTHER,
+            actor=request.user,
+            target=entity,
+            details={
+                "event": "entity_risk_factors_scored",
+                "scoringModel": f"{model.name} v{model.version}",
+                "composite": str(score.composite_score),
+            },
+            request=request,
+        )
+
+        payload = {
+            "composite": str(score.composite_score),
+            "isHighRisk": score.is_high_risk,
+            "rank": score.rank,
+            "snapshotAt": score.snapshot_at,
+        }
+        # The IIA formula also has a native 2..10 reading, which is the one
+        # auditors recognise from the practice guide; send both.
+        if model.formula == RiskScoringModel.FORMULA_IMPACT_LIKELIHOOD:
+            try:
+                payload["detail"] = {
+                    k: (str(v) if v is not None else None)
+                    for k, v in impact_likelihood_detail(model, factor_values).items()
+                }
+            except RiskEngineError:
+                pass
+        entity.refresh_from_db()
+        payload["entity"] = self.get_serializer(entity).data
+        return Response(payload)
 
     @action(detail=True, methods=["get"], url_path="readiness")
     def readiness(self, request, pk=None):
@@ -3013,10 +3210,30 @@ class GenerateAuditPlanView(APIView):
             model = RiskScoringModel.objects.get(pk=model_id)
         except RiskScoringModel.DoesNotExist:
             return Response({"detail": "scoring model not found."}, status=status.HTTP_404_NOT_FOUND)
+        capacity = request.data.get("capacity") or None
+        if capacity is not None and not isinstance(capacity, dict):
+            return Response(
+                {"capacity": ['Expected an object, e.g. {"auditors": 6}.']},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        min_readiness = request.data.get("minReadiness")
+        if min_readiness is not None:
+            try:
+                min_readiness = int(min_readiness)
+            except (TypeError, ValueError):
+                return Response(
+                    {"minReadiness": ["Must be a whole percentage, e.g. 80."]},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+        include_mandatory = bool(request.data.get("includeMandatory", True))
+
         try:
             req = generate_audit_plan_draft(
                 model=model, year=year, top_n=top_n,
                 requested_by=request.user,
+                capacity=capacity,
+                min_readiness=min_readiness,
+                include_mandatory=include_mandatory,
             )
         except RiskEngineError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
@@ -3030,10 +3247,21 @@ class GenerateAuditPlanView(APIView):
                 "year": int(year),
                 "top_n": top_n,
                 "scoring_model": model.name,
+                # The capacity assumptions travel with the plan so a year-old
+                # draft can be re-derived, and so "why was this left out?" has
+                # an answer that does not rely on anyone's memory.
+                "capacity": capacity,
+                "min_readiness": min_readiness,
+                "include_mandatory": include_mandatory,
             },
             request=request,
         )
-        return Response(ApprovalRequestSerializer(req).data, status=status.HTTP_201_CREATED)
+        # The plan summary rides alongside the approval request so the UI can
+        # show what fitted, what spilled and how much capacity is left without
+        # parsing it back out of the description text.
+        payload = ApprovalRequestSerializer(req).data
+        payload["planSummary"] = getattr(req, "_plan_summary", None)
+        return Response(payload, status=status.HTTP_201_CREATED)
 
 
 # ═════════════════════════════════════════════════════════════════════

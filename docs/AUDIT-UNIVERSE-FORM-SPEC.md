@@ -1,6 +1,6 @@
 # Audit Universe — Entity Form Specification
 
-**Status:** Approved; PR 1 implemented on `feat/audit-universe-v2`
+**Status:** Approved; PRs 1-2 implemented on `feat/audit-universe-v2`
 **Author:** Engineering (with Claude)
 **Date:** 2026-09-16
 **Applies to:** `iams-backend` (`iams.models.AuditableEntity` and friends), `iams-frontend` (`src/components/audit-universe/*`, `src/pages/AuditableEntity*`)
@@ -586,6 +586,19 @@ Current head: `0046_riskassessmentrecord_entity_and_more`.
 | `0054` | `retire_compliance_status` | Archive each entity's `compliance_status` into a final `AuditableEntityRevision` entry, then drop the column, the enum, the index `ae_compliance_idx`, the filter, the `ordering_fields` entry, and the `complianceRate` KPI | **Breaking.** Coordinate with FE release |
 | `0055` | `finalize_v2_constraints` | `code` → `unique=True, blank=False`; `NOT NULL` on `universe_category`; drop `headcount` / `operating_budget` columns | **Breaking.** Only after `0050`/`0052` verified in prod |
 
+### Archived rows are in scope for every backfill
+
+`AuditableEntity.objects` is an active manager that hides `Archived` rows;
+`all_objects` is the escape hatch. Both the read **and the write** side of every
+backfill must go through `all_objects` (`iams.backfills._entity_manager`).
+
+This is not theoretical. A `bulk_update` through the default manager silently
+skips archived entities, which then fail the `NOT NULL` check when `0055` makes
+`code` required — with nothing in the deploy log explaining why. Django's
+historical models carry only a plain manager, so a migration run masks the bug
+entirely and it appears only when the management command is used. There is a
+regression test (`test_codes_are_assigned_to_archived_entities_too`).
+
 **Deploy gates** (matching our existing practice for the `0031-0033` department merge and the
 `0034-0040` RBAC matrix):
 
@@ -688,7 +701,7 @@ Three locales ship (`en`, `ar`, `fr`; `ar` is RTL). New keys under `auditUnivers
 | PR | Scope | Ships |
 |---|---|---|
 | **1** | Migrations `0047`–`0049`; new models; serializers additive; new read endpoints; filters. No FE change | Release *N* |
-| **2** | Backfills `0050`–`0053` behind a management command, run manually in the window | Release *N* |
+| **2** | Backfills `0050`–`0053`. Logic lives once in `iams/backfills.py` and is driven both by the migrations (historical models) and by `manage.py backfill_audit_universe` (real models, `--dry-run`, `--only <step>`), so a large universe can be done in the window and the migrations then find nothing to do | Release *N* |
 | **3** | FE: create wizard, sectioned edit page, derived rail, readiness. Old fields still accepted | Release *N* |
 | **4** | FE + BE: factor-scoring step, override dialog, `risk_assessment` gating, `riskRating`/`inherent*` read-only at the API | Release *N* |
 | **5** | Capacity-aware plan generation; `spilled[]`; plan report changes | Release *N* |

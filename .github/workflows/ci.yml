@@ -1,0 +1,61 @@
+name: IAMS Backend CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+# Cancel in-flight runs for the same branch when a new commit lands —
+# CI cost discipline.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ────────────────────────────────────────────────────────────────────
+  # lint → migrations check → tests with coverage → OpenAPI schema
+  # ────────────────────────────────────────────────────────────────────
+  backend:
+    runs-on: ubuntu-latest
+    env:
+      IAMS_DISABLE_PDF_RENDER: "1"   # no pango/cairo in CI runners
+      DJANGO_SETTINGS_MODULE: config.settings.test
+      LOG_FORMAT: structured    # formatter name in config/settings/base.py
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "0.5.13"
+          enable-cache: true
+
+      - name: Install Python + project dependencies
+        run: uv sync --frozen
+
+      - name: Lint with ruff
+        run: uv run ruff check iams config
+        continue-on-error: true    # ruff may not be configured yet; soft for now
+
+      - name: Check for missing migrations
+        run: |
+          uv run python manage.py makemigrations --check --dry-run --no-input
+
+      - name: Run tests with coverage
+        run: uv run pytest --cov=iams --cov-report=xml --cov-report=term -q
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-coverage
+          path: coverage.xml
+
+      # OpenAPI contract: the frontend repo consumes this schema.
+      - name: Export OpenAPI schema
+        run: uv run python manage.py spectacular --file openapi.yml
+
+      - name: Upload schema
+        uses: actions/upload-artifact@v4
+        with:
+          name: openapi-schema
+          path: openapi.yml

@@ -1,0 +1,117 @@
+groups:
+  - name: iams.system
+    interval: 30s
+    rules:
+      - alert: IAMSHighErrorRate
+        expr: |
+          sum(rate(django_http_responses_total_by_status_total{status=~"5.."}[5m]))
+            / clamp_min(sum(rate(django_http_responses_total_by_status_total[5m])), 0.001)
+            > 0.01
+        for: 5m
+        labels:
+          severity: page
+          service: iams-backend
+        annotations:
+          summary: "IAMS error rate > 1%"
+          description: |
+            5xx error rate exceeded 1% of total traffic for 5 minutes.
+            Check Sentry + the recent deploy log.
+
+      - alert: IAMSP95LatencyHigh
+        expr: |
+          histogram_quantile(0.95, sum by (le) (
+            rate(django_http_requests_latency_seconds_by_view_method_bucket[5m])
+          )) > 1
+        for: 10m
+        labels:
+          severity: warn
+          service: iams-backend
+        annotations:
+          summary: "IAMS p95 latency > 1s"
+          description: |
+            95th-percentile request latency exceeded 1s for 10 minutes.
+            Likely a slow query — check pg_stat_statements + dashboard hot keys.
+
+      - alert: IAMSCeleryQueueBacklog
+        expr: celery_queue_length > 1000
+        for: 5m
+        labels:
+          severity: page
+          service: iams-backend
+        annotations:
+          summary: "IAMS Celery queue depth > 1000"
+          description: |
+            Tasks are piling up faster than workers can drain. Check
+            worker health + scale-up.
+
+      - alert: IAMSDatabaseErrorsRising
+        expr: rate(django_db_errors_total[5m]) > 0.5
+        for: 10m
+        labels:
+          severity: warn
+          service: iams-backend
+        annotations:
+          summary: "IAMS database errors > 0.5/s"
+          description: |
+            Sustained DB errors — likely connection-pool exhaustion or
+            a misbehaving query. Check pgbouncer.
+
+  - name: iams.security
+    interval: 30s
+    rules:
+      - alert: IAMSAccountLockoutBurst
+        expr: sum(increase(iams_account_lockouts_total[5m])) > 5
+        for: 1m
+        labels:
+          severity: page
+          service: iams-backend
+        annotations:
+          summary: "IAMS account lockout burst (>5 in 5m)"
+          description: |
+            More than 5 account lockouts in 5 minutes — possible
+            credential-stuffing attempt. Verify with login-attempt audit log.
+
+      - alert: IAMSLoginFailureSpike
+        expr: |
+          sum(rate(iams_login_attempts_total{outcome=~"invalid_credentials|user_not_found"}[5m]))
+            > 1
+        for: 5m
+        labels:
+          severity: warn
+          service: iams-backend
+        annotations:
+          summary: "IAMS login-failure rate elevated"
+          description: |
+            Failed login rate > 1/s sustained 5m. Check for brute-force
+            patterns in the audit log.
+
+  - name: iams.business
+    interval: 5m
+    rules:
+      - alert: IAMSOverdueCAPsHigh
+        expr: iams_caps_overdue_current > 50
+        for: 30m
+        labels:
+          severity: warn
+          team: audit
+        annotations:
+          summary: "IAMS overdue CAP count > 50"
+          description: |
+            Operational signal — overdue CAPs are piling up. The audit
+            committee report will reflect this; consider an escalation
+            from the CAE.
+
+      - alert: IAMSReportJobsFailing
+        expr: |
+          sum(rate(iams_report_jobs_failed_total[15m]))
+            / clamp_min(sum(rate(iams_report_jobs_total[15m])), 0.001)
+            > 0.1
+        for: 15m
+        labels:
+          severity: warn
+          service: iams-backend
+        annotations:
+          summary: "IAMS report-job failure rate > 10%"
+          description: |
+            Report renderers are failing. Check the renderer logs + the
+            output WeasyPrint / openpyxl dependencies.

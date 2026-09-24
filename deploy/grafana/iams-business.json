@@ -1,0 +1,137 @@
+{
+  "title": "IAMS — Business",
+  "uid": "iams-business",
+  "schemaVersion": 39,
+  "version": 1,
+  "tags": ["iams", "business"],
+  "timezone": "browser",
+  "time": { "from": "now-7d", "to": "now" },
+  "refresh": "5m",
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": { "selected": false, "text": "Prometheus", "value": "Prometheus" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "CAPs overdue (current)",
+      "gridPos": { "x": 0, "y": 0, "w": 6, "h": 4 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 5 },
+              { "color": "red", "value": 20 }
+            ]
+          }
+        }
+      },
+      "targets": [{ "refId": "A", "expr": "iams_caps_overdue_current" }]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Approvals pending (current)",
+      "gridPos": { "x": 6, "y": 0, "w": 6, "h": 4 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [{ "refId": "A", "expr": "iams_approvals_pending_current" }]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Findings raised — daily rate by severity",
+      "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (severity) (increase(iams_findings_raised_total[1d]))",
+          "legendFormat": "{{severity}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Audits created vs completed (per day)",
+      "gridPos": { "x": 0, "y": 4, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(increase(iams_audits_created_total[1d]))",
+          "legendFormat": "created"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(increase(iams_audits_completed_total[1d]))",
+          "legendFormat": "completed"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "CAPs created vs closed (per day)",
+      "gridPos": { "x": 0, "y": 12, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        { "refId": "A", "expr": "increase(iams_caps_created_total[1d])", "legendFormat": "created" },
+        { "refId": "B", "expr": "increase(iams_caps_closed_total[1d])", "legendFormat": "closed" }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Approvals — daily flow",
+      "gridPos": { "x": 12, "y": 12, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (type) (increase(iams_approvals_requested_total[1d]))",
+          "legendFormat": "requested:{{type}}"
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (type) (increase(iams_approvals_approved_total[1d]))",
+          "legendFormat": "approved:{{type}}"
+        },
+        {
+          "refId": "C",
+          "expr": "sum by (type) (increase(iams_approvals_rejected_total[1d]))",
+          "legendFormat": "rejected:{{type}}"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Report jobs — completed / failed",
+      "gridPos": { "x": 0, "y": 20, "w": 24, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (kind) (increase(iams_report_jobs_completed_total[1d]))",
+          "legendFormat": "ok:{{kind}}"
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (kind) (increase(iams_report_jobs_failed_total[1d]))",
+          "legendFormat": "fail:{{kind}}"
+        }
+      ]
+    }
+  ]
+}

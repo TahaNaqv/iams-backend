@@ -1,0 +1,185 @@
+# IAMS full-stack docker-compose (production, blue-green).
+#
+# Not the local dev stack — that's docker-compose.yml. On the deploy host
+# this file is copied to /opt/iams/docker-compose.yml alongside deploy/,
+# which is where deploy/blue_green.sh expects it.
+#
+# This is the **runtime** topology. CI image builds happen in GitHub
+# Actions; this file references the built images by tag.
+#
+# Two flavors are baked in via profiles:
+#   - profile: blue   — primary stack
+#   - profile: green  — standby stack used by ./deploy/blue_green.sh
+#
+# Shared services (postgres, redis, minio, clamav, celery, prometheus,
+# loki, grafana) live outside the profile so both colors share them.
+# nginx upstream-swap is what cuts traffic over (see deploy/nginx/).
+
+x-backend-base: &backend-base
+  image: ${BACKEND_IMAGE:-iams-backend:latest}
+  env_file: .env
+  environment:
+    DJANGO_SETTINGS_MODULE: config.settings.prod
+    DATABASE_URL: postgres://iams:${POSTGRES_PASSWORD}@postgres:5432/iams
+    REDIS_URL: redis://redis:6379/0
+    CELERY_BROKER_URL: redis://redis:6379/0
+    S3_ENDPOINT_URL: http://minio:9000
+    S3_BUCKET_NAME: iams-evidence
+    CLAMD_HOST: clamav
+    LOG_FORMAT: json
+    OTEL_ENABLED: "true"
+    OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+  depends_on:
+    postgres: { condition: service_healthy }
+    redis:    { condition: service_healthy }
+    minio:    { condition: service_started }
+  restart: unless-stopped
+
+services:
+  # ──────────────────────────────────────────────────────────────────
+  # Postgres
+  # ──────────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: iams
+      POSTGRES_USER: iams
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?required}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U iams -d iams"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  pgbouncer:
+    image: edoburu/pgbouncer:1.23
+    environment:
+      DATABASE_URL: postgres://iams:${POSTGRES_PASSWORD}@postgres:5432/iams
+      POOL_MODE: transaction
+      MAX_CLIENT_CONN: "200"
+      DEFAULT_POOL_SIZE: "25"
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: unless-stopped
+
+  # ──────────────────────────────────────────────────────────────────
+  # Redis (cache + Celery broker)
+  # ──────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # ──────────────────────────────────────────────────────────────────
+  # MinIO (S3-compatible object storage)
+  # ──────────────────────────────────────────────────────────────────
+  minio:
+    image: minio/minio:latest
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY:?required}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:?required}
+    volumes:
+      - miniodata:/data
+    restart: unless-stopped
+
+  # ──────────────────────────────────────────────────────────────────
+  # ClamAV (antivirus daemon)
+  # ──────────────────────────────────────────────────────────────────
+  clamav:
+    image: clamav/clamav:latest
+    volumes:
+      - clamavdata:/var/lib/clamav
+    restart: unless-stopped
+
+  # ──────────────────────────────────────────────────────────────────
+  # Backend — blue / green pair behind nginx
+  # ──────────────────────────────────────────────────────────────────
+  backend-blue:
+    <<: *backend-base
+    profiles: ["blue"]
+    container_name: iams-backend-blue
+    command: ["gunicorn", "config.wsgi:application", "--bind", "0.0.0.0:8000", "--workers", "4", "--access-logfile", "-"]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:8000/ready/"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  backend-green:
+    <<: *backend-base
+    profiles: ["green"]
+    container_name: iams-backend-green
+    command: ["gunicorn", "config.wsgi:application", "--bind", "0.0.0.0:8000", "--workers", "4", "--access-logfile", "-"]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:8000/ready/"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ──────────────────────────────────────────────────────────────────
+  # Celery worker + beat (always single color; not blue/green)
+  # ──────────────────────────────────────────────────────────────────
+  celery-worker:
+    <<: *backend-base
+    command: ["celery", "-A", "config", "worker", "--loglevel=info", "--concurrency=4"]
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A config inspect ping -d celery@$$HOSTNAME"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  celery-beat:
+    <<: *backend-base
+    command: ["celery", "-A", "config", "beat", "--loglevel=info", "--scheduler", "django_celery_beat.schedulers:DatabaseScheduler"]
+
+  # ──────────────────────────────────────────────────────────────────
+  # Frontend — blue / green pair
+  # ──────────────────────────────────────────────────────────────────
+  frontend-blue:
+    image: ${FRONTEND_IMAGE:-iams-frontend:latest}
+    profiles: ["blue"]
+    container_name: iams-frontend-blue
+    restart: unless-stopped
+
+  frontend-green:
+    image: ${FRONTEND_IMAGE:-iams-frontend:latest}
+    profiles: ["green"]
+    container_name: iams-frontend-green
+    restart: unless-stopped
+
+  # ──────────────────────────────────────────────────────────────────
+  # nginx reverse proxy — swap target by editing upstream conf and
+  # ``nginx -s reload`` (driven by ./deploy/blue_green.sh).
+  # ──────────────────────────────────────────────────────────────────
+  nginx:
+    image: nginx:1.27-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/nginx:/etc/nginx/conf.d:ro
+      - ./deploy/certs:/etc/nginx/certs:ro
+    depends_on:
+      - backend-blue
+      - frontend-blue
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  redisdata:
+  miniodata:
+  clamavdata:

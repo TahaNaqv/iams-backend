@@ -387,3 +387,33 @@ def test_mfa_enforcement_after_grace_period(auditor_user):
     from iams.security import mfa_enforcement_required
     # date_joined is well in the past → grace=0 → enforcement on
     assert mfa_enforcement_required(auditor_user) is True
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Global MFA switch (IAMS_MFA_ENABLED)
+# ──────────────────────────────────────────────────────────────────────
+@override_settings(IAMS_MFA_ENABLED=False, IAMS_MFA_GRACE_DAYS=0)
+def test_mfa_disabled_skips_enforcement(auditor_user, roles):
+    from iams.security import mfa_enforcement_required
+
+    role = roles["Auditor"]
+    role.mfa_required = True
+    role.save(update_fields=["mfa_required"])
+    assert mfa_enforcement_required(auditor_user) is False
+
+
+def test_mfa_disabled_login_skips_otp_for_enrolled_user(api_client, auditor_user, authed_client):
+    import pyotp
+
+    api = authed_client(auditor_user)
+    secret = api.post("/api/auth/mfa/totp/enroll/").json()["secret"]
+    api.post("/api/auth/mfa/totp/confirm/", {"token": pyotp.TOTP(secret).now()}, format="json")
+
+    with override_settings(IAMS_MFA_ENABLED=False):
+        res = api_client.post(
+            "/api/auth/token/",
+            {"username": auditor_user.username, "password": "TestPassword123!"},
+            format="json",
+        )
+        assert res.status_code == 200, res.content
+        assert api.get("/api/auth/mfa/").json()["mfaEnabled"] is False

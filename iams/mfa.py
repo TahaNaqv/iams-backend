@@ -204,9 +204,10 @@ def get_mfa_status(user) -> dict[str, object]:
             payload = {}
         backup_remaining = len(payload.get("codes") or [])
 
-    from iams.security import mfa_enforcement_required
+    from iams.security import mfa_enabled, mfa_enforcement_required
 
     return {
+        "mfaEnabled": mfa_enabled(),
         "totpEnrolled": bool(totp and totp.confirmed),
         "totpPending": bool(totp and not totp.confirmed),
         "backupCodesRemaining": backup_remaining,

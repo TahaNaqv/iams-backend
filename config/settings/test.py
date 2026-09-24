@@ -62,3 +62,7 @@ logging.disable(logging.CRITICAL)
 CLAMD_SKIP = True
 CLAMD_HOST = "clamav-not-used-in-tests"
 CLAMD_PORT = 3310
+
+# MFA may be switched off in a developer's .env; tests exercise the real
+# gate and opt out per-test with override_settings.
+IAMS_MFA_ENABLED = True

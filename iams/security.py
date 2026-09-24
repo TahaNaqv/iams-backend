@@ -277,6 +277,11 @@ def hash_password(raw: str) -> str:
 # ──────────────────────────────────────────────────────────────────────
 # MFA enforcement gate
 # ──────────────────────────────────────────────────────────────────────
+def mfa_enabled() -> bool:
+    """Global MFA switch (``IAMS_MFA_ENABLED``)."""
+    return bool(getattr(settings, "IAMS_MFA_ENABLED", True))
+
+
 def mfa_enforcement_required(user) -> bool:
     """Return True iff the user must complete MFA setup before login.
 
@@ -286,9 +291,13 @@ def mfa_enforcement_required(user) -> bool:
         since account creation OR last password change, whichever is
         most recent — the "soft escalation" path.
 
-    Returns False if the user already has a confirmed TOTP device.
+    Returns False if the user already has a confirmed TOTP device, or
+    if MFA is switched off globally via ``IAMS_MFA_ENABLED``.
     """
     from iams.models import MFADevice
+
+    if not mfa_enabled():
+        return False
 
     profile = getattr(user, "profile", None)
 

@@ -116,6 +116,7 @@ class ThrottledTokenObtainPairView(TokenObtainPairView):
         from iams.models import LoginAttempt, MFADevice
         from iams.security import (
             get_active_lockout,
+            mfa_enabled,
             mfa_enforcement_required,
             record_login_attempt,
             register_failure,
@@ -201,10 +202,13 @@ class ThrottledTokenObtainPairView(TokenObtainPairView):
         #   - User has no confirmed device but enrollment is required by
         #     policy (role / grace expired) → block with mfa_required so
         #     the FE prompts enrollment.
+        # Both are skipped when MFA is switched off (IAMS_MFA_ENABLED).
         totp = MFADevice.objects.filter(
             user=user, kind=MFADevice.KIND_TOTP, confirmed=True,
         ).first()
-        enforce = mfa_enforcement_required(user) or totp is not None
+        enforce = mfa_enabled() and (
+            mfa_enforcement_required(user) or totp is not None
+        )
         if enforce:
             if totp is None or not otp_token:
                 record_login_attempt(

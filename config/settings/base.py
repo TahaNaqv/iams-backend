@@ -174,6 +174,11 @@ IAMS_LOGIN_FAIL_THRESHOLD = env.int("IAMS_LOGIN_FAIL_THRESHOLD", default=5)
 IAMS_LOGIN_LOCKOUT_MINUTES = env.int("IAMS_LOGIN_LOCKOUT_MINUTES", default=15)
 IAMS_LOGIN_FAIL_WINDOW_MIN = env.int("IAMS_LOGIN_FAIL_WINDOW_MIN", default=15)
 IAMS_PASSWORD_HISTORY_N = env.int("IAMS_PASSWORD_HISTORY_N", default=5)
+# Master switch for two-factor authentication. When False the login
+# view never asks for an OTP (even for users with a confirmed TOTP
+# device) and no user is forced to enroll. Intended for pre-production
+# testing only — keep True in real production.
+IAMS_MFA_ENABLED = env.bool("IAMS_MFA_ENABLED", default=True)
 IAMS_MFA_GRACE_DAYS = env.int("IAMS_MFA_GRACE_DAYS", default=30)
 IAMS_MFA_TOTP_ISSUER = env("IAMS_MFA_TOTP_ISSUER", default="IAMS")
 # Session inactivity timeout — refresh tokens are auto-blacklisted on
